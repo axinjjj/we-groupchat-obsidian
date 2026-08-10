@@ -1,0 +1,230 @@
+import os
+import tempfile
+import unittest
+from unittest.mock import patch
+
+from core.config import (
+    DEFAULT_CONFIG,
+    _sanitize_config,
+    active_monitor_chats,
+    merge_monitor_chat_preferences,
+)
+from core.taxonomy_assignment import FREE_FORM_PROFILE
+
+
+class ConfigTests(unittest.TestCase):
+    def test_active_monitor_chats_falls_back_to_valid_v1_singleton(self):
+        self.assertEqual(
+            active_monitor_chats({
+                "monitor_chats": [],
+                "monitor_chat_username": " room@chatroom ",
+                "monitor_chat_display_name": " Legacy Room ",
+            }),
+            [{"username": "room@chatroom", "name": "Legacy Room"}],
+        )
+
+    def test_active_monitor_chats_prefers_non_empty_valid_multi_chat_config(self):
+        self.assertEqual(
+            active_monitor_chats({
+                "monitor_chats": [
+                    {"username": " current@chatroom ", "name": " Current Room "},
+                    {"username": "", "name": "Ignored"},
+                ],
+                "monitor_chat_username": "legacy@chatroom",
+                "monitor_chat_display_name": "Legacy Room",
+            }),
+            [{"username": "current@chatroom", "name": "Current Room"}],
+        )
+
+    def test_default_runtime_paths_use_new_project_data_dir(self):
+        self.assertIn(".we-groupchat-obsidian", DEFAULT_CONFIG["keys_file"])
+        self.assertIn(".we-groupchat-obsidian", DEFAULT_CONFIG["decrypted_dir"])
+        self.assertIn(".we-groupchat-obsidian", DEFAULT_CONFIG["monitor_knowledge_db"])
+        self.assertIn(".we-groupchat-obsidian", DEFAULT_CONFIG["monitor_obsidian_root"])
+
+    def test_legacy_default_paths_are_rebased_to_new_data_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_data = os.path.join(tmp, ".wechat-summary")
+            new_data = os.path.join(tmp, ".we-groupchat-obsidian")
+            cfg = _sanitize_config({
+                "keys_file": os.path.join(old_data, "all_keys.json"),
+                "decrypted_dir": os.path.join(old_data, "decrypted"),
+                "monitor_knowledge_db": os.path.join(old_data, "monitor_knowledge.db"),
+                "monitor_obsidian_root": os.path.join(old_data, "obsidian_knowledge"),
+            })
+
+            with patch("core.config.DATA_DIR", new_data), \
+                 patch("core.config.LEGACY_DATA_DIR", old_data):
+                cfg = _sanitize_config(cfg)
+
+            self.assertEqual(cfg["keys_file"], os.path.join(new_data, "all_keys.json"))
+            self.assertEqual(cfg["decrypted_dir"], os.path.join(new_data, "decrypted"))
+            self.assertEqual(cfg["monitor_knowledge_db"], os.path.join(new_data, "monitor_knowledge.db"))
+            self.assertEqual(cfg["monitor_obsidian_root"], os.path.join(new_data, "obsidian_knowledge"))
+
+    def test_monitor_notification_flags_are_preserved(self):
+        cfg = _sanitize_config({
+            "background_notifications_enabled": False,
+            "monitor_notify_writes": False,
+            "monitor_notify_checkins": True,
+        })
+
+        self.assertFalse(cfg["background_notifications_enabled"])
+        self.assertFalse(cfg["monitor_notify_writes"])
+        self.assertTrue(cfg["monitor_notify_checkins"])
+
+    def test_monitor_notification_defaults(self):
+        self.assertTrue(DEFAULT_CONFIG["background_notifications_enabled"])
+        self.assertTrue(DEFAULT_CONFIG["monitor_notify_writes"])
+        self.assertFalse(DEFAULT_CONFIG["monitor_notify_checkins"])
+
+    def test_link_preview_fetching_defaults_to_explicit_opt_in(self):
+        self.assertFalse(DEFAULT_CONFIG["monitor_fetch_links"])
+        cfg = _sanitize_config({"monitor_fetch_links": True})
+        self.assertTrue(cfg["monitor_fetch_links"])
+
+    def test_mcp_send_mode_defaults_and_sanitized_config(self):
+        self.assertEqual(DEFAULT_CONFIG["mcp_send_mode"], "disabled")
+        cfg = _sanitize_config({
+            "mcp_send_mode": " allowlist ",
+            "mcp_send_allowlist": [" room@chatroom ", "", 42, "wxid_example"],
+        })
+
+        self.assertEqual(cfg["mcp_send_mode"], "allowlist")
+        self.assertEqual(cfg["mcp_send_allowlist"], ["room@chatroom", "wxid_example"])
+
+    def test_legacy_mcp_send_boolean_maps_to_enabled_mode(self):
+        cfg = _sanitize_config({"mcp_enable_send_message": True})
+
+        self.assertEqual(cfg["mcp_send_mode"], "enabled")
+
+    def test_daily_digest_defaults_and_sanitized_config(self):
+        cfg = _sanitize_config({
+            "daily_digest_enabled": False,
+            "daily_digest_notify": False,
+            "daily_digest_time": "22:15",
+            "daily_digest_timezone": "Asia/Shanghai",
+            "daily_digest_dir": "~/daily digests",
+        })
+
+        self.assertTrue(DEFAULT_CONFIG["daily_digest_enabled"])
+        self.assertTrue(DEFAULT_CONFIG["daily_digest_notify"])
+        self.assertEqual(DEFAULT_CONFIG["daily_digest_time"], "21:30")
+        self.assertEqual(DEFAULT_CONFIG["daily_digest_dir"], "")
+        self.assertFalse(cfg["daily_digest_enabled"])
+        self.assertFalse(cfg["daily_digest_notify"])
+        self.assertEqual(cfg["daily_digest_time"], "22:15")
+        self.assertEqual(cfg["daily_digest_timezone"], "Asia/Shanghai")
+        self.assertTrue(cfg["daily_digest_dir"].endswith("daily digests"))
+
+    def test_monitor_chat_aliases_are_sanitized(self):
+        cfg = _sanitize_config({
+            "monitor_chat_aliases": {
+                " room@chatroom ": " Stable Vault Name ",
+                "empty@chatroom": "",
+                "bad-value@chatroom": 42,
+                "bad-key": "Ignored",
+                1: "Also ignored",
+            },
+        })
+
+        self.assertEqual(
+            cfg["monitor_chat_aliases"],
+            {"room@chatroom": "Stable Vault Name"},
+        )
+
+    def test_monitor_chat_taxonomy_profiles_are_sanitized(self):
+        cfg = _sanitize_config({
+            "monitor_chat_taxonomy_profiles": {
+                " room@chatroom ": " human_ai_intimacy_v1 ",
+                "unknown@chatroom": "future_profile",
+                "bad-key": "human_ai_intimacy_v1",
+                "empty@chatroom": "",
+                1: "human_ai_intimacy_v1",
+            },
+        })
+        self.assertEqual(
+            cfg["monitor_chat_taxonomy_profiles"],
+            {
+                "room@chatroom": "human_ai_intimacy_v1",
+                "unknown@chatroom": "future_profile",
+            },
+        )
+
+    def test_merge_monitor_chat_preferences_preserves_existing_maps(self):
+        config = {
+            "monitor_chat_aliases": {"existing@chatroom": "Existing"},
+            "monitor_chat_taxonomy_profiles": {
+                "existing@chatroom": "human_ai_intimacy_v1",
+            },
+        }
+
+        updated = merge_monitor_chat_preferences(
+            config,
+            [{"username": "new@chatroom", "name": "New Chat"}],
+            profile_by_username={"new@chatroom": "future_profile"},
+            alias_by_username={"new@chatroom": "Stable New"},
+        )
+
+        self.assertEqual(
+            updated["monitor_chat_aliases"],
+            {
+                "existing@chatroom": "Existing",
+                "new@chatroom": "Stable New",
+            },
+        )
+        self.assertEqual(
+            updated["monitor_chat_taxonomy_profiles"],
+            {
+                "existing@chatroom": "human_ai_intimacy_v1",
+                "new@chatroom": "future_profile",
+            },
+        )
+        self.assertNotIn("new@chatroom", config["monitor_chat_aliases"])
+
+    def test_merge_monitor_chat_preferences_seeds_alias_without_changing_profiles(self):
+        config = {
+            "monitor_chat_aliases": {},
+            "monitor_chat_taxonomy_profiles": {
+                "room@chatroom": "human_ai_intimacy_v1",
+            },
+        }
+        updated = merge_monitor_chat_preferences(
+            config,
+            [{"username": "room@chatroom", "name": "群已经改名"}],
+        )
+        self.assertEqual(updated["monitor_chat_aliases"]["room@chatroom"], "群已经改名")
+        self.assertEqual(
+            updated["monitor_chat_taxonomy_profiles"],
+            {"room@chatroom": "human_ai_intimacy_v1"},
+        )
+
+    def test_merge_monitor_chat_preferences_persists_blank_as_free_form(self):
+        config = {
+            "monitor_chat_taxonomy_profiles": {
+                "room@chatroom": "human_ai_intimacy_v1",
+            },
+        }
+
+        updated = merge_monitor_chat_preferences(
+            config,
+            [{"username": "room@chatroom", "name": "Room"}],
+            profile_by_username={"room@chatroom": ""},
+        )
+
+        self.assertEqual(
+            updated["monitor_chat_taxonomy_profiles"],
+            {"room@chatroom": FREE_FORM_PROFILE},
+        )
+
+    def test_merge_monitor_chat_preferences_requires_stable_username(self):
+        with self.assertRaisesRegex(
+            ValueError, "selected chat lacks a stable @chatroom username"
+        ):
+            merge_monitor_chat_preferences(
+                {}, [{"username": "wxid_unstable", "name": "Unstable"}]
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

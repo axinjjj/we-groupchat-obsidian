@@ -1,0 +1,527 @@
+# we-groupchat-obsidian
+
+本地优先的微信群聊总结、关注推送与 Obsidian 知识库工具。
+
+当前状态：source-only developer preview。请先读完数据流和账号安全边界，再在真实聊天数据上使用。
+
+一个本地优先的 macOS 微信群聊总结工具。它读取你电脑上的微信本地数据库，生成群聊摘要、关键词搜索结果，并把值得关注的新消息整理成 Obsidian-friendly Markdown 笔记。
+
+它不是微信/Tencent 官方软件，不是微信机器人，不是员工监控工具；当你启用云端 AI、远程链接预览或 MCP 发送时，它也不是完全离线工具。它不接入微信官方/非官方接口，也不会替你把聊天记录上传到项目作者的服务器。所有运行状态、数据库 key、知识库和导出文件默认都保存在你自己的 Mac 上。
+
+项目来源说明：本项目是基于 [Qizhan7/mac-wechat-summary](https://github.com/Qizhan7/mac-wechat-summary) 的 standalone derivative。原项目打下了 macOS 菜单栏总结、本地微信数据库读取和 MCP 访问的基础；这个仓库没有挂在 GitHub fork network 里，也不作为 upstream PR 分支维护，而是继续发展成一个独立的 local-first Obsidian workflow 项目。见 [NOTICE.md](NOTICE.md)。
+
+![Python](https://img.shields.io/badge/Python-3.10+-blue)
+![macOS](https://img.shields.io/badge/macOS-only-lightgrey)
+![License](https://img.shields.io/badge/License-AGPL--3.0-blue)
+
+## 实际 Obsidian 输出
+
+下面的画面是在真实 Obsidian 里用日常 theme 渲染的。为避免公开群友和私有项目，
+展示内容使用与当前 exporter 结构一致的临时脱敏副本：群名、成员名、私有项目和
+本机路径已替换，Cloudflare、DeepSeek、GitHub 等公开公司名和新闻主题保留。
+Properties、wiki links、标题标记和正文 section 仍是实际工作流的格式。
+
+![Daily Digest：集中回看知识笔记、资源机会和风险项](docs/assets/readme/obsidian-daily-digest.jpg)
+
+**Daily Digest**：每天把值得回看的知识笔记、资源机会和风险项汇总到一页；
+标题是可点击的 Obsidian wiki link，可以直接回到对应的单篇笔记。当前月份的
+Digest 直接放在 `Daily Digest/`，更早月份归档到 `Daily Digest/YYYY-MM/`。
+
+![00-按日期：按日期和时间浏览完整知识笔记历史](docs/assets/readme/obsidian-date-index.jpg)
+
+**按日期浏览**：总目录和每个群聊目录各有一份 link-only `00-按日期.md`，按日期
+和时间串起完整笔记历史。它不复制正文，也不创建第二套月度 archive。
+
+### 不同类型的知识笔记
+
+![普通主题或新闻类知识笔记](docs/assets/readme/obsidian-note-plain.jpg)
+
+**普通 / 新闻主题**：保留结构化摘要、关键事实、相关主题和来源窗口，适合之后
+继续搜索、链接和重组。公开公司名或新闻对象不会为了脱敏而被抹掉。
+
+![链接类型知识笔记](docs/assets/readme/obsidian-note-link.jpg)
+
+**`[链接]` 笔记**：除了摘要与来源，还会保存公开 URL 和 link resource metadata，
+便于从群聊讨论回到原始资料。
+
+![文件类型知识笔记](docs/assets/readme/obsidian-note-file.jpg)
+
+**`[文件]` 笔记**：记录文件名、消息时间和发送者线索；当本机对应的微信月份目录
+存在时，会给出该月份文件夹的 local shortcut。它不会把微信附件复制进 vault，
+也不保证直接定位到唯一文件。
+
+## 一次实际 DeepSeek API 用量参考
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/assets/readme/deepseek-usage-overview-2026-08-10.png" alt="DeepSeek API 消费、请求次数和 token 总览"></td>
+    <td width="50%"><img src="docs/assets/readme/deepseek-v4-flash-usage-2026-08-10.png" alt="deepseek-v4-flash 请求与 token 分布"></td>
+  </tr>
+</table>
+
+上图是一个实际 monitor 在 `2026-07-12` 至 `2026-08-10` 的账号后台样本：使用
+`deepseek-v4-flash` 共发出 `2,980` 次 API 请求，处理 `23,167,525` tokens，后台
+显示消费 `¥19.78 CNY`。图里的非均匀尖峰包含历史消息补跑，因此不是稳定的每日
+请求量，也不是对其他安装的固定成本承诺。
+
+DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命中和输出 token 的
+单价不同；实际费用还会随模型、prompt、输出长度、cache hit 和官方调价变化。
+本项目目前不自行保存一份 cost ledger，图中数字来自 DeepSeek Platform：
+
+- [查看本账号的实际用量](https://platform.deepseek.com/usage)（需登录）
+- [查看 DeepSeek 当前官方价格](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)
+- [了解 token 用量口径](https://api-docs.deepseek.com/quick_start/token_usage/)
+
+如需按 API Key 查看明细，可按[官方 FAQ](https://api-docs.deepseek.com/faq/)
+所述，在 Usage 页面选择月份并点击 `Export`；下载包中的 `amount` CSV 会按 Key
+拆分用量。README 不复制固定价目表，以免官方价格调整后留下过期数字。
+
+## 现在能做什么
+
+- 菜单栏总结：按群聊总结新消息、自定义最近 N 条/分钟、按天回顾、复制和打开历史总结。
+- 群聊管理：读取最近活跃群聊，给群聊分组，批量总结多个群聊。
+- 关键词搜索：跨群按关键词和日期搜索，可让 AI 归纳搜索结果。
+- 关注推送：后台监控指定群聊里“值得看”的新功能、链接、教程、实验结论、产品想法或其他自定义主题；可独立关闭自动 banner，不影响监控和 Obsidian 写入。
+- Obsidian 知识库：命中内容写入本地 SQLite，并导出为 Markdown；普通主题、`[链接]`、`[文件]` 和 `[链接+文件]` 使用不同的标题标记与 resource metadata。
+- Daily Digest 和 Review Queue：高信号内容默认进入知识库和每日摘要；Digest 可以跳回单篇笔记，只把有明确下一步动作的条目放进待审阅队列。
+- 按日期浏览：全局和每个群聊各有一份 link-only `00-按日期.md`，串起完整笔记历史而不复制正文。
+- Resource Lead：识别“可以私发 / 晚点发 / repo 还没公开 / 求一份”这类资源还没出现但值得追问的窗口。
+- 链接和转发展开：可选择补充公开网页标题/摘要；远程链接预览默认关闭。本地微信 XML 里可见的转发聊天记录会尽量解析。
+- MCP Server：让 Claude Desktop、Claude Code、Cursor、OpenClaw 等 MCP 客户端只读查询群聊、搜索、总结、查看图片；发送消息默认关闭。
+- 运维命令：即使菜单栏图标被隐藏，也可以用 `.command` 文件配置关注推送、健康检查、刷新数据源、历史回填和安装自启动。
+
+## 隐私和风险边界
+
+这个项目适合个人本地使用。它涉及微信本地数据库和进程内 key 提取，所以公开使用前请先理解这些边界：
+
+- 程序读取本机微信数据库副本，不修改微信聊天数据库。
+- 首次提取数据库 key，或微信更新后重新提取 key，可能需要对 `WeChat.app` 做 ad-hoc re-sign。脚本不会在普通双击启动时偷偷执行这一步，必须显式运行带 `--allow-wechat-resign` 的命令。
+- 聊天内容会发送给你自己配置的 AI provider。使用 Ollama 本地模型时，内容可以完全不离开本机；使用云端 provider 时，请按对应服务的隐私规则自行判断。
+- API Key 存储在 macOS Keychain，不写入 repo。
+- 本地配置、书签、monitor state、数据库 key、日志、SQLite DB 和 Markdown 导出默认在 `~/.we-groupchat-obsidian/` 或你的 Obsidian vault 中，不应该提交到 git。旧 `~/.wechat-summary/` 只作为本机 migration/compatibility 路径保留。
+- 远程链接预览默认关闭。只有显式设置 `monitor_fetch_links: true` 后，程序才会请求关注消息里的公开 URL；远端网站可能收到你的请求元数据。链接预览有保守的 SSRF 防护，但它仍然只是 best-effort public URL preview，不是 hardened crawler。
+- MCP read tools 会把本地 chat-derived data 暴露给 MCP client；部分管理工具可以修改本地 metadata，例如分组或配置衍生状态。
+- MCP 的发送微信消息能力默认关闭。真实 UI 发送需要显式设置 `mcp_send_mode`（`allowlist` 或 `enabled`）、授予辅助功能权限，并走 `prepare_send_message` -> 用户确认 -> `confirm_send_message` nonce 流程。
+
+公开 fork 前建议跑：
+
+```bash
+git status --short
+rg -n "sk-|api[_-]?key|secret|token|password|BEGIN .*PRIVATE|wxid_|chatroom|\\.we-groupchat-obsidian|\\.wechat-summary|all_keys|enc_key|image_aes_key" .
+```
+
+如果只是把源码包发给朋友，建议用 sanitized share zip，而不是直接压缩当前工作目录：
+
+```bash
+.venv/bin/python scripts/build_share_package.py
+```
+
+生成的 zip 会从 tracked source 构建，排除本机 runtime、`.venv`、build/cache 产物和 internal continuity docs，并额外附带一份 `群友使用说明.md` 快速入门。
+
+## 安装
+
+### 前置条件
+
+- macOS 12+
+- Python 3.10+
+- 微信桌面版，并已登录
+- 至少一个 AI provider API Key，或本地 Ollama
+- Xcode Command Line Tools，用于编译 key scanner
+- Obsidian 可选；只想生成 Markdown 文件时不需要安装
+
+支持的 AI provider：
+
+- 通义千问
+- DeepSeek
+- Claude
+- OpenAI
+- Ollama 本地模型
+
+选择 DeepSeek 且没有显式填写 `ai_model` 时，当前默认使用
+`deepseek-v4-flash`；仍可在配置中指定其他兼容 model。
+
+### 快速开始
+
+```bash
+git clone https://github.com/IndelibleVivi/we-groupchat-obsidian.git
+cd we-groupchat-obsidian
+./启动.command
+```
+
+第一次运行或 `requirements.txt` 更新时，`启动.command` 会先询问是否创建/更新 `.venv` 并安装 dependencies；只有明确输入 `y` 才会继续，不同意则直接退出。项目仍是 source-only CLI 分发，不提供 `.dmg` 或 bundled Python runtime。若 macOS 阻止打开 `.command` 文件，右键它，选择“打开”，再确认打开。
+
+如果提示微信需要重新授权，请阅读终端说明后手动运行：
+
+```bash
+./启动.command --allow-wechat-resign
+```
+
+这一步可能会退出微信，并要求输入 Mac 登录密码。输入密码时终端不显示字符是正常的。
+
+## 常用命令
+
+这些命令都可以双击运行，也可以在 Terminal 中执行。
+
+| 命令 | 用途 |
+| --- | --- |
+| `./启动.command` | 启动菜单栏应用 |
+| `./启动.command --setup-only` | 只检查环境和依赖，不启动 app |
+| `./配置关注推送.command` | 不依赖菜单栏，配置监控群聊、关注描述、AI Key 和 Obsidian 输出 |
+| `./健康检查.command` | 打印 redacted-by-default 状态；只有本地排查时才加 `--sensitive` |
+| `./刷新数据源.command` | 微信更新后刷新数据库 key，不需要找到菜单栏图标 |
+| `./历史总结到Obsidian.command` | 把历史消息按天总结并导出到 Obsidian |
+| `./整理Obsidian输出.command` | 只整理/重导出知识库 Markdown，不调用 AI |
+| `./安装自动启动.command` | 安装 macOS LaunchAgent 登录自启 |
+| `./卸载自动启动.command` | 卸载登录自启 |
+
+等价 CLI 参数：
+
+```bash
+./启动.command --configure-monitor
+./启动.command --health-check
+./启动.command --refresh-data-source
+./启动.command --backfill-history
+./启动.command --organize-obsidian
+./启动.command --install-autostart
+./启动.command --uninstall-autostart
+```
+
+面向 monitor 的维护脚本：
+
+```bash
+.venv/bin/python scripts/daily_digest.py
+.venv/bin/python scripts/review_queue.py list
+.venv/bin/python scripts/review_queue.py audit
+.venv/bin/python scripts/review_queue.py cleanup
+.venv/bin/python scripts/review_queue.py cleanup --apply
+.venv/bin/python scripts/review_queue.py show <item-id>
+.venv/bin/python scripts/review_queue.py mark <item-id> reviewed
+.venv/bin/python scripts/organize_obsidian.py --taxonomy-dry-run
+.venv/bin/python scripts/organize_obsidian.py --taxonomy-review-brief
+.venv/bin/python scripts/organize_obsidian.py --dry-run
+.venv/bin/python scripts/organize_obsidian.py --knowledge-audit
+.venv/bin/python scripts/organize_obsidian.py --knowledge-audit --knowledge-audit-output "<path-to-report.md>"
+.venv/bin/python scripts/organize_obsidian.py --date-indexes-only
+.venv/bin/python scripts/health_check.py --sensitive
+.venv/bin/python scripts/health_check.py --delete-sensitive-key-log
+```
+
+菜单栏的 `关注推送 -> 后台通知：开/关` 是自动 banner 总开关。关闭后，
+后台监控、知识库写入和 Daily Digest 仍会继续运行，只是不再显示自动命中、
+心跳、后台错误和 Digest 通知；手动操作反馈与“测试系统通知”仍会显示。
+
+如果系统级通知一直不出现，先看 `./健康检查.command` 里的
+`Notification identity`。源码目录 + virtualenv 启动时，进程可能显示为
+`Python / org.python.python`；这种情况下 rumps 可以成功 schedule 通知，但
+macOS 可能不会给项目一个稳定的通知设置入口，也不一定弹 banner。正式 `.app`
+打包应使用 `io.github.indeliblevivi.we-groupchat-obsidian` 作为通知 bundle
+identity，并使用仓库里的 `resources/app_icon.icns`，避免通知中心显示 py2app
+默认的 Python 图标。
+
+如果想让登录自启直接走本地 `.app` 身份：
+
+```bash
+.venv/bin/python -m pip install py2app
+# 如果这个 virtualenv 的 pip 不可用：
+# uv pip install --python .venv/bin/python py2app
+.venv/bin/python setup.py py2app --alias
+.venv/bin/python scripts/autostart.py install --app-bundle dist/WeGroupchatObsidian.app --load-now
+```
+
+这里的 `--alias` app 依赖当前源码目录和 `.venv`，适合本机 LaunchAgent /
+系统通知 identity，不是 standalone distributable build。
+
+## Runtime Data Migration
+
+新安装默认使用 `~/.we-groupchat-obsidian/` 保存 config、logs、key cache、monitor SQLite state、Review Queue 和默认 Markdown 输出。旧本机环境可能还存在 `~/.wechat-summary/`；如果新 config 不存在，程序会读取旧 config，并把项目默认路径 rebased 到新目录。
+
+已有机器迁移时，应在重启 LaunchAgent 前迁移实际文件：把旧目录移动到 `~/.we-groupchat-obsidian/`，或在兼容期内保留 `~/.wechat-summary` -> `~/.we-groupchat-obsidian` 的 symlink。旧 Keychain service name 下的 API Key 仍会作为 fallback 读取，新保存的 key 会写到 `we-groupchat-obsidian`。
+
+## LaunchAgent 兼容策略
+
+新安装的登录自启默认使用 neutral label：
+
+```text
+io.github.indeliblevivi.we-groupchat-obsidian
+```
+
+如果旧版本已经安装过当前项目的 LaunchAgent，脚本会按 plist 里的 `ProgramArguments` / `WorkingDirectory` 自动识别，并默认保留旧 label，避免把正在运行的 monitor 迁到另一个 job。健康检查和卸载也按“是否指向当前项目或同名 runtime copy”识别，不依赖硬编码个人 label。
+
+当前项目 / repo 名是 `we-groupchat-obsidian`。旧本机环境里如果还看到 runtime 目录或 LaunchAgent label 带 `mac-wechat-summary` / `wechat-summary`，应视为这台机器上的 legacy compatibility name，不代表当前项目身份。
+
+如果你确认要把旧 label 迁移到 neutral label，可以显式运行：
+
+```bash
+./安装自动启动.command --migrate-label
+```
+
+## 关注推送工作流
+
+关注推送适合盯“不是每条都重要，但错过会可惜”的群聊信息。
+
+1. 运行 `./配置关注推送.command`。
+2. 从最近活跃群聊中选择一个或多个群聊。
+3. 写下关注描述，例如：
+
+```text
+提醒我群里出现值得进一步了解的新功能、AI/产品新想法、链接、教程、实验结果、修复方案或可执行做法。普通闲聊、只有情绪没有对象和信息量的内容不要通知。
+```
+
+4. 选择 AI provider，配置 API Key。
+5. 配置 Obsidian vault 或使用默认输出目录。
+
+后台检查不是“每隔 N 分钟必写一篇 note”。`monitor_interval_minutes` 只是轮询间隔；只有真的命中关注主题，并通过 AI 判断值得保存时，才会写入知识库和 Markdown。
+
+命中后的处理逻辑：
+
+- 高信号但无下一步动作的内容会保存在知识库和 Daily Digest，但不进入 Review Queue；单条通知仍按 `P1/P2/P3` gating 判断。
+- Review Queue 只放真正有动作的条目：`follow_up_resource`、`import_resource`、`evaluate_reference`、`review_risk`。
+- Daily Digest 当前月份默认写到 `<monitor_obsidian_root>/<monitor_obsidian_subdir>/Daily Digest/YYYY-MM-DD Daily Digest.md`；更早月份归档到 `Daily Digest/YYYY-MM/YYYY-MM-DD Daily Digest.md`。里面的主题使用 Obsidian wiki link，可直接跳转到对应笔记。
+- Review Queue audit 是维护视角，只做 dry-run 报告，用来检查 stale resource leads、旧 `read_note` 队列项和积压清理建议，不是 daily digest 的正文。
+- Review Queue cleanup 默认也是 dry-run：`scripts/review_queue.py cleanup` 只报告 legacy digest-only 队列债务；只有加 `--apply` 才会把这些非行动项标成 reviewed，并保留真正 actionable 的资源/风险条目。
+- Taxonomy migration dry-run 会预览已显式绑定到该 taxonomy 的群聊 folder 收缩，不写 SQLite，也不移动 Markdown 文件。
+- Taxonomy review brief 会输出 path/title/counts-only 的 Markdown 检查清单，包含完整 old-folder 到 new-folder mapping、未解决的 `待归类` 条目和 metadata-only backfill。
+- 写入侧的 Obsidian organizer 和 dry-run 使用同一套 taxonomy mapping。运行无参数 organizer 前，先看 `scripts/organize_obsidian.py --taxonomy-dry-run` 和 `--dry-run`；无参数命令会更新 SQLite path 并重写 Markdown。
+- Knowledge audit 会输出只读 Markdown 报告，汇总 topic relations、duplicate candidates、taxonomy review pressure 和 path cleanup candidates，方便把笔记关系共享给 Obsidian 或其他 vault 工作流，不会改 vault。
+- 显式绑定到 `human_ai_intimacy_v1` 的群聊会使用 version 2 固定 folder taxonomy；`工具与模型` 已拆成 `模型与平台` 和 `工具与方法`，交叉语义放进 `semantic_tags`，不再生成新的 subfolders。
+
+Review Queue 文件保存在 `~/.we-groupchat-obsidian/review_queue/`；里面只存派生标题、摘要、资源线索、链接和笔记路径，不复制 raw chat bodies。
+
+如果 Mac 睡眠导致普通菜单栏 timer 错过检查，程序会在醒来后做轻量补跑。默认只在命中、写入或报错时通知；如果想确认后台仍然活着，可以在菜单栏里打开“心跳通知”。
+
+## Obsidian 输出
+
+默认知识库数据库：
+
+```text
+~/.we-groupchat-obsidian/monitor_knowledge.db
+```
+
+默认 Markdown vault：
+
+```text
+~/.we-groupchat-obsidian/obsidian_knowledge/
+```
+
+如果你配置了自己的 Obsidian vault，程序只会写入配置的子目录，默认是：
+
+```text
+微信群聊/关注推送/
+```
+
+笔记路径示例：
+
+```text
+微信群聊/关注推送/示例群聊/工具更新/[链接] Claude Code 封窗解决方案.md
+```
+
+单篇知识笔记会按资源形态使用不同的标题标记：普通主题不加前缀，链接使用
+`[链接]`，文件使用 `[文件]`，同一主题同时包含两者时使用 `[链接+文件]`。
+Markdown 正文会保留摘要、关键事实、资源、相关主题和来源窗口。文件条目只记录
+文件名、消息时间、发送者线索，以及可用时的本机微信月份目录 shortcut；它不会
+复制附件，也不承诺直接定位到唯一 attachment。
+
+每个群聊文件夹也会生成一个 `00-按日期.md`，总目录会生成 `微信群聊/关注推送/00-按日期.md`。这些日期视图只保存 wiki links，不复制笔记正文；目前完整历史会保留在这两个 root-level link map 中，不再创建 `按日期/YYYY-MM.md` 月度 archive 文件夹。旧版 managed archive 文件夹只会作为清理对象处理。
+
+日期索引只会覆盖带有 `we-groupchat-obsidian:managed-date-index` 标记的文件；旧版生成过的 `wechat-summary:managed-date-index` 文件仍会被识别为 managed，以便原地升级。如果同名文件已经被你手写占用，程序会保留它，并改写到 `00-按日期.generated.md`。
+
+如果微信群聊改名，但你想让 vault 文件夹保持稳定，可以在本地配置里设置 `monitor_chat_aliases`：
+
+```json
+{
+  "monitor_chat_aliases": {
+    "<chat-username>": "稳定群聊文件夹名"
+  }
+}
+```
+
+## MCP Server
+
+以 Claude Desktop 为例，在配置文件中添加：
+
+```text
+~/Library/Application Support/Claude/claude_desktop_config.json
+```
+
+示例配置：
+
+```json
+{
+  "mcpServers": {
+    "we-groupchat-obsidian": {
+      "command": "/absolute/path/to/we-groupchat-obsidian/.venv/bin/python3",
+      "args": ["/absolute/path/to/we-groupchat-obsidian/mcp_server.py"]
+    }
+  }
+}
+```
+
+MCP 默认偏只读，但 read tools 会把本地 chat-derived data 暴露给 MCP client，管理工具也可能修改本地 metadata，例如群聊分组配置。发送微信消息由本地 `mcp_send_mode` 控制：
+
+```json
+{
+  "mcp_send_mode": "disabled"
+}
+```
+
+可选模式：
+
+- `disabled`：永不发送。
+- `dry_run`：只回显目标和内容，不触碰微信，不需要 nonce。
+- `allowlist`：只允许发送到 `mcp_send_allowlist` 里的稳定 username。
+- `enabled`：允许发送到非空目标。
+
+所有非 disabled 模式都拒绝空目标，不会再发送到“当前打开聊天”。allowlist 请使用 `example@chatroom` 这类稳定 username，不要用群显示名：
+
+```json
+{
+  "mcp_send_mode": "allowlist",
+  "mcp_send_allowlist": ["example@chatroom"]
+}
+```
+
+旧配置 `mcp_enable_send_message: true` 仍会作为 backward-compatible shortcut 映射到 `enabled`，新配置建议使用 `mcp_send_mode`。
+
+真实发送必须走两步确认。先调用 `prepare_send_message(text, chat_name)`，把返回的 nonce、目标、内容预览和过期时间展示给用户；用户确认后，再用完全相同的目标和内容调用 `confirm_send_message(nonce, text, chat_name)`。兼容旧客户端的 `send_message` 工具在真实发送模式下只会准备 nonce，不会直接发送。
+
+真实发送还需要在 macOS 中授权运行 MCP Server 的应用：
+
+```text
+系统设置 -> 隐私与安全性 -> 辅助功能
+```
+
+## 微信更新后的维护
+
+微信自动更新后，常见情况是签名恢复、数据库新增或 key 失效。先运行：
+
+```bash
+./健康检查.command
+```
+
+如果看到：
+
+```text
+[WARN] WeChat re-sign: 需要重新授权或无法检测
+[WARN] New encrypted DBs missing keys: N 个
+```
+
+运行：
+
+```bash
+./刷新数据源.command
+```
+
+完成后再次运行：
+
+```bash
+./健康检查.command
+```
+
+目标是 missing keys 变成 0。
+
+## 项目结构
+
+```text
+app.py                   # macOS 菜单栏应用入口
+mcp_server.py            # MCP Server
+ai/                      # AI provider 适配层
+core/
+  wechat_db.py           # 微信数据库读取和消息格式化
+  decryptor.py           # SQLCipher 解密
+  key_extractor.py       # 微信 DB key 提取
+  config.py              # 配置和路径管理
+  keychain.py            # macOS Keychain
+  knowledge.py           # 关注推送知识库和 Markdown 导出
+  monitor.py             # 关注推送检查逻辑
+  daily_digest.py        # 每日摘要
+  review_queue.py        # 本地待审阅队列
+  notification_target.py # 通知点击打开本地文件
+  sender.py              # 微信 UI 发送消息，可选且默认关闭
+scripts/
+  configure_monitor.py   # CLI 配置关注推送
+  health_check.py        # privacy-safe 健康检查
+  refresh_data_source.py # CLI 刷新数据库 key
+  backfill_history.py    # 历史回填到 Obsidian
+  organize_obsidian.py   # 重导出/整理 Markdown
+  daily_digest.py        # 手动生成 Daily Digest
+  review_queue.py        # 查看/标记 Review Queue
+  autostart.py           # LaunchAgent 安装/卸载
+c_src/                   # key scanner C 代码
+resources/               # 图标资源
+test_*.py                # unittest 测试
+*.command                # 面向普通用户的双击入口
+```
+
+## 开发与测试
+
+```bash
+.venv/bin/python -m unittest discover -p 'test_*.py'
+.venv/bin/python -m py_compile app.py mcp_server.py core/launch_agent.py core/monitor.py core/knowledge.py core/config.py core/wechat_db.py core/daily_digest.py core/link_preview.py core/notification_target.py core/notification_identity.py core/review_queue.py core/mcp_send_confirmation.py core/mcp_send_policy.py scripts/health_check.py scripts/refresh_data_source.py scripts/daily_digest.py scripts/review_queue.py scripts/organize_obsidian.py scripts/autostart.py
+bash -n 启动.command
+bash -n 刷新数据源.command
+```
+
+部分测试会 import macOS/AppKit 或加密相关依赖；如果本地环境卡在 import 阶段，先用上面的窄测试确认核心逻辑，再单独排查依赖。
+
+## 常见问题
+
+### 菜单栏图标看不到怎么办？
+
+macOS 菜单栏图标太多、刘海区域或菜单栏管理工具都可能把图标挤掉。配置和维护可以直接走 `.command` 文件：
+
+```bash
+./配置关注推送.command
+./健康检查.command
+./刷新数据源.command
+```
+
+### 微信更新后读不到新消息怎么办？
+
+先跑 `./健康检查.command`。如果提示 re-sign 或 missing keys，跑 `./刷新数据源.command`。
+
+### 输入管理员密码时终端没有反应？
+
+正常。macOS 的 sudo 密码输入不会显示字符或星号，输入 Mac 登录密码后回车即可。
+
+### 数据保存在哪里？
+
+主要运行数据在：
+
+```text
+~/.we-groupchat-obsidian/
+```
+
+旧版本的 `~/.wechat-summary/` 只作为 migration/compatibility 路径保留。
+
+项目虚拟环境在：
+
+```text
+项目目录/.venv/
+```
+
+## 公开仓库状态
+
+这个 repo 不应该包含个人聊天数据库、导出 Markdown、API Key、Keychain 内容、日志、`.venv`、`~/.we-groupchat-obsidian/`、legacy `~/.wechat-summary/` 或任何微信账号标识。`.gitignore` 已覆盖常见运行文件，但公开前仍建议手动检查 `git status --short` 和 secret pattern scan。
+
+## 和原仓库相比改了什么
+
+这个 fork 没有改变原项目的核心方向：仍然是在用户自己的 Mac 上读取本地微信数据库，用用户自己配置的 AI provider 做群聊总结。这里的大部分改动来自实际使用反馈：菜单栏图标找不到怎么办，微信更新后 key 失效怎么办，LaunchAgent 显示 loaded 但没真的运行怎么办，关注推送如何避免变成噪音，Obsidian 输出怎样才能长期检索和迁移。
+
+- 更完整的本地运维入口：`setup-only`、健康检查、关注推送配置、刷新数据源、历史回填、整理 Obsidian 输出、安装/卸载自启动，都有 CLI 或 `.command` 入口。
+- 微信更新恢复路径更明确：通过 `./健康检查.command` 判断 re-sign、missing keys、monitor、Obsidian、LaunchAgent 状态，再用 `./刷新数据源.command` 修复，不依赖菜单栏图标一定可见。
+- LaunchAgent 做了 public-safe 兼容：新安装使用 neutral label，旧的项目 plist 会按 `ProgramArguments` / `WorkingDirectory` 自动识别并默认保留，只有显式 `--migrate-label` 才迁移。
+- 关注推送从“有命中就吵人”调成了更 value-first 的工作流：支持多群、provider/model 配置、显式开启的链接预览、转发聊天记录解析、睡眠唤醒补跑、`P1/P2/P3` 通知分层，以及更稳定的摘要 prompt。
+- 资源线索不会因为暂时没有文件/链接而丢掉：`resource_lead` 会把“可以私发 / 晚点发 / repo 还没公开 / 求一份”这类机会作为 `follow_up_resource` 留进 Review Queue。
+- Obsidian 输出被当作本地知识库来维护：按群聊/分类组织笔记，文件名和 frontmatter 更稳定，资源区更安全，生成 root-level link-only 日期 overview，也支持不重新调用 AI 的重导出整理。
+- 新增 Daily Digest 和派生 Review Queue：只有 `follow_up_resource`、`import_resource`、`evaluate_reference`、`review_risk` 这类有明确动作的条目才进入 Review Queue；队列文件保存派生标题、摘要、资源线索、链接和笔记路径，不复制 raw chat bodies；高信号但无下一步动作的内容会保存在知识库和 Daily Digest，但不进入 Review Queue，单条通知仍按 `P1/P2/P3` gating 判断。
+- 为公开使用做了清理和测试：移除个人 runtime 默认值，补了 config sanitization、health check、LaunchAgent discovery、monitor、review queue、daily digest、notification target、date index、knowledge export 等测试。
+
+## 致谢
+
+- 上游项目：[Qizhan7/mac-wechat-summary](https://github.com/Qizhan7/mac-wechat-summary)。本项目是在原项目的本地 macOS 菜单栏总结和 MCP 基础上，继续向长期本地使用、Obsidian workflow、可靠运维和 privacy-aware public sharing 方向推进；不是 GitHub fork network 内的仓库，也不作为 upstream PR 分支维护。更多来源说明见 [NOTICE.md](NOTICE.md)。
+- [ylytdeng/wechat-decrypt](https://github.com/ylytdeng/wechat-decrypt) - 微信数据库解密方案参考
+- [Obsidian](https://obsidian.md/) - 本地 Markdown vault 与知识图谱工作流灵感来源
+
+## License
+
+本项目使用 [AGPL-3.0](LICENSE) 协议。
