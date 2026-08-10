@@ -12,23 +12,24 @@ Project lineage: this standalone derivative builds on [Qizhan7/mac-wechat-summar
 
 [完整中文版 README](README.zh-CN.md)
 
-## Real Obsidian output
+## Obsidian output preview
 
-These screens are rendered in the real Obsidian app with the everyday theme.
-For a public-safe view, they use temporary redacted copies that preserve the
-current exporter's Markdown structure: chat names, people, private projects,
-and local paths are replaced, while public company names and news topics such
-as Cloudflare, DeepSeek, and GitHub remain. Properties, wiki links, title
-markers, and note sections retain the real workflow format.
+These screens use temporary redacted copies of real exporter Markdown, laid
+out as an Obsidian light reading view. To keep the note content crisp and
+readable in the README, only the note body is shown—without the sidebar,
+ribbon, tab bar, or status bar. Chat names, people, private projects, and local
+paths are replaced, while public company names and news topics such as
+Cloudflare, DeepSeek, and GitHub remain. The schema, wiki links, title markers,
+and note sections retain the real workflow format.
 
-![Daily Digest with linked notes, resource opportunities, and risk items](docs/assets/readme/obsidian-daily-digest.jpg)
+![Daily Digest with linked notes, resource opportunities, and risk items](docs/assets/readme/obsidian-daily-digest.png)
 
 **Daily Digest** — One daily page for notes worth revisiting, resource
 opportunities, and risk items. Linked titles open the underlying knowledge
 note. Digests for the current month live directly under `Daily Digest/`; older
 months are archived under `Daily Digest/YYYY-MM/`.
 
-![Global date index linking the complete knowledge-note history](docs/assets/readme/obsidian-date-index.jpg)
+![Global date index linking the complete knowledge-note history](docs/assets/readme/obsidian-date-index.png)
 
 **Browse by date** — Global and per-chat `00-按日期.md` pages organize the full
 note history as lightweight wiki-link maps without duplicating note bodies or
@@ -36,19 +37,19 @@ creating a second monthly archive.
 
 ### Different knowledge-note types
 
-![Ordinary topic or news knowledge note](docs/assets/readme/obsidian-note-plain.jpg)
+![Ordinary topic or news knowledge note](docs/assets/readme/obsidian-note-plain.png)
 
 **Ordinary / news topic** — Keeps a structured summary, key facts, related
 topics, and a source window for later search, linking, and reorganization.
 Public companies and news subjects are intentionally left readable.
 
-![Link-specialized knowledge note](docs/assets/readme/obsidian-note-link.jpg)
+![Link-specialized knowledge note](docs/assets/readme/obsidian-note-link.png)
 
 **`[链接]` note** — Adds public URLs and link resource metadata to the summary
 and source trail, making it easy to move from the discussion back to the
 original material.
 
-![File-specialized knowledge note](docs/assets/readme/obsidian-note-file.jpg)
+![File-specialized knowledge note](docs/assets/readme/obsidian-note-file.png)
 
 **`[文件]` note** — Records the filename, message time, and sender clue. When the
 matching local WeChat month directory exists, it also provides a shortcut to

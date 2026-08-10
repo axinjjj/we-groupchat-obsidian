@@ -14,37 +14,38 @@
 ![macOS](https://img.shields.io/badge/macOS-only-lightgrey)
 ![License](https://img.shields.io/badge/License-AGPL--3.0-blue)
 
-## 实际 Obsidian 输出
+## Obsidian 输出预览
 
-下面的画面是在真实 Obsidian 里用日常 theme 渲染的。为避免公开群友和私有项目，
-展示内容使用与当前 exporter 结构一致的临时脱敏副本：群名、成员名、私有项目和
-本机路径已替换，Cloudflare、DeepSeek、GitHub 等公开公司名和新闻主题保留。
-Properties、wiki links、标题标记和正文 section 仍是实际工作流的格式。
+下面的画面由真实 exporter Markdown 的临时脱敏副本，按 Obsidian light reading view
+的排版生成。为了让 README 里的正文清楚可读，画面只保留 note body，不包含侧栏、
+ribbon、tab bar 或 status bar。群名、成员名、私有项目和本机路径已替换，
+Cloudflare、DeepSeek、GitHub 等公开公司名和新闻主题保留；schema、wiki links、
+标题标记和正文 section 仍与实际工作流一致。
 
-![Daily Digest：集中回看知识笔记、资源机会和风险项](docs/assets/readme/obsidian-daily-digest.jpg)
+![Daily Digest：集中回看知识笔记、资源机会和风险项](docs/assets/readme/obsidian-daily-digest.png)
 
 **Daily Digest**：每天把值得回看的知识笔记、资源机会和风险项汇总到一页；
 标题是可点击的 Obsidian wiki link，可以直接回到对应的单篇笔记。当前月份的
 Digest 直接放在 `Daily Digest/`，更早月份归档到 `Daily Digest/YYYY-MM/`。
 
-![00-按日期：按日期和时间浏览完整知识笔记历史](docs/assets/readme/obsidian-date-index.jpg)
+![00-按日期：按日期和时间浏览完整知识笔记历史](docs/assets/readme/obsidian-date-index.png)
 
 **按日期浏览**：总目录和每个群聊目录各有一份 link-only `00-按日期.md`，按日期
 和时间串起完整笔记历史。它不复制正文，也不创建第二套月度 archive。
 
 ### 不同类型的知识笔记
 
-![普通主题或新闻类知识笔记](docs/assets/readme/obsidian-note-plain.jpg)
+![普通主题或新闻类知识笔记](docs/assets/readme/obsidian-note-plain.png)
 
 **普通 / 新闻主题**：保留结构化摘要、关键事实、相关主题和来源窗口，适合之后
 继续搜索、链接和重组。公开公司名或新闻对象不会为了脱敏而被抹掉。
 
-![链接类型知识笔记](docs/assets/readme/obsidian-note-link.jpg)
+![链接类型知识笔记](docs/assets/readme/obsidian-note-link.png)
 
 **`[链接]` 笔记**：除了摘要与来源，还会保存公开 URL 和 link resource metadata，
 便于从群聊讨论回到原始资料。
 
-![文件类型知识笔记](docs/assets/readme/obsidian-note-file.jpg)
+![文件类型知识笔记](docs/assets/readme/obsidian-note-file.png)
 
 **`[文件]` 笔记**：记录文件名、消息时间和发送者线索；当本机对应的微信月份目录
 存在时，会给出该月份文件夹的 local shortcut。它不会把微信附件复制进 vault，
