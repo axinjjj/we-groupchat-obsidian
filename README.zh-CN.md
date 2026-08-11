@@ -111,13 +111,10 @@ git status --short
 rg -n "sk-|api[_-]?key|secret|token|password|BEGIN .*PRIVATE|wxid_|chatroom|\\.we-groupchat-obsidian|\\.wechat-summary|all_keys|enc_key|image_aes_key" .
 ```
 
-如果只是把源码包发给朋友，建议用 sanitized share zip，而不是直接压缩当前工作目录：
-
-```bash
-.venv/bin/python scripts/build_share_package.py
-```
-
-生成的 zip 会从 tracked source 构建，排除本机 runtime、`.venv`、build/cache 产物和 internal continuity docs，并额外附带一份 `群友使用说明.md` 快速入门。
+向其他人分享时，直接发送[公开 repo](https://github.com/IndelibleVivi/we-groupchat-obsidian)
+或[中文版 README](https://github.com/IndelibleVivi/we-groupchat-obsidian/blob/main/README.zh-CN.md)。
+不要重新压缩自己正在运行的 checkout；其中可能已经出现 `.venv`、本机 runtime、
+cache、日志或私有调试材料。
 
 ## 安装
 

@@ -118,16 +118,10 @@ git status --short
 rg -n "sk-|api[_-]?key|secret|token|password|BEGIN .*PRIVATE|wxid_|chatroom|\\.we-groupchat-obsidian|\\.wechat-summary|all_keys|enc_key|image_aes_key" .
 ```
 
-For a shareable source zip, build from tracked source files and exclude local
-runtime artifacts, virtualenvs, build outputs, and internal continuity notes:
-
-```bash
-.venv/bin/python scripts/build_share_package.py
-```
-
-The generated zip includes an extra `群友使用说明.md` quick-start file and
-omits internal handoff docs such as `docs/working-continuity.md` and
-`docs/superpowers/`.
+When sharing the project, send the [public repository](https://github.com/IndelibleVivi/we-groupchat-obsidian)
+or the [Chinese README](https://github.com/IndelibleVivi/we-groupchat-obsidian/blob/main/README.zh-CN.md).
+Do not re-zip a checkout that you have already run; it may contain `.venv`,
+local runtime state, caches, logs, or private debugging material.
 
 ## Requirements
 

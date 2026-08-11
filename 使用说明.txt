@@ -8,17 +8,22 @@ fork 说明，请优先阅读 README.zh-CN.md。
 
 【安装（只需一次）】
 
-第一步：解压后双击「启动.command」
+第一步：从公开 repo 获取源码
 
-  找到解压出来的文件夹，双击「启动.command」文件。
-  不要只单独拷贝某一个文件，整个文件夹要保留在一起。
+  打开 Terminal，运行：
+
+    git clone https://github.com/IndelibleVivi/we-groupchat-obsidian.git
+    cd we-groupchat-obsidian
+    ./启动.command
+
+  项目是 source-only CLI 分发，不提供 .dmg 或 bundled Python runtime。
 
 
 ---------------------------------------------
 ⚠ 遇到安全提示怎么办？
 ---------------------------------------------
 
-macOS 会拦截从网上下载的文件，这是正常的。按下面的方法解除：
+如果 macOS 拦截 .command 文件，可以按下面的方法解除：
 
   方法一（推荐）：右键打开
 
@@ -39,7 +44,7 @@ macOS 会拦截从网上下载的文件，这是正常的。按下面的方法�
 
 
 ---------------------------------------------
-第二步：确认 CLI 安装
+第二步：确认 dependencies 安装
 ---------------------------------------------
 
 首次运行或 requirements.txt 更新时，脚本会询问是否：
@@ -49,7 +54,6 @@ macOS 会拦截从网上下载的文件，这是正常的。按下面的方法�
   3. 检查微信数据目录和授权状态
 
   输入 y 才会继续安装；不同意就退出，不会偷偷改环境。
-  这是 source-only CLI 分发，不包含 .dmg 或 bundled Python runtime。
   * .venv 是项目自己的运行环境，不会污染你电脑里别的 Python。
   * 如果需要重新提取数据库 key 或重新授权，脚本会明确提示你使用
     「刷新数据源.command」或带 --allow-wechat-resign 的命令，不会在普通启动时偷偷重签名。
@@ -125,6 +129,14 @@ A：先双击「健康检查.command」查看 DB/key、re-sign、missing keys �
 Q：关闭终端窗口会怎样？
 A：关闭终端窗口会退出程序。想退出时直接关窗口或按 Ctrl+C。
 
+Q：公开 repo 更新后怎么升级？
+A：先确认当前 checkout 没有需要保留的未提交修改，然后在项目目录运行：
+
+     git pull --ff-only
+     ./启动.command
+
+   如果 requirements.txt 有变化，启动脚本会再次询问是否更新 .venv 和 dependencies。
+
 Q：可以保留后台监控，但关掉系统通知吗？
 A：可以。在菜单栏打开「关注推送」，点击「后台通知：开/关」。关闭后监控、
    Obsidian 写入和 Daily Digest 仍会继续，只静音自动 banner；手动操作反馈和
@@ -146,11 +158,11 @@ A：MCP 默认只读。发送消息需要先在 ~/.we-groupchat-obsidian/config.
    发送时微信必须已登录且在运行中，AI 会自动操作微信界面完成发送，
    发送后会自动验证消息是否成功写入数据库。
 
-Q：我要把这个工具转发给别人，怎么打包？
-A：不要直接压缩当前工作目录；这样容易把 .venv、build/cache、本机运行记录或内部交接文档一起带出去。
-   推荐在项目目录运行：
+Q：我要把这个工具分享给别人，发什么？
+A：直接发送公开 repo 或中文版 README 链接：
 
-     .venv/bin/python scripts/build_share_package.py
+     https://github.com/IndelibleVivi/we-groupchat-obsidian
+     https://github.com/IndelibleVivi/we-groupchat-obsidian/blob/main/README.zh-CN.md
 
-   它会生成一个 sanitized zip，只包含源码、README、常用命令、测试和给朋友看的「群友使用说明.md」。
-   包里不会包含 .venv、.git、notes、build/dist、__pycache__ 或 internal continuity docs。
+   不要重新压缩自己正在运行的 checkout；其中可能已经出现 .venv、本机 runtime、
+   cache、日志或私有调试材料。
