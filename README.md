@@ -86,6 +86,33 @@ page and choose `Export`; the downloaded `amount` CSV groups usage by key. This
 README links to the live pricing page instead of copying a price table that can
 become stale.
 
+## Architecture
+
+![we-groupchat-obsidian architecture](docs/assets/architecture/we-groupchat-obsidian-architecture.en.svg)
+
+The diagram follows the main path from the encrypted local WeChat database,
+through source normalization, incremental monitoring, and replaceable AI
+interpretation, into the project's durable knowledge and attention surfaces.
+Its most important boundaries are:
+
+- The WeChat database remains the raw source authority. The project reads local
+  files and maintains its own decrypted cache; it does not write back to WeChat.
+- `monitor_knowledge.db` owns derived knowledge state (`topics`, `events`,
+  `relations`, and FTS). Markdown notes, date indexes, and Daily Digests are
+  rebuildable projections: commit first, project second.
+- Remote AI calls and opt-in public URL previews cross the Mac-local boundary.
+  Ollama can keep AI interpretation local, while public URL context remains off
+  by default and is treated as untrusted input.
+- Saving knowledge, interrupting with a notification, and creating later action
+  in Review Queue are separate decisions. WeChat UI sending is a separate,
+  guarded path that is disabled by default and requires an unchanged
+  `prepare_send_message` / `confirm_send_message` nonce flow.
+
+The boxes are logical responsibilities inside one local application, not
+independently deployed microservices. Editable sources:
+[English-first Excalidraw](docs/architecture/we-groupchat-obsidian-architecture.en.excalidraw) ·
+[Chinese-first Excalidraw](docs/architecture/we-groupchat-obsidian-architecture.zh-CN.excalidraw).
+
 ## Features
 
 - Menu bar summaries for new messages, custom ranges, and day-based reviews.

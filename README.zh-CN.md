@@ -77,6 +77,25 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
 所述，在 Usage 页面选择月份并点击 `Export`；下载包中的 `amount` CSV 会按 Key
 拆分用量。README 不复制固定价目表，以免官方价格调整后留下过期数字。
 
+## 架构
+
+![we-groupchat-obsidian 架构图](docs/assets/architecture/we-groupchat-obsidian-architecture.zh-CN.svg)
+
+这张图沿着主数据路径展开：从微信本地加密数据库出发，经过来源规范化、增量监控和可替换的 AI
+解释层，进入项目持久化的知识与注意力表面。最重要的边界是：
+
+- 微信数据库始终是 raw source authority。项目只读取本地文件并维护自己的解密缓存，不回写微信数据库。
+- `monitor_knowledge.db` 持有派生知识状态，包括 `topics`、`events`、`relations` 和 FTS；
+  Markdown 主题笔记、日期索引与 Daily Digest 都是可重建 projection，遵循“先提交 SQLite，再投影”。
+- 远程 AI 调用和显式开启的公开网页预览会跨出 Mac 本地边界；Ollama 可以让 AI 解释留在本机，
+  而公开网页上下文默认关闭，并始终按 untrusted input 处理。
+- 保存知识、立刻发通知、进入 Review Queue 供以后行动，是三个独立判断。微信 UI 发送属于另一条受控路径，
+  默认关闭，并要求内容和目标不变的 `prepare_send_message` / `confirm_send_message` nonce 确认。
+
+图中的方框表示同一个本地应用内的逻辑责任边界，不是独立部署的 microservices。可编辑源文件：
+[中文主版 Excalidraw](docs/architecture/we-groupchat-obsidian-architecture.zh-CN.excalidraw) ·
+[English-first Excalidraw](docs/architecture/we-groupchat-obsidian-architecture.en.excalidraw)。
+
 ## 现在能做什么
 
 - 菜单栏总结：按群聊总结新消息、自定义最近 N 条/分钟、按天回顾、复制和打开历史总结。
