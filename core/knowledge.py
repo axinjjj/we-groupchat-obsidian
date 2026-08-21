@@ -4,6 +4,9 @@ import json
 import os
 import re
 import sqlite3
+import stat
+import tempfile
+import threading
 import time
 import unicodedata
 from datetime import datetime
@@ -23,6 +26,8 @@ from .taxonomy_assignment import TaxonomyResolution, resolve_taxonomy_profile
 KNOWLEDGE_DB = os.path.join(DATA_DIR, "monitor_knowledge.db")
 OBSIDIAN_ROOT = os.path.join(DATA_DIR, "obsidian_knowledge")
 OBSIDIAN_SUBDIR = "关注推送"
+
+_PROJECTION_WRITE_LOCKS = tuple(threading.Lock() for _ in range(64))
 
 RELATION_NOTIFY = {"new", "update", "contradiction"}
 RELATION_LABELS = {
@@ -779,6 +784,80 @@ def event_context(messages, config):
     }
 
 
+def attachment_resources(messages, config):
+    """Normalize resource envelopes for the canonical attachment outbox."""
+    resources = []
+    source_chat_username = str(config.get("monitor_chat_username") or "").strip()
+    for message_index, message in enumerate(messages or []):
+        message_resources = message.get("resources")
+        if not isinstance(message_resources, list):
+            message_resources = []
+        if not message_resources:
+            text = str(message.get("text") or message.get("content") or "")
+            for index, match in enumerate(re.finditer(r"\[文件\]\s*([^\n\r`]+)", text)):
+                name = match.group(1).strip(" -:：")
+                if name:
+                    message_resources.append({
+                        "kind": "file",
+                        "resource_index": index,
+                        "original_name": name[:240],
+                        "extension": os.path.splitext(name)[1].lstrip(".")[:20],
+                    })
+        if not message_resources:
+            continue
+
+        source_message_id = str(message.get("source_message_id") or "").strip()
+        if not source_message_id:
+            identity = "\0".join([
+                "knowledge-source-message-v1",
+                source_chat_username,
+                str(message.get("timestamp") or ""),
+                str(message.get("sender") or message.get("group_nickname") or ""),
+                str(message.get("text") or message.get("content") or ""),
+                str(message_index),
+            ])
+            source_message_id = "wgmsg_" + hashlib.sha256(identity.encode()).hexdigest()[:32]
+
+        time_text = str(message.get("time_str") or "")
+        month = _month_from_time(time_text)
+        sender = str(message.get("sender") or message.get("group_nickname") or "").strip()[:80]
+        try:
+            source_timestamp = float(message.get("timestamp") or 0)
+        except (TypeError, ValueError):
+            source_timestamp = 0
+        for fallback_index, raw in enumerate(message_resources):
+            if not isinstance(raw, dict):
+                continue
+            kind = str(raw.get("kind") or "").strip().lower()
+            if kind not in {"file", "image"}:
+                continue
+            try:
+                resource_index = int(raw.get("resource_index", fallback_index))
+            except (TypeError, ValueError):
+                resource_index = fallback_index
+            normalized = {
+                "kind": kind,
+                "resource_index": max(0, resource_index),
+                "original_name": str(raw.get("original_name") or "").strip()[:240],
+                "declared_size": raw.get("declared_size"),
+                "declared_hash": str(raw.get("declared_hash") or raw.get("md5") or "").strip().lower()[:128],
+                "attach_id": str(raw.get("attach_id") or "").strip()[:240],
+                "extension": str(raw.get("extension") or "").strip().lstrip(".")[:20],
+                "source_message_id": source_message_id,
+                "source_month": month,
+                "source_time": time_text[:40],
+                "source_timestamp": source_timestamp,
+                "source_sender": sender,
+            }
+            if normalized["declared_size"] is not None:
+                try:
+                    normalized["declared_size"] = max(0, int(normalized["declared_size"]))
+                except (TypeError, ValueError):
+                    normalized["declared_size"] = None
+            resources.append(normalized)
+    return resources
+
+
 def _is_history_summary_candidate(candidate):
     topic_key = str(candidate.get("topic_key") or "")
     event_type = str(candidate.get("event_type") or "")
@@ -803,6 +882,7 @@ class KnowledgeStore:
         read_only=False,
         taxonomy_assignments=None,
         taxonomy_aliases=None,
+        attachment_archive_root=None,
     ):
         self.db_path = os.path.expanduser(db_path)
         self.obsidian_root = os.path.expanduser(obsidian_root)
@@ -811,6 +891,9 @@ class KnowledgeStore:
         self.read_only = read_only
         self.taxonomy_assignments = dict(taxonomy_assignments or {})
         self.taxonomy_aliases = dict(taxonomy_aliases or {})
+        self.attachment_archive_root = os.path.expanduser(
+            attachment_archive_root or os.path.join(DATA_DIR, "attachment_archive")
+        )
 
     @classmethod
     def from_config(cls, config, now_func=time.time, read_only=False):
@@ -822,6 +905,7 @@ class KnowledgeStore:
             read_only=read_only,
             taxonomy_assignments=config.get("monitor_chat_taxonomy_profiles") or {},
             taxonomy_aliases=config.get("monitor_chat_aliases") or {},
+            attachment_archive_root=config.get("attachment_archive_root"),
         )
 
     def connect(self):
@@ -933,6 +1017,66 @@ class KnowledgeStore:
                 UNIQUE(source_topic_id, target_topic_id, relation)
             );
 
+            CREATE TABLE IF NOT EXISTS attachment_mentions (
+                mention_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER,
+                topic_id INTEGER,
+                source_message_id TEXT NOT NULL,
+                resource_index INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                original_name TEXT NOT NULL DEFAULT '',
+                declared_size INTEGER,
+                declared_hash TEXT NOT NULL DEFAULT '',
+                attach_id TEXT NOT NULL DEFAULT '',
+                extension TEXT NOT NULL DEFAULT '',
+                source_month TEXT NOT NULL DEFAULT '',
+                source_time TEXT NOT NULL DEFAULT '',
+                source_timestamp REAL NOT NULL DEFAULT 0,
+                source_sender TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                resolution_method TEXT NOT NULL DEFAULT '',
+                object_sha256 TEXT NOT NULL DEFAULT '',
+                last_error_code TEXT NOT NULL DEFAULT '',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_retry_at REAL NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                UNIQUE(event_id, source_message_id, resource_index),
+                FOREIGN KEY(event_id) REFERENCES events(event_id),
+                FOREIGN KEY(topic_id) REFERENCES topics(topic_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_attachment_mentions_status
+                ON attachment_mentions(status, mention_id);
+            CREATE INDEX IF NOT EXISTS idx_attachment_mentions_topic
+                ON attachment_mentions(topic_id, mention_id);
+
+            CREATE TABLE IF NOT EXISTS attachment_objects (
+                sha256 TEXT PRIMARY KEY,
+                size INTEGER NOT NULL,
+                object_relpath TEXT NOT NULL UNIQUE,
+                original_name TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS attachment_attempts (
+                attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mention_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                status TEXT NOT NULL,
+                resolution_method TEXT NOT NULL DEFAULT '',
+                error_code TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                FOREIGN KEY(mention_id) REFERENCES attachment_mentions(mention_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS attachment_worker_state (
+                worker_name TEXT PRIMARY KEY,
+                wake_generation INTEGER NOT NULL DEFAULT 0,
+                drained_generation INTEGER NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL DEFAULT 0
+            );
+
             CREATE VIRTUAL TABLE IF NOT EXISTS topic_fts USING fts5(
                 topic_id UNINDEXED,
                 title,
@@ -956,6 +1100,21 @@ class KnowledgeStore:
         self._ensure_column(conn, "events", "semantic_tags_json", "TEXT NOT NULL DEFAULT '[]'")
         self._ensure_column(conn, "events", "taxonomy_profile", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "events", "taxonomy_version", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "attachment_mentions", "attempt_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "attachment_mentions", "next_retry_at", "REAL NOT NULL DEFAULT 0")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_attachment_mentions_retry
+            ON attachment_mentions(status, next_retry_at, mention_id)
+            """
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO attachment_worker_state(
+                worker_name, wake_generation, drained_generation, updated_at
+            ) VALUES ('attachment_archive', 0, 0, 0)
+            """
+        )
         conn.commit()
 
     @staticmethod
@@ -1054,6 +1213,14 @@ class KnowledgeStore:
                     topic_id = int(row["topic_id"])
 
             event_id = self._insert_event(conn, topic_id, candidate, ctx, relation, now)
+            self._register_attachment_mentions(
+                conn,
+                event_id,
+                topic_id,
+                messages,
+                config,
+                now,
+            )
             if relation in {"update", "contradiction"} and linked_topic_id:
                 self._bump_new_topic_event_count(conn, topic_id, now)
                 rel_name = "updates" if relation == "update" else "contradicts"
@@ -1114,6 +1281,41 @@ class KnowledgeStore:
             }
         finally:
             conn.close()
+
+    @staticmethod
+    def _register_attachment_mentions(conn, event_id, topic_id, messages, config, now):
+        for resource in attachment_resources(messages, config):
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO attachment_mentions (
+                    event_id, topic_id, source_message_id, resource_index, kind,
+                    original_name, declared_size, declared_hash, attach_id, extension,
+                    source_month, source_time, source_timestamp, source_sender,
+                    status, resolution_method, object_sha256, last_error_code,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        'pending', '', '', '', ?, ?)
+                """,
+                (
+                    event_id,
+                    topic_id,
+                    resource["source_message_id"],
+                    resource["resource_index"],
+                    resource["kind"],
+                    resource["original_name"],
+                    resource["declared_size"],
+                    resource["declared_hash"],
+                    resource["attach_id"],
+                    resource["extension"],
+                    resource["source_month"],
+                    resource["source_time"],
+                    resource["source_timestamp"],
+                    resource["source_sender"],
+                    now,
+                    now,
+                ),
+            )
 
     def get_topic(self, topic_id):
         conn = self.connect()
@@ -1439,10 +1641,28 @@ class KnowledgeStore:
         relation_rows = relations.fetchall()
         if relation_rows and not isinstance(relation_rows[0], sqlite3.Row):
             relation_rows = [dict(zip(relation_columns, row)) for row in relation_rows]
-        return self._render_markdown(self._topic_dict(topic_row), event_rows, relation_rows)
+        attachment_rows = conn.execute(
+            """
+            SELECT m.kind, m.original_name, m.source_month, m.source_time,
+                   m.source_sender, m.status, m.resolution_method,
+                   m.object_sha256, o.object_relpath
+            FROM attachment_mentions m
+            LEFT JOIN attachment_objects o ON o.sha256 = m.object_sha256
+            WHERE m.topic_id = ?
+            ORDER BY m.mention_id
+            """,
+            (topic_id,),
+        ).fetchall()
+        return self._render_markdown(
+            self._topic_dict(topic_row),
+            event_rows,
+            relation_rows,
+            attachment_mentions=attachment_rows,
+        )
 
     def _render_markdown(
-        self, topic, events, relations, *, include_source_contract=True
+        self, topic, events, relations, *, include_source_contract=True,
+        attachment_mentions=(),
     ):
         title = topic["title"]
         entities = topic["entities"]
@@ -1453,6 +1673,18 @@ class KnowledgeStore:
         tags = ["wechat-monitor", safe_path_part(topic["category"], "uncategorized").replace(" ", "-")]
         display_title = _display_title(title, links, files)
         resource_types = _resource_types(links, files)
+        for mention in attachment_mentions or ():
+            kind = str(_row_get(mention, "kind", "") or "").strip()
+            if kind and kind not in resource_types:
+                resource_types.append(kind)
+        archive_by_name = {}
+        for mention in attachment_mentions or ():
+            name = str(mention["original_name"] or "").strip().lower()
+            if not name:
+                continue
+            current = archive_by_name.get(name)
+            if current is None or str(mention["status"]) in {"archived", "original_archived"}:
+                archive_by_name[name] = mention
         source_lines = []
         if include_source_contract:
             if is_history_summary(topic, events):
@@ -1476,6 +1708,7 @@ class KnowledgeStore:
             f"event_count: {int(topic['event_count'])}",
             f"has_links: {_frontmatter_bool(bool(links))}",
             f"has_files: {_frontmatter_bool(bool(files))}",
+            f"has_attachments: {_frontmatter_bool(bool(attachment_mentions))}",
             f"source_chat: {_frontmatter_scalar(topic['source_chat'])}",
             f"source_chat_username: {_frontmatter_scalar(topic.get('source_chat_username', ''))}",
             f"vault_chat_name: {_frontmatter_scalar(topic.get('vault_chat_name', ''))}",
@@ -1500,7 +1733,7 @@ class KnowledgeStore:
         else:
             lines.append("- （暂无关键事实）")
 
-        if links or files:
+        if links or files or attachment_mentions:
             lines.extend(["", "## 资源"])
             if links:
                 lines.extend(["", "### 链接"])
@@ -1513,8 +1746,51 @@ class KnowledgeStore:
                     if details:
                         line += f"（{details}）"
                     lines.append(line)
+                    archived = archive_by_name.get(str(item["name"]).strip().lower())
+                    if archived is not None:
+                        lines.append(f"  - 归档状态：{archived['status']}")
+                        if archived["object_relpath"]:
+                            object_path = os.path.join(
+                                self.attachment_archive_root,
+                                str(archived["object_relpath"]),
+                            )
+                            lines.append(f"  - 本地归档：{_file_url(object_path)}")
                     if item.get("month_dir"):
                         lines.append(f"  - 月份目录：{_file_url(item['month_dir'])}")
+            listed_names = {
+                str(item.get("name") or "").strip().lower()
+                for item in files
+                if str(item.get("name") or "").strip()
+            }
+            remaining_mentions = [
+                mention
+                for mention in attachment_mentions or ()
+                if not str(_row_get(mention, "original_name", "") or "").strip().lower()
+                or str(_row_get(mention, "original_name", "") or "").strip().lower() not in listed_names
+            ]
+            if remaining_mentions:
+                lines.extend(["", "### 附件归档"])
+                for mention in remaining_mentions:
+                    kind = str(_row_get(mention, "kind", "attachment") or "attachment")
+                    name = str(_row_get(mention, "original_name", "") or "").strip()
+                    label = name or ("图片附件" if kind == "image" else "附件")
+                    details = " · ".join(
+                        value
+                        for value in (
+                            str(_row_get(mention, "source_time", "") or "").strip(),
+                            str(_row_get(mention, "source_sender", "") or "").strip(),
+                        )
+                        if value
+                    )
+                    lines.append(f"- {label}" + (f"（{details}）" if details else ""))
+                    lines.append(f"  - 归档状态：{_row_get(mention, 'status', 'unknown')}")
+                    object_relpath = str(_row_get(mention, "object_relpath", "") or "")
+                    if object_relpath:
+                        object_path = os.path.join(self.attachment_archive_root, object_relpath)
+                        lines.append(f"  - 本地归档：{_file_url(object_path)}")
+                    source_month = str(_row_get(mention, "source_month", "") or "")
+                    if source_month:
+                        lines.append(f"  - 来源月份：{source_month}")
 
         relation_lines = []
         for rel in relations:
@@ -1543,6 +1819,15 @@ class KnowledgeStore:
             lines.append(f"- {when} · {label} · {senders or '未知'} · {window}")
 
         return "\n".join(lines).rstrip() + "\n"
+
+    def rewrite_topic_markdown(self, topic_id):
+        if self.read_only:
+            raise RuntimeError("knowledge store is read-only")
+        conn = self.connect()
+        try:
+            self._write_topic_markdown(conn, int(topic_id))
+        finally:
+            conn.close()
 
     def _unique_obsidian_path(
         self,
@@ -1884,17 +2169,38 @@ class KnowledgeStore:
 
     @staticmethod
     def _atomic_write_text(path, text):
-        tmp_path = f"{path}.tmp-{os.getpid()}"
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                f.write(text)
-            os.replace(tmp_path, path)
-        finally:
+        target = os.path.abspath(path)
+        directory = os.path.dirname(target)
+        lock_index = hashlib.sha256(target.encode("utf-8")).digest()[0] % len(
+            _PROJECTION_WRITE_LOCKS
+        )
+        with _PROJECTION_WRITE_LOCKS[lock_index]:
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=f".{os.path.basename(target)}.",
+                suffix=".tmp",
+                dir=directory,
+            )
             try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except OSError:
-                pass
+                try:
+                    target_mode = stat.S_IMODE(os.stat(target, follow_symlinks=False).st_mode)
+                except OSError:
+                    target_mode = 0o644
+                os.fchmod(fd, target_mode)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    fd = -1
+                    handle.write(text)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp_path, target)
+                tmp_path = ""
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+                if tmp_path:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
 
     def write_date_indexes(self):
         if self.read_only:

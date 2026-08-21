@@ -51,10 +51,11 @@ original material.
 
 ![File-specialized knowledge note](docs/assets/readme/obsidian-note-file.png)
 
-**`[文件]` note** — Records the filename, message time, and sender clue. When the
-matching local WeChat month directory exists, it also provides a shortcut to
-that folder. It does not copy the attachment into the vault or guarantee a
-direct pointer to one unique file.
+**`[文件]` note** — Records the filename, message time, sender clue, and archive
+resolution state. When the opt-in local archive resolves unique bytes, the note
+links to that private content-addressed object; otherwise it can still provide
+the matching WeChat month-folder hint. Attachment bytes are not copied into the
+vault itself.
 
 ## One real DeepSeek API usage sample
 
@@ -98,8 +99,19 @@ Its most important boundaries are:
 - The WeChat database remains the raw source authority. The project reads local
   files and maintains its own decrypted cache; it does not write back to WeChat.
 - `monitor_knowledge.db` owns derived knowledge state (`topics`, `events`,
-  `relations`, and FTS). Markdown notes, date indexes, and Daily Digests are
+  `relations`, FTS, and the attachment catalog). Attachment mentions commit in
+  the same transaction as their Knowledge event; byte resolution and copying
+  run later, so an archive failure never rolls back the event or rewinds its
+  monitor checkpoint. Markdown notes, date indexes, and Daily Digests are
   rebuildable projections: commit first, project second.
+- The optional source guard is a separate control-plane component, not part of
+  `TopicMonitor`. It can request a normal background WeChat launch after grace,
+  budget, and backoff checks, but it never kills or re-signs WeChat, drives its
+  UI, performs login, or treats an unknown process lookup as absence.
+- File attachment bytes can be preserved in a private local SHA-256
+  content-addressed archive. An optional backup copies immutable objects to an
+  ordinary filesystem target; verification proves the target bytes only, not a
+  sync provider's cloud-upload state.
 - Remote AI calls and opt-in public URL previews cross the Mac-local boundary.
   Ollama can keep AI interpretation local, while public URL context remains off
   by default and is treated as untrusted input.
@@ -123,6 +135,9 @@ independently deployed microservices. Editable sources:
 - Daily Digest with links back to single notes, plus an actionable review queue for concrete follow-up, import, reference, and risk-review work.
 - Global and per-chat link-only `00-按日期.md` maps for browsing the complete note history without duplicating note bodies.
 - Resource-lead detection for "can share privately / will share later / not public yet" situations where the artifact is not attached yet.
+- Opt-in attachment cataloging plus a private local content-addressed archive that deduplicates identical bytes; file and image kinds are selected explicitly.
+- Optional, separately installed WeChat source guard with grace, pause, restart budget, exponential backoff, content-free receipts, and no `KeepAlive` loop.
+- Provider-neutral filesystem snapshots for the attachment archive, including plan, run, verify, and read-only restore planning.
 - Optional link preview context for public URLs; it is off by default and must be enabled explicitly.
 - CLI and `.command` maintenance entrypoints for users whose menu bar icon is hidden.
 - MCP server for read-only chat lookup, search, summaries, images, and optional UI-based sending.
@@ -132,6 +147,13 @@ independently deployed microservices. Editable sources:
 - Runtime data is local by default: `~/.we-groupchat-obsidian/`.
 - API keys are stored in macOS Keychain, not in the repo.
 - WeChat database keys, logs, SQLite files, Markdown exports, and `.venv/` should never be committed.
+- The attachment catalog, local archive, source-guard state/receipts, and backup
+  snapshot manifests/catalogs are private runtime data. Archive objects contain the original
+  attachment bytes; do not commit or publish them.
+- A configured backup target is just a filesystem path. If that path sits in a
+  Google Drive, Dropbox, iCloud Drive, or other sync folder, that provider may
+  receive the archived bytes and manifests under its own privacy rules. This
+  project has no provider API/OAuth integration and cannot verify remote upload.
 - Extracting database keys may require ad-hoc re-signing `WeChat.app`. The regular double-click flow does not silently do this; commands that perform it are explicit.
 - Cloud AI providers receive the text you ask them to summarize. Use Ollama if you want the AI step to stay local.
 - Remote link previews are disabled by default. If you set `monitor_fetch_links: true`, the app fetches public URLs found in monitored messages, and those remote sites may receive your request metadata. Link preview has a conservative SSRF guard, but it is still a best-effort public URL preview, not a hardened crawler.
@@ -233,6 +255,43 @@ Monitor maintenance helpers:
 .venv/bin/python scripts/health_check.py --sensitive
 .venv/bin/python scripts/health_check.py --delete-sensitive-key-log
 ```
+
+Source reliability helpers:
+
+```bash
+# Optional source guard: disabled by default; enable and installation are separate.
+.venv/bin/python scripts/wechat_source_guard.py status
+.venv/bin/python scripts/wechat_source_guard.py enable
+.venv/bin/python scripts/wechat_source_guard.py pause --hours 8
+.venv/bin/python scripts/wechat_source_guard.py pause --indefinite
+.venv/bin/python scripts/wechat_source_guard.py resume
+.venv/bin/python scripts/wechat_source_guard.py check
+.venv/bin/python scripts/wechat_source_guard.py install-agent
+.venv/bin/python scripts/wechat_source_guard.py install-agent --load-now
+.venv/bin/python scripts/wechat_source_guard.py uninstall-agent
+
+# Attachment archive: disabled by default; historical backfill is read-only unless --apply is explicit.
+.venv/bin/python scripts/attachment_archive.py status
+.venv/bin/python scripts/attachment_archive.py run
+.venv/bin/python scripts/attachment_archive.py retry --mention-id <id> --run
+.venv/bin/python scripts/attachment_archive.py backfill
+.venv/bin/python scripts/attachment_archive.py backfill --apply
+
+# Optional filesystem backup target. The target may be inside a sync folder.
+.venv/bin/python scripts/attachment_backup.py set-target "<filesystem-target>"
+.venv/bin/python scripts/attachment_backup.py plan
+.venv/bin/python scripts/attachment_backup.py run
+.venv/bin/python scripts/attachment_backup.py verify
+.venv/bin/python scripts/attachment_backup.py restore-plan
+.venv/bin/python scripts/attachment_backup.py clear-target
+```
+
+`install-agent` writes a one-shot `StartInterval` plist but does not load it;
+`--load-now` is the separate activation step. `attachment_archive.py backfill`
+is a dry plan unless `--apply` is present. Backup `verify` checks bytes visible
+at the configured target and deliberately makes no claim about provider-side
+upload. See the [source reliability guide](docs/source-reliability.md) for
+states, resolver rules, storage layout, and failure boundaries.
 
 ### Guarded exact relation Markdown cleanup
 

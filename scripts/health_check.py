@@ -14,6 +14,8 @@ if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
 from core.config import DATA_DIR, active_monitor_chats, load_config
+from core.attachment_archive import AttachmentArchive
+from core.attachment_backup import AttachmentBackup
 from core.knowledge import TAXONOMY_PROFILES
 from core.key_extractor import (
     EXTRACT_LOG,
@@ -29,10 +31,13 @@ from core.review_queue import QUEUE_DIR, ReviewQueue
 from core.relation_audit import audit_relations
 from core.launch_agent import (
     launch_agent_report,
+    launch_agent_status,
     parse_launch_agent_status,
 )
 from core.notification_identity import notification_identity_status_for_launch_agent
+from core.project_identity import SOURCE_GUARD_LAUNCH_AGENT_LABEL
 from core.taxonomy_assignment import taxonomy_assignment_summary
+from core.wechat_source_guard import source_guard_status
 
 AUTOSTART_ERR_LOG = Path(DATA_DIR) / "logs" / "autostart.err.log"
 AUTOSTART_OUT_LOG = Path(DATA_DIR) / "logs" / "autostart.out.log"
@@ -205,6 +210,13 @@ def main(argv: list[str] | None = None) -> int:
     can_lookup_processes = process_lookup_available()
     wechat_running = is_wechat_running() if can_lookup_processes else None
     agent_record, agent_status = launch_agent_report(PROJECT_DIR)
+    guard_plist = (
+        Path.home()
+        / "Library"
+        / "LaunchAgents"
+        / f"{SOURCE_GUARD_LAUNCH_AGENT_LABEL}.plist"
+    )
+    guard_agent_status = launch_agent_status(SOURCE_GUARD_LAUNCH_AGENT_LABEL)
     autostart_log_label, autostart_log_line, autostart_log_failed = autostart_log_status()
     notify_backend, notify_failed = latest_notification_backend_status()
     notify_identity = notification_identity_status_for_launch_agent(agent_record)
@@ -219,6 +231,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     pending_reviews = review_queue_pending_count()
     key_log_status, key_log_warn = _sensitive_log_status(delete=args.delete_sensitive_key_log)
+    guard = source_guard_status(config)
+    attachment_archive = AttachmentArchive.from_config(config).status()
+    attachment_backup = AttachmentBackup.from_config(config).status()
 
     print("微信总结 health check")
     print("")
@@ -281,6 +296,54 @@ def main(argv: list[str] | None = None) -> int:
         f"[{ok(config.get('daily_digest_enabled', True))}] Daily digest: "
         f"{digest_state} at {config.get('daily_digest_time', '21:30')} "
         f"{config.get('daily_digest_timezone', 'Asia/Shanghai')} -> {digest_target}"
+    )
+    guard_state = guard.get("state") or "unknown"
+    guard_enabled = bool(config.get("wechat_source_guard_enabled", False))
+    guard_ok = (
+        not guard_enabled
+        or guard_state in {"healthy", "missing_grace", "restart_backoff", "paused"}
+    )
+    process_state = (
+        "unknown" if wechat_running is None else "running" if wechat_running else "absent"
+    )
+    print(
+        f"[{ok(guard_ok)}] WeChat source guard: "
+        f"{'enabled' if guard_enabled else 'disabled'} / "
+        f"{guard_state}; last={guard.get('last_result') or 'unknown'}; "
+        f"process={process_state}; pause={guard.get('pause_until') or '-'}; "
+        f"missing={int(guard.get('missing_duration') or 0)}s; "
+        f"budget={guard.get('restart_budget_remaining', 0)}; "
+        f"backoff={guard.get('backoff_until') or '-'}; "
+        f"freshness={guard.get('source_freshness') or 'unknown'}"
+    )
+    guard_agent_ok = not guard_enabled or (guard_plist.exists() and guard_agent_status.loaded)
+    print(
+        f"[{ok(guard_agent_ok)}] Source guard LaunchAgent: "
+        f"installed={guard_plist.exists()}; loaded={guard_agent_status.loaded}"
+    )
+    archive_enabled = bool(config.get("attachment_archive_enabled", False))
+    archive_counts = attachment_archive.get("counts") or {}
+    archive_count_text = ", ".join(
+        f"{key}={archive_counts[key]}" for key in sorted(archive_counts)
+    ) or "empty"
+    archive_ok = not archive_enabled or attachment_archive.get("state") in {
+        "healthy",
+        "knowledge_db_missing",
+    }
+    print(
+        f"[{ok(archive_ok)}] Attachment archive: "
+        f"{'enabled' if archive_enabled else 'disabled'} / {attachment_archive.get('state')}; "
+        f"objects={attachment_archive.get('objects', 0)}; {archive_count_text}"
+    )
+    backup_target = config.get("attachment_backup_target") or ""
+    if args.sensitive and backup_target:
+        backup_label = os.path.expanduser(backup_target)
+    else:
+        backup_label = "configured" if backup_target else "not configured (optional)"
+    backup_ok = not backup_target or attachment_backup.get("state") == "configured"
+    print(
+        f"[{ok(backup_ok)}] Attachment backup target: {backup_label}; "
+        f"complete snapshots={attachment_backup.get('complete_snapshots', 0)}"
     )
     print("")
     plist_label = agent_record.plist_path if args.sensitive else ("present" if agent_record.plist_path.exists() else "missing")

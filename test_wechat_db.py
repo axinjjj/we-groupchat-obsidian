@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import sqlite3
 import struct
@@ -108,6 +109,96 @@ class WeChatDBPagingTests(unittest.TestCase):
 
         self.assertEqual([m["timestamp"] for m in first], [101, 102, 103])
         self.assertEqual([m["timestamp"] for m in second], [104, 105, 106])
+
+
+class WeChatSourceEnvelopeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.tmp.name, "message_7.db")
+        self.username = "room@chatroom"
+        self.table_name = "Chat_source"
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(f"""
+                CREATE TABLE [{self.table_name}] (
+                    local_id INTEGER,
+                    server_id INTEGER,
+                    sort_seq INTEGER,
+                    local_type INTEGER,
+                    create_time INTEGER,
+                    message_content TEXT,
+                    WCDB_CT_message_content INTEGER,
+                    status INTEGER,
+                    packed_info_data BLOB
+                )
+            """)
+            file_xml = (
+                "sender:\n<msg><appmsg><title>reliable source.pdf</title><type>6</type>"
+                "<appattach><totallen>12</totallen><fileext>pdf</fileext>"
+                "<md5>0123456789abcdef0123456789abcdef</md5><attachid>att-7</attachid>"
+                "</appattach></appmsg></msg>"
+            )
+            conn.execute(
+                f"INSERT INTO [{self.table_name}] VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (7, 7007, 70, 49, 100, file_xml, None, 0, None),
+            )
+            image_hash = "abcdef0123456789abcdef0123456789"
+            packed = b"\x0a\x20" + image_hash.encode("ascii")
+            conn.execute(
+                f"INSERT INTO [{self.table_name}] VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (8, 8008, 80, 3, 101, "sender:\n<msg><img /></msg>", None, 0, packed),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        self.db = object.__new__(WeChatDB)
+        self.db._contacts = {"sender": "成员"}
+        self.db._nick_to_remark = {}
+        self.db._load_contacts = lambda: None
+        self.db._find_msg_table = lambda username: ([self.db_path], self.table_name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_file_metadata_is_parsed_before_text_cleaning(self):
+        message = self.db.get_messages(self.username, limit=10)[0]
+
+        self.assertEqual(message["text"], "[文件] reliable source.pdf")
+        self.assertRegex(message["source_message_id"], r"^wgmsg_[0-9a-f]{32}$")
+        self.assertEqual(message["source_envelope"]["local_id"], 7)
+        self.assertEqual(message["source_envelope"]["server_id"], 7007)
+        self.assertEqual(message["source_envelope"]["sort_seq"], 70)
+        self.assertTrue(message["source_envelope"]["rowid"])
+        self.assertNotIn("room@chatroom", json.dumps(message["source_envelope"]))
+        self.assertEqual(message["resources"], [{
+            "kind": "file",
+            "resource_index": 0,
+            "original_name": "reliable source.pdf",
+            "extension": "pdf",
+            "declared_size": 12,
+            "declared_hash": "0123456789abcdef0123456789abcdef",
+            "md5": "0123456789abcdef0123456789abcdef",
+            "attach_id": "att-7",
+            "source_message_id": message["source_message_id"],
+        }])
+
+    def test_image_packed_hash_is_preserved_without_raw_blob(self):
+        message = self.db.get_messages(self.username, limit=10)[1]
+
+        self.assertEqual(message["text"], "[图片]")
+        self.assertTrue(message["source_envelope"]["packed_info_present"])
+        self.assertNotIn("packed_info_data", message["source_envelope"])
+        self.assertEqual(message["resources"][0]["declared_hash"], "abcdef0123456789abcdef0123456789")
+
+    def test_ai_format_excludes_source_envelope_and_internal_ids(self):
+        messages = self.db.get_messages(self.username, limit=10)
+        formatted = self.db.format_messages_for_ai(messages, show_group_nickname=True)
+
+        self.assertIn("[文件] reliable source.pdf", formatted)
+        self.assertNotIn("wgmsg_", formatted)
+        self.assertNotIn("server_id", formatted)
+        self.assertNotIn("message_7.db", formatted)
 
 
 class WeChatImageDecoderTests(unittest.TestCase):

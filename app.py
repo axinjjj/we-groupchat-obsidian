@@ -101,6 +101,7 @@ from core.knowledge import (
     ensure_obsidian_vault,
     safe_obsidian_subdir,
 )
+from core.attachment_archive import process_pending_from_config
 from core.monitor import (
     HITS_DIR,
     MonitorConfigError,
@@ -912,6 +913,8 @@ class WeGroupchatObsidianApp(rumps.App):
                         "[daily-digest] canonical-event refresh failed: "
                         f"{type(exc).__name__}"
                     )
+            if not dry_run and self.config.get("attachment_archive_enabled", False):
+                self._start_attachment_archive_consumer()
 
         if status == "notified":
             hit_path = result.get("hit_path", "")
@@ -985,6 +988,25 @@ class WeGroupchatObsidianApp(rumps.App):
         }
         title, message = messages.get(status, ("检查完成", str(result)))
         _notify("关注推送", title, message)
+
+    def _start_attachment_archive_consumer(self):
+        """Consume the attachment outbox after the canonical event committed."""
+        threading.Thread(
+            target=self._run_attachment_archive_consumer,
+            daemon=True,
+        ).start()
+
+    def _run_attachment_archive_consumer(self):
+        try:
+            result = process_pending_from_config(dict(self.config))
+            if result.get("processed"):
+                print(
+                    "[attachment-archive] "
+                    f"processed={result['processed']} "
+                    f"archived={result['archived']} failed={result['failed']}"
+                )
+        except Exception as exc:
+            print(f"[attachment-archive] consumer failed: {type(exc).__name__}")
 
     def _handle_monitor_error(self, message, manual=False):
         print(f"[monitor] {message}")
@@ -1724,6 +1746,8 @@ class WeGroupchatObsidianApp(rumps.App):
 
         print("[init] 正在加载数据库...")
         self.db = WeChatDB(self.config["db_dir"], keys)
+        if self.config.get("attachment_archive_enabled", False):
+            self._start_attachment_archive_consumer()
 
         print("[init] 正在刷新群聊列表...")
         self._run_on_main(self._rebuild_chat_menu)

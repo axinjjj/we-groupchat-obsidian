@@ -232,6 +232,69 @@ def _clean_msg_text(text):
     return text
 
 
+def _optional_int(value):
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_source_value(value):
+    if value is None or isinstance(value, (str, int, float)):
+        return value
+    return str(value)
+
+
+def _xml_attribute(text, element_name, attribute_name):
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return ""
+    elem = root.find(f".//{element_name}")
+    return _clean_xml_field(elem.attrib.get(attribute_name, "")) if elem is not None else ""
+
+
+def _file_resource_metadata(text):
+    if "<appmsg" not in text or "<type>6</type>" not in text:
+        return None
+    name = _xml_field(text, "title")
+    if not name:
+        return None
+    size = None
+    for tag in ("totallen", "filesize", "size"):
+        size = _optional_int(_xml_field(text, tag))
+        if size is not None:
+            break
+    declared_hash = ""
+    for tag in ("md5", "filemd5"):
+        value = _xml_field(text, tag).strip().lower()
+        if re.fullmatch(r"[0-9a-f]{32}|[0-9a-f]{64}", value):
+            declared_hash = value
+            break
+    attach_id = _xml_field(text, "attachid")
+    extension = _xml_field(text, "fileext").lstrip(".")
+    if not extension:
+        suffix = os.path.splitext(name)[1].lstrip(".")
+        extension = suffix[:20]
+    resource = {
+        "kind": "file",
+        "resource_index": 0,
+        "original_name": name[:240],
+        "extension": extension[:20],
+    }
+    if size is not None and size >= 0:
+        resource["declared_size"] = size
+    if declared_hash:
+        resource["declared_hash"] = declared_hash
+        if len(declared_hash) == 32:
+            resource["md5"] = declared_hash
+    if attach_id:
+        resource["attach_id"] = attach_id[:240]
+    return resource
+
+
 class WeChatDB:
     """WeChat database query interface."""
 
@@ -576,6 +639,63 @@ class WeChatDB:
                 conn.close()
         return total
 
+    @staticmethod
+    def _table_columns(conn, table_name):
+        return {
+            str(row[1]).lower(): str(row[1])
+            for row in conn.execute(f"PRAGMA table_info([{table_name}])")
+        }
+
+    @staticmethod
+    def _column_expr(columns, aliases, output_name, default="NULL"):
+        for alias in aliases:
+            actual = columns.get(alias.lower())
+            if actual:
+                return f"[{actual}] AS [{output_name}]"
+        return f"{default} AS [{output_name}]"
+
+    @staticmethod
+    def _rowid_expr(conn, table_name):
+        try:
+            conn.execute(f"SELECT rowid FROM [{table_name}] LIMIT 0")
+            return "rowid AS [__rowid]"
+        except sqlite3.Error:
+            return "NULL AS [__rowid]"
+
+    @staticmethod
+    def _db_shard_identity(db_path):
+        basename = os.path.basename(str(db_path))
+        return hashlib.sha256(f"wechat-db-shard-v1\0{basename}".encode()).hexdigest()[:20]
+
+    @staticmethod
+    def _source_message_id(username, envelope):
+        parts = ["wechat-source-message-v1", hashlib.sha256(username.encode()).hexdigest()]
+        for key in ("db_shard_id", "server_id", "local_id", "sort_seq", "rowid", "create_time", "local_type"):
+            parts.append(f"{key}={envelope.get(key, '')}")
+        return "wgmsg_" + hashlib.sha256("\0".join(parts).encode()).hexdigest()[:32]
+
+    def _resource_metadata(self, text, local_type, packed_info):
+        resources = []
+        file_resource = _file_resource_metadata(text)
+        if file_resource:
+            resources.append(file_resource)
+        if int(local_type or 0) == 3 or "<img " in text or "<img>" in text:
+            file_hash = ""
+            if packed_info and isinstance(packed_info, bytes):
+                file_hash = self._extract_file_hash_from_protobuf(packed_info) or ""
+            if not file_hash:
+                for attribute in ("md5", "cdnmidimgurl"):
+                    value = _xml_attribute(text, "img", attribute).strip().lower()
+                    if re.fullmatch(r"[0-9a-f]{32}", value):
+                        file_hash = value
+                        break
+            image = {"kind": "image", "resource_index": len(resources), "original_name": ""}
+            if file_hash:
+                image["declared_hash"] = file_hash
+                image["md5"] = file_hash
+            resources.append(image)
+        return resources
+
     def get_messages(self, username, since_ts=0, limit=500, page_forward=False):
         """Get group/private chat messages.
 
@@ -603,11 +723,25 @@ class WeChatDB:
         for db_path in db_paths:
             conn = sqlite3.connect(db_path)
             try:
+                conn.row_factory = sqlite3.Row
+                columns = self._table_columns(conn, table_name)
+                select_fields = [
+                    self._column_expr(columns, ("local_type",), "local_type", "0"),
+                    self._column_expr(columns, ("create_time",), "create_time", "0"),
+                    self._column_expr(columns, ("message_content",), "message_content", "NULL"),
+                    self._column_expr(columns, ("WCDB_CT_message_content",), "content_type", "NULL"),
+                    self._column_expr(columns, ("status",), "status", "0"),
+                    self._column_expr(columns, ("local_id", "localid"), "local_id"),
+                    self._column_expr(columns, ("server_id", "serverid"), "server_id"),
+                    self._column_expr(columns, ("sort_seq", "sortseq"), "sort_seq"),
+                    self._column_expr(columns, ("packed_info_data", "packedinfodata"), "packed_info_data"),
+                    self._rowid_expr(conn, table_name),
+                ]
+                select_sql = ", ".join(select_fields)
                 if since_ts > 0:
                     order = "ASC" if page_forward else "DESC"
                     rows = conn.execute(f"""
-                        SELECT local_type, create_time, message_content,
-                               WCDB_CT_message_content, status
+                        SELECT {select_sql}
                         FROM [{table_name}]
                         WHERE create_time > ?
                         ORDER BY create_time {order}
@@ -615,13 +749,16 @@ class WeChatDB:
                     """, (since_ts, limit * 2)).fetchall()
                 else:
                     rows = conn.execute(f"""
-                        SELECT local_type, create_time, message_content,
-                               WCDB_CT_message_content, status
+                        SELECT {select_sql}
                         FROM [{table_name}]
                         ORDER BY create_time DESC
                         LIMIT ?
                     """, (limit,)).fetchall()
-                all_rows.extend(rows)
+                shard_id = self._db_shard_identity(db_path)
+                for row in rows:
+                    item = dict(row)
+                    item["db_shard_id"] = shard_id
+                    all_rows.append(item)
             except Exception:
                 pass
             finally:
@@ -631,7 +768,7 @@ class WeChatDB:
             return []
 
         # Sort by time, take the latest limit entries
-        all_rows.sort(key=lambda r: r[1])  # r[1] = create_time
+        all_rows.sort(key=lambda row: row["create_time"])
         if since_ts > 0 and page_forward:
             rows = all_rows[:limit]
         else:
@@ -643,7 +780,13 @@ class WeChatDB:
             contact_name = self._contacts.get(username, username)
 
         messages = []
-        for local_type, create_time, content, ct, status in rows:
+        for row in rows:
+            local_type = row["local_type"]
+            create_time = row["create_time"]
+            content = row["message_content"]
+            ct = row["content_type"]
+            status = row["status"]
+            packed_info = row.get("packed_info_data")
             # zstd decompression
             if ct and ct == 4 and isinstance(content, bytes):
                 try:
@@ -675,7 +818,24 @@ class WeChatDB:
             if is_group and (not sender or not sender.strip()):
                 sender = "您"
 
-            # Clean XML special messages
+            source_envelope = {
+                "db_shard_id": row["db_shard_id"],
+                "local_id": _safe_source_value(row.get("local_id")),
+                "server_id": _safe_source_value(row.get("server_id")),
+                "sort_seq": _safe_source_value(row.get("sort_seq")),
+                "rowid": _safe_source_value(row.get("__rowid")),
+                "create_time": create_time,
+                "local_type": local_type,
+                "packed_info_present": packed_info is not None,
+            }
+            source_message_id = self._source_message_id(username, source_envelope)
+            source_envelope["source_message_id"] = source_message_id
+            resources = self._resource_metadata(text, local_type, packed_info)
+            for index, resource in enumerate(resources):
+                resource["resource_index"] = index
+                resource["source_message_id"] = source_message_id
+
+            # Clean XML special messages only after structured source metadata is captured.
             cleaned = _clean_msg_text(text)
             if cleaned is None:
                 continue
@@ -688,6 +848,9 @@ class WeChatDB:
                 "timestamp": create_time,
                 "time_str": datetime.fromtimestamp(create_time).strftime("%Y-%m-%d %H:%M"),
                 "type": local_type,
+                "source_message_id": source_message_id,
+                "source_envelope": source_envelope,
+                "resources": resources,
             })
 
         return messages

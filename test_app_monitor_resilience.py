@@ -81,6 +81,39 @@ class AppMonitorResilienceTests(unittest.TestCase):
 
         refresh.assert_not_called()
 
+    def test_canonical_write_starts_nonblocking_attachment_consumer_after_commit(self):
+        app = WeGroupchatObsidianApp.__new__(WeGroupchatObsidianApp)
+        app.config = {
+            "monitor_notify_writes": False,
+            "attachment_archive_enabled": True,
+        }
+        app._start_attachment_archive_consumer = unittest.mock.Mock()
+
+        with patch("app.refresh_existing_daily_digests"):
+            app._handle_monitor_result({
+                "status": "duplicate",
+                "knowledge_event_written": True,
+                "affected_dates": [],
+            })
+
+        app._start_attachment_archive_consumer.assert_called_once_with()
+
+    def test_dry_run_never_starts_attachment_consumer(self):
+        app = WeGroupchatObsidianApp.__new__(WeGroupchatObsidianApp)
+        app.config = {
+            "monitor_notify_writes": False,
+            "attachment_archive_enabled": True,
+        }
+        app._start_attachment_archive_consumer = unittest.mock.Mock()
+
+        with patch("app.refresh_existing_daily_digests"), patch("app._notify"):
+            app._handle_monitor_result(
+                {"status": "matched", "knowledge_event_written": True},
+                dry_run=True,
+            )
+
+        app._start_attachment_archive_consumer.assert_not_called()
+
     def test_background_notification_toggle_mutes_automatic_hit_banner(self):
         app = WeGroupchatObsidianApp.__new__(WeGroupchatObsidianApp)
         app.config = {

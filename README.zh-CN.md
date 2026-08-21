@@ -47,9 +47,9 @@ Digest 直接放在 `Daily Digest/`，更早月份归档到 `Daily Digest/YYYY-M
 
 ![文件类型知识笔记](docs/assets/readme/obsidian-note-file.png)
 
-**`[文件]` 笔记**：记录文件名、消息时间和发送者线索；当本机对应的微信月份目录
-存在时，会给出该月份文件夹的 local shortcut。它不会把微信附件复制进 vault，
-也不保证直接定位到唯一文件。
+**`[文件]` 笔记**：记录文件名、消息时间、发送者线索和 archive resolution state。
+显式开启的本地 archive 成功定位唯一 bytes 后，笔记会链接到私有 content-addressed object；
+否则仍可提供对应微信月份目录的 hint。附件 bytes 不会复制进 vault 本身。
 
 ## 一次实际 DeepSeek API 用量参考
 
@@ -85,8 +85,16 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
 解释层，进入项目持久化的知识与注意力表面。最重要的边界是：
 
 - 微信数据库始终是 raw source authority。项目只读取本地文件并维护自己的解密缓存，不回写微信数据库。
-- `monitor_knowledge.db` 持有派生知识状态，包括 `topics`、`events`、`relations` 和 FTS；
-  Markdown 主题笔记、日期索引与 Daily Digest 都是可重建 projection，遵循“先提交 SQLite，再投影”。
+- `monitor_knowledge.db` 持有派生知识状态，包括 `topics`、`events`、`relations`、FTS 和附件 catalog。
+  Attachment mention 与 Knowledge event 在同一个 transaction 里提交；定位和复制 bytes 发生在 commit 之后，
+  所以归档失败不会回滚 event，也不会倒退 monitor checkpoint。Markdown 主题笔记、日期索引与 Daily Digest
+  都是可重建 projection，遵循“先提交 SQLite，再投影”。
+- 可选 source guard 是独立 control plane，不属于 `TopicMonitor`。它只会在 grace、restart budget 和 backoff
+  判定通过后，请求 macOS 正常后台打开微信；不会 kill / re-sign 微信，不操作 UI 或登录，也不会把
+  `process lookup unknown` 当成“微信不存在”。
+- 文件附件可以进入本机私有的 SHA-256 content-addressed archive，同一份 bytes 只保留一个 object。
+  可选 backup 只把 immutable objects 复制到普通 filesystem target；验证的是目标目录 bytes，
+  不是 sync provider 的云端上传状态。
 - 远程 AI 调用和显式开启的公开网页预览会跨出 Mac 本地边界；Ollama 可以让 AI 解释留在本机，
   而公开网页上下文默认关闭，并始终按 untrusted input 处理。
 - 保存知识、立刻发通知、进入 Review Queue 供以后行动，是三个独立判断。微信 UI 发送属于另一条受控路径，
@@ -106,6 +114,9 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
 - Daily Digest 和 Review Queue：高信号内容默认进入知识库和每日摘要；Digest 可以跳回单篇笔记，只把有明确下一步动作的条目放进待审阅队列。
 - 按日期浏览：全局和每个群聊各有一份 link-only `00-按日期.md`，串起完整笔记历史而不复制正文。
 - Resource Lead：识别“可以私发 / 晚点发 / repo 还没公开 / 求一份”这类资源还没出现但值得追问的窗口。
+- 附件 catalog 与本地 content-addressed archive：archive 默认关闭；启用后相同 bytes 自动 dedup，图片仍需单独 opt-in。
+- 可选、单独安装的微信 source guard：grace、pause、restart budget、exponential backoff、content-free receipts，且没有 `KeepAlive` busy loop。
+- Provider-neutral filesystem snapshot：支持 attachment archive 的 plan、run、verify 和只读 restore plan。
 - 链接和转发展开：可选择补充公开网页标题/摘要；远程链接预览默认关闭。本地微信 XML 里可见的转发聊天记录会尽量解析。
 - MCP Server：让 Claude Desktop、Claude Code、Cursor、OpenClaw 等 MCP 客户端只读查询群聊、搜索、总结、查看图片；发送消息默认关闭。
 - 运维命令：即使菜单栏图标被隐藏，也可以用 `.command` 文件配置关注推送、健康检查、刷新数据源、历史回填和安装自启动。
@@ -119,6 +130,11 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
 - 聊天内容会发送给你自己配置的 AI provider。使用 Ollama 本地模型时，内容可以完全不离开本机；使用云端 provider 时，请按对应服务的隐私规则自行判断。
 - API Key 存储在 macOS Keychain，不写入 repo。
 - 本地配置、书签、monitor state、数据库 key、日志、SQLite DB 和 Markdown 导出默认在 `~/.we-groupchat-obsidian/` 或你的 Obsidian vault 中，不应该提交到 git。旧 `~/.wechat-summary/` 只作为本机 migration/compatibility 路径保留。
+- Attachment catalog、本地 archive、source-guard state/receipts 和 backup snapshot manifest/catalog 都是私有 runtime data。
+  Archive object 含原始附件 bytes，绝不能提交或公开。
+- Backup target 只是一个 filesystem path。如果它位于 Google Drive、Dropbox、iCloud Drive 等同步目录，
+  对应 provider 可能按自己的隐私规则接收附件 bytes 和 manifest。本项目没有 provider API/OAuth，
+  也不能验证远端 upload 是否完成。
 - 远程链接预览默认关闭。只有显式设置 `monitor_fetch_links: true` 后，程序才会请求关注消息里的公开 URL；远端网站可能收到你的请求元数据。链接预览有保守的 SSRF 防护，但它仍然只是 best-effort public URL preview，不是 hardened crawler。
 - MCP read tools 会把本地 chat-derived data 暴露给 MCP client；部分管理工具可以修改本地 metadata，例如分组或配置衍生状态。
 - MCP 的发送微信消息能力默认关闭。真实 UI 发送需要显式设置 `mcp_send_mode`（`allowlist` 或 `enabled`）、授予辅助功能权限，并走 `prepare_send_message` -> 用户确认 -> `confirm_send_message` nonce 流程。
@@ -222,6 +238,42 @@ cd we-groupchat-obsidian
 .venv/bin/python scripts/health_check.py --sensitive
 .venv/bin/python scripts/health_check.py --delete-sensitive-key-log
 ```
+
+Source reliability 运维脚本：
+
+```bash
+# Source guard 默认关闭；enable 与安装/加载 LaunchAgent 是三件分开的事。
+.venv/bin/python scripts/wechat_source_guard.py status
+.venv/bin/python scripts/wechat_source_guard.py enable
+.venv/bin/python scripts/wechat_source_guard.py pause --hours 8
+.venv/bin/python scripts/wechat_source_guard.py pause --indefinite
+.venv/bin/python scripts/wechat_source_guard.py resume
+.venv/bin/python scripts/wechat_source_guard.py check
+.venv/bin/python scripts/wechat_source_guard.py install-agent
+.venv/bin/python scripts/wechat_source_guard.py install-agent --load-now
+.venv/bin/python scripts/wechat_source_guard.py uninstall-agent
+
+# Attachment archive 默认关闭；历史 backfill 没有 --apply 时只输出 plan。
+.venv/bin/python scripts/attachment_archive.py status
+.venv/bin/python scripts/attachment_archive.py run
+.venv/bin/python scripts/attachment_archive.py retry --mention-id <id> --run
+.venv/bin/python scripts/attachment_archive.py backfill
+.venv/bin/python scripts/attachment_archive.py backfill --apply
+
+# 可选 filesystem backup target，也可以指向某个同步目录。
+.venv/bin/python scripts/attachment_backup.py set-target "<filesystem-target>"
+.venv/bin/python scripts/attachment_backup.py plan
+.venv/bin/python scripts/attachment_backup.py run
+.venv/bin/python scripts/attachment_backup.py verify
+.venv/bin/python scripts/attachment_backup.py restore-plan
+.venv/bin/python scripts/attachment_backup.py clear-target
+```
+
+`install-agent` 只写入 one-shot `StartInterval` plist，不会加载；`--load-now` 才是单独的 activation。
+`attachment_archive.py backfill` 默认是 dry plan，只有显式 `--apply` 才登记历史 mention。
+Backup `verify` 只验证 configured target 上看得到的 bytes，绝不宣称 provider-side upload 已完成。
+完整状态、resolver 规则、存储结构和失败边界见
+[来源可靠性指南](docs/source-reliability.zh-CN.md)。
 
 菜单栏的 `关注推送 -> 后台通知：开/关` 是自动 banner 总开关。关闭后，
 后台监控、知识库写入和 Daily Digest 仍会继续运行，只是不再显示自动命中、

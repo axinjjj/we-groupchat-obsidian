@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
 from datetime import datetime
 from unittest.mock import patch
@@ -84,6 +85,56 @@ class KnowledgeStoreTests(unittest.TestCase):
             return [dict(r) for r in conn.execute(f"SELECT * FROM {table} ORDER BY 1")]
         finally:
             conn.close()
+
+    def test_atomic_markdown_writes_use_unique_temps_and_serialize_same_path(self):
+        path = os.path.join(self.tmp.name, "shared.md")
+        original_replace = os.replace
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_entered = threading.Event()
+        call_lock = threading.Lock()
+        calls = []
+
+        def controlled_replace(source, target):
+            with call_lock:
+                calls.append(source)
+                ordinal = len(calls)
+            if ordinal == 1:
+                first_entered.set()
+                release_first.wait(timeout=2)
+            else:
+                second_entered.set()
+            original_replace(source, target)
+
+        errors = []
+
+        def write(value):
+            try:
+                KnowledgeStore._atomic_write_text(path, value)
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        with patch.object(knowledge.os, "replace", side_effect=controlled_replace):
+            first = threading.Thread(target=write, args=("first\n",))
+            second = threading.Thread(target=write, args=("second\n",))
+            first.start()
+            self.assertTrue(first_entered.wait(timeout=2))
+            second.start()
+            self.assertFalse(second_entered.wait(timeout=0.1))
+            release_first.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+
+        self.assertEqual(errors, [])
+        self.assertTrue(second_entered.is_set())
+        self.assertEqual(len(calls), 2)
+        self.assertNotEqual(calls[0], calls[1])
+        with open(path, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "second\n")
+        self.assertEqual(
+            [name for name in os.listdir(self.tmp.name) if name.endswith(".tmp")],
+            [],
+        )
 
     @staticmethod
     def digest(path):
@@ -2330,6 +2381,102 @@ class KnowledgeStoreTests(unittest.TestCase):
         self.assertIn("### 文件", md)
         self.assertIn("test workflow.zip", md)
         self.assertIn("file://" + file_dir.replace(" ", "%20"), md)
+
+    def test_attachment_mention_is_registered_with_event_transaction(self):
+        messages = [
+            {
+                **msg(16, "蛋", "[文件] source reliability.pdf"),
+                "source_message_id": "wgmsg_fixture_001",
+                "resources": [
+                    {
+                        "kind": "file",
+                        "resource_index": 2,
+                        "original_name": "source reliability.pdf",
+                        "declared_size": 4096,
+                        "declared_hash": "a" * 32,
+                        "attach_id": "fixture-attach-id",
+                        "extension": "pdf",
+                    }
+                ],
+            }
+        ]
+
+        result = self.store.apply_event(
+            candidate(title="Source reliability 文件", links=[]),
+            messages,
+            self.config,
+            {"relation": "new"},
+        )
+
+        mentions = self.rows("attachment_mentions")
+        self.assertEqual(len(mentions), 1)
+        self.assertEqual(mentions[0]["event_id"], result["event_id"])
+        self.assertEqual(mentions[0]["topic_id"], result["topic_id"])
+        self.assertEqual(mentions[0]["source_message_id"], "wgmsg_fixture_001")
+        self.assertEqual(mentions[0]["resource_index"], 2)
+        self.assertEqual(mentions[0]["kind"], "file")
+        self.assertEqual(mentions[0]["declared_size"], 4096)
+        self.assertEqual(mentions[0]["status"], "pending")
+
+        with open(result["knowledge_path"], encoding="utf-8") as f:
+            md = f.read()
+        self.assertIn("归档状态：pending", md)
+
+    def test_attachment_registration_failure_rolls_back_event_and_topic(self):
+        messages = [
+            {
+                **msg(16, "蛋", "[文件] must-rollback.txt"),
+                "source_message_id": "wgmsg_fixture_rollback",
+                "resources": [
+                    {
+                        "kind": "file",
+                        "resource_index": 0,
+                        "original_name": "must-rollback.txt",
+                    }
+                ],
+            }
+        ]
+
+        with patch.object(
+            KnowledgeStore,
+            "_register_attachment_mentions",
+            side_effect=sqlite3.OperationalError("fixture catalog failure"),
+        ):
+            with self.assertRaisesRegex(sqlite3.OperationalError, "fixture catalog failure"):
+                self.store.apply_event(
+                    candidate(title="应整体回滚", links=[]),
+                    messages,
+                    self.config,
+                    {"relation": "new"},
+                )
+
+        self.assertEqual(self.rows("topics"), [])
+        self.assertEqual(self.rows("events"), [])
+        self.assertEqual(self.rows("attachment_mentions"), [])
+
+    def test_image_attachment_projection_keeps_sender_and_time(self):
+        messages = [{
+            **msg(18, "蛋", "[图片]"),
+            "source_message_id": "wgmsg_fixture_image",
+            "resources": [{
+                "kind": "image",
+                "resource_index": 0,
+                "original_name": "",
+                "declared_hash": "b" * 32,
+            }],
+        }]
+
+        result = self.store.apply_event(
+            candidate(title="图片附件 source reliability", links=[]),
+            messages,
+            self.config,
+            {"relation": "new"},
+        )
+
+        with open(result["knowledge_path"], encoding="utf-8") as file:
+            markdown = file.read()
+        self.assertIn("图片附件（2026-05-29 03:18 · 蛋）", markdown)
+        self.assertIn("归档状态：pending", markdown)
 
     def test_clean_filename_collision_uses_compact_month_day(self):
         first = self.store.apply_event(

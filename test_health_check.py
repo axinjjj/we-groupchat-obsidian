@@ -29,6 +29,7 @@ class HealthCheckTests(unittest.TestCase):
             "monitor_enabled": True,
             "monitor_interval_minutes": 3,
             "ai_provider": "ollama",
+            "attachment_archive_enabled": True,
         }
         record = type(
             "Record",
@@ -55,6 +56,7 @@ class HealthCheckTests(unittest.TestCase):
             patch("scripts.health_check.is_wechat_signed", return_value=False),
             patch("scripts.health_check.process_lookup_available", return_value=False),
             patch("scripts.health_check.launch_agent_report", return_value=(record, status)),
+            patch("scripts.health_check.launch_agent_status", return_value=status),
             patch("scripts.health_check.autostart_log_status", return_value=("", "", False)),
             patch("scripts.health_check.latest_notification_backend_status", return_value=("", False)),
             patch("scripts.health_check.notification_identity_status_for_launch_agent", return_value={"ok": True}),
@@ -63,6 +65,31 @@ class HealthCheckTests(unittest.TestCase):
             patch("scripts.health_check.relation_integrity_status", return_value=("unavailable", False)),
             patch("scripts.health_check.review_queue_pending_count", return_value=0),
             patch("scripts.health_check._sensitive_log_status", return_value=("absent", False)),
+            patch(
+                "scripts.health_check.source_guard_status",
+                return_value={
+                    "state": "disabled",
+                    "last_result": "disabled",
+                    "restart_budget_remaining": 3,
+                    "source_freshness": "unknown",
+                },
+            ),
+            patch(
+                "scripts.health_check.AttachmentArchive.from_config",
+                return_value=type(
+                    "ArchiveStatus",
+                    (),
+                    {"status": lambda self: {"state": "healthy", "counts": {"pending": 2}, "objects": 1}},
+                )(),
+            ),
+            patch(
+                "scripts.health_check.AttachmentBackup.from_config",
+                return_value=type(
+                    "BackupStatus",
+                    (),
+                    {"status": lambda self: {"state": "target_not_configured", "complete_snapshots": 0}},
+                )(),
+            ),
         ):
             output = StringIO()
             with redirect_stdout(output):
@@ -75,6 +102,9 @@ class HealthCheckTests(unittest.TestCase):
             text,
         )
         self.assertNotIn("Monitor chats: 未选择", text)
+        self.assertIn("WeChat source guard: disabled / disabled", text)
+        self.assertIn("Attachment archive: enabled / healthy; objects=1; pending=2", text)
+        self.assertIn("Attachment backup target: not configured (optional)", text)
 
     def test_relation_integrity_status_is_counts_only(self):
         report = {
@@ -329,6 +359,7 @@ gui/501/com.example.wechat-summary = {
                  patch("scripts.health_check.process_lookup_available", return_value=True), \
                  patch("scripts.health_check.is_wechat_running", return_value=True), \
                  patch("scripts.health_check.launch_agent_report", return_value=(agent_record, agent_status)), \
+                 patch("scripts.health_check.launch_agent_status", return_value=agent_status), \
                  patch("scripts.health_check.autostart_log_status", return_value=("Last autostart stderr", "/private/raw stderr", True)), \
                  patch("scripts.health_check.latest_notification_backend_status", return_value=("rumps ok", False)), \
                  patch(
@@ -421,6 +452,7 @@ gui/501/com.example.wechat-summary = {
                  patch("scripts.health_check.process_lookup_available", return_value=True), \
                  patch("scripts.health_check.is_wechat_running", return_value=True), \
                  patch("scripts.health_check.launch_agent_report", return_value=(agent_record, agent_status)), \
+                 patch("scripts.health_check.launch_agent_status", return_value=agent_status), \
                  patch("scripts.health_check.autostart_log_status", return_value=("Last autostart stderr", "/private/raw stderr", True)), \
                  patch("scripts.health_check.latest_notification_backend_status", return_value=("rumps ok", False)), \
                  patch(
@@ -461,6 +493,9 @@ gui/501/com.example.wechat-summary = {
                  patch("scripts.health_check.is_wechat_signed", return_value=False), \
                  patch("scripts.health_check.process_lookup_available", return_value=False), \
                  patch("scripts.health_check.launch_agent_report") as report, \
+                 patch("scripts.health_check.launch_agent_status", return_value=type(
+                     "Status", (), {"loaded": False, "running": False, "state": "", "job_state": "", "last_exit_code": ""}
+                 )()), \
                  patch("scripts.health_check.autostart_log_status", return_value=("", "", False)), \
                  patch("scripts.health_check.latest_notification_backend_status", return_value=("", False)), \
                  patch(

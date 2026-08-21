@@ -1,6 +1,7 @@
 """Configuration management - app config and WeChat data path detection."""
 import json
 import os
+import re
 import shlex
 
 from .project_identity import DATA_DIR_NAME, LEGACY_DATA_DIR_NAME
@@ -60,6 +61,23 @@ DEFAULT_CONFIG = {
     "daily_digest_time": "21:30",
     "daily_digest_timezone": "Asia/Shanghai",
     "daily_digest_dir": "",
+    "wechat_source_guard_enabled": False,
+    "wechat_source_guard_grace_seconds": 300,
+    "wechat_source_guard_interval_seconds": 300,
+    "wechat_source_guard_restart_budget": 3,
+    "wechat_source_guard_restart_window_seconds": 1800,
+    "wechat_source_guard_backoff_base_seconds": 300,
+    "wechat_source_guard_stale_seconds": 7200,
+    "wechat_source_guard_notification_cooldown_seconds": 3600,
+    "wechat_source_guard_pause_until": "",
+    "attachment_archive_enabled": False,
+    "attachment_archive_kinds": ["file"],
+    "attachment_archive_root": os.path.join(DATA_DIR, "attachment_archive"),
+    "attachment_archive_max_object_bytes": 512 * 1024 * 1024,
+    "attachment_archive_min_free_bytes": 1024 * 1024 * 1024,
+    "attachment_archive_retry_base_seconds": 300,
+    "attachment_archive_retry_max_seconds": 6 * 60 * 60,
+    "attachment_backup_target": "",
     "mcp_enable_send_message": False,
     "mcp_send_mode": "disabled",
     "mcp_send_allowlist": [],
@@ -185,6 +203,7 @@ def _sanitize_config(saved):
         "monitor_topic", "monitor_ai_provider", "monitor_ai_model",
         "monitor_knowledge_db", "monitor_obsidian_root", "monitor_obsidian_subdir",
         "daily_digest_time", "daily_digest_timezone", "daily_digest_dir",
+        "wechat_source_guard_pause_until",
         "image_aes_key",
     ):
         value = saved.get(key)
@@ -206,6 +225,7 @@ def _sanitize_config(saved):
         "background_notifications_enabled",
         "monitor_notify_writes", "monitor_notify_checkins",
         "daily_digest_enabled", "daily_digest_notify",
+        "wechat_source_guard_enabled", "attachment_archive_enabled",
         "mcp_enable_send_message",
     ):
         value = saved.get(key)
@@ -239,6 +259,17 @@ def _sanitize_config(saved):
         "monitor_ai_retry_attempts": (0, 3),
         "monitor_ai_retry_delay_seconds": (0, 60),
         "monitor_ai_failure_backoff_minutes": (1, 1440),
+        "wechat_source_guard_grace_seconds": (0, 86400),
+        "wechat_source_guard_interval_seconds": (60, 86400),
+        "wechat_source_guard_restart_budget": (1, 20),
+        "wechat_source_guard_restart_window_seconds": (60, 86400),
+        "wechat_source_guard_backoff_base_seconds": (1, 86400),
+        "wechat_source_guard_stale_seconds": (60, 604800),
+        "wechat_source_guard_notification_cooldown_seconds": (60, 604800),
+        "attachment_archive_max_object_bytes": (1024 * 1024, 10 * 1024 * 1024 * 1024),
+        "attachment_archive_min_free_bytes": (0, 1024 * 1024 * 1024 * 1024),
+        "attachment_archive_retry_base_seconds": (1, 86400),
+        "attachment_archive_retry_max_seconds": (1, 604800),
     }
     for key, (min_value, max_value) in int_ranges.items():
         value = saved.get(key)
@@ -268,6 +299,31 @@ def _sanitize_config(saved):
     daily_digest_dir = normalize_path_value(saved.get("daily_digest_dir", ""))
     if daily_digest_dir:
         cfg["daily_digest_dir"] = daily_digest_dir
+
+    pause_until = str(saved.get("wechat_source_guard_pause_until") or "").strip()
+    if pause_until == "indefinite" or re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})",
+        pause_until,
+    ):
+        cfg["wechat_source_guard_pause_until"] = pause_until
+    else:
+        cfg["wechat_source_guard_pause_until"] = ""
+
+    kinds = saved.get("attachment_archive_kinds")
+    if isinstance(kinds, list):
+        cfg["attachment_archive_kinds"] = list(dict.fromkeys(
+            item.strip().lower()
+            for item in kinds
+            if isinstance(item, str) and item.strip().lower() in {"file", "image"}
+        )) or ["file"]
+
+    attachment_archive_root = _rebase_legacy_data_path(saved.get("attachment_archive_root", ""))
+    if attachment_archive_root:
+        cfg["attachment_archive_root"] = attachment_archive_root
+
+    attachment_backup_target = normalize_path_value(saved.get("attachment_backup_target", ""))
+    if attachment_backup_target:
+        cfg["attachment_backup_target"] = attachment_backup_target
 
     return cfg
 

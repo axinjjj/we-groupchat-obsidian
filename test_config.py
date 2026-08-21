@@ -117,6 +117,64 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg["daily_digest_timezone"], "Asia/Shanghai")
         self.assertTrue(cfg["daily_digest_dir"].endswith("daily digests"))
 
+    def test_source_reliability_defaults_and_config_are_sanitized(self):
+        self.assertFalse(DEFAULT_CONFIG["wechat_source_guard_enabled"])
+        self.assertFalse(DEFAULT_CONFIG["attachment_archive_enabled"])
+        self.assertEqual(DEFAULT_CONFIG["attachment_archive_kinds"], ["file"])
+        self.assertEqual(DEFAULT_CONFIG["attachment_archive_max_object_bytes"], 512 * 1024 * 1024)
+        self.assertEqual(DEFAULT_CONFIG["attachment_archive_min_free_bytes"], 1024 * 1024 * 1024)
+        self.assertEqual(DEFAULT_CONFIG["attachment_backup_target"], "")
+
+        cfg = _sanitize_config({
+            "wechat_source_guard_enabled": True,
+            "wechat_source_guard_grace_seconds": 45,
+            "wechat_source_guard_interval_seconds": 30,
+            "wechat_source_guard_restart_budget": 4,
+            "wechat_source_guard_pause_until": "indefinite",
+            "attachment_archive_enabled": False,
+            "attachment_archive_kinds": [" image ", "file", "image", "video", 7],
+            "attachment_archive_root": "~/private attachment archive",
+            "attachment_archive_max_object_bytes": 8 * 1024 * 1024,
+            "attachment_archive_min_free_bytes": 2 * 1024 * 1024,
+            "attachment_archive_retry_base_seconds": 15,
+            "attachment_archive_retry_max_seconds": 300,
+            "attachment_backup_target": "~/Google Drive/WeChat backup",
+        })
+
+        self.assertTrue(cfg["wechat_source_guard_enabled"])
+        self.assertEqual(cfg["wechat_source_guard_grace_seconds"], 45)
+        self.assertEqual(
+            cfg["wechat_source_guard_interval_seconds"],
+            DEFAULT_CONFIG["wechat_source_guard_interval_seconds"],
+        )
+        self.assertEqual(cfg["wechat_source_guard_restart_budget"], 4)
+        self.assertEqual(cfg["wechat_source_guard_pause_until"], "indefinite")
+        self.assertFalse(cfg["attachment_archive_enabled"])
+        self.assertEqual(cfg["attachment_archive_kinds"], ["image", "file"])
+        self.assertTrue(cfg["attachment_archive_root"].endswith("private attachment archive"))
+        self.assertEqual(cfg["attachment_archive_max_object_bytes"], 8 * 1024 * 1024)
+        self.assertEqual(cfg["attachment_archive_min_free_bytes"], 2 * 1024 * 1024)
+        self.assertEqual(cfg["attachment_archive_retry_base_seconds"], 15)
+        self.assertEqual(cfg["attachment_archive_retry_max_seconds"], 300)
+        self.assertTrue(cfg["attachment_backup_target"].endswith("Google Drive/WeChat backup"))
+
+        invalid = _sanitize_config({
+            "wechat_source_guard_pause_until": "tomorrow",
+            "attachment_archive_kinds": ["video"],
+            "attachment_archive_max_object_bytes": 1,
+            "attachment_archive_min_free_bytes": -1,
+        })
+        self.assertEqual(invalid["wechat_source_guard_pause_until"], "")
+        self.assertEqual(invalid["attachment_archive_kinds"], ["file"])
+        self.assertEqual(
+            invalid["attachment_archive_max_object_bytes"],
+            DEFAULT_CONFIG["attachment_archive_max_object_bytes"],
+        )
+        self.assertEqual(
+            invalid["attachment_archive_min_free_bytes"],
+            DEFAULT_CONFIG["attachment_archive_min_free_bytes"],
+        )
+
     def test_monitor_chat_aliases_are_sanitized(self):
         cfg = _sanitize_config({
             "monitor_chat_aliases": {
