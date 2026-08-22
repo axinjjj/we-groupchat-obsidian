@@ -191,7 +191,7 @@ snapshot：
 
 ```text
 用户选定的微信群聊
-  -> 每群 scan cursor + durable file-message queue
+  -> 每群 × message shard scan cursor + durable file-message queue
   -> 既有精确 resolver + 共享本地 SHA-256 CAS
   -> 每份唯一 bytes 一个 Drive object
   -> 群聊 / source month 的 Drive shortcut projection
@@ -199,8 +199,13 @@ snapshot：
 
 第一版只接受 source envelope 中 `kind=file` 的真实文件。图片、语音、视频与表情不会进入这条 queue。
 Scanner 会跨过缺失文件与非 file 消息继续推进，因此一个暂时没有自动下载到微信 cache 的文件不会堵住
-后面的消息。`missing_retryable` 只在 due 时按有上限的 exponential backoff 重试；`ambiguous` 不猜测、
-不上传。
+后面的消息。Cursor 是 per-chat × privacy-safe message-shard cursor：某 shard 失败时只把该 shard 记为
+`source_degraded` 并保持 cursor 不动，健康 shard 仍可推进；恢复后漏读文件只会入队一次。普通
+`WeChatDB.get_messages()` 也使用 strict all-known-shards contract，任何已知 shard 失败都不会返回伪完整的
+剩余 rows。Receipt 和 health 只记录 content-free error code 与 degraded shard count，不记录 raw path、
+chat ID 或 database name。
+
+`missing_retryable` 只在 due 时按有上限的 exponential backoff 重试；`ambiguous` 不猜测、不上传。
 
 第一次 enable 会把当前已选择群聊的 cursor 初始化到“现在”，不会静默上传全部历史。历史发现严格是另一条
 plan/apply action。把某个群聊从 selected set 移除时，其 cursor、queue 与 retry state 都保留，但该群 pending
@@ -225,14 +230,18 @@ Public 默认全部关闭：
 ```
 
 Selected chat username 只存在 private local config 和独立本机 ledger。Remote chat identity 是由随机本地
-`archive_id` 加盐派生的 SHA-256 key；Drive metadata 永远不写 raw `@chatroom` username。每群 cursor
-保存 timestamp 和该 timestamp 已见过的完整 message identity set，因此同秒分页、restart 都不会漏或重。
+`archive_id` 加盐派生的 SHA-256 key；Drive metadata 永远不写 raw `@chatroom` username。每个群聊 × shard
+cursor 保存 timestamp 和该 timestamp 已见过的完整 message identity set，因此同秒分页、restart 都不会漏或重。
 `(source_message_id, resource_index)` 全局幂等。这套 DB 与 run receipt 不保存 raw chat body。
 
-主要表是 `drive_scan_state`、`drive_sync_items`、`drive_objects`、`drive_placements`、
-`drive_folders` 和 content-free `drive_sync_runs`。Menu timer、CLI 与 app startup recovery 都调用同一个
+`drive_scan_state` 保存 enable-time chat seed；canonical 增量位置保存在 `drive_scan_shards`。其余主要表是
+`drive_sync_items`、`drive_objects`、`drive_placements`、`drive_folders` 和 content-free
+`drive_sync_runs`。Menu timer、CLI 与 app startup recovery 都调用同一个
 带 non-blocking process lock 的 one-shot worker，不新增 infinite loop。Disable/pause 后不开始新的 scan/upload；
 如果开关在一个文件处理中改变，当前单文件安全结束，worker 不再取下一项。
+
+`attempt_count` 只计算 retry failure；`uploading -> shortcut_pending -> complete` 等成功状态转换不再增加
+exponential backoff。成功跨过 resolve、object 或 shortcut phase 时会重置该 phase 的连续失败计数。
 
 ### OAuth 与 credential boundary
 
@@ -244,8 +253,10 @@ https://www.googleapis.com/auth/drive.file
 
 用户自己的 OAuth client JSON 会被 normalize 到 private runtime directory，权限 `0600`；它不进入普通
 config 或 tracked source。Refresh token 只存 macOS Keychain，access token 只在内存里；请求 offline access。
-不支持 service account。Refresh token 失效或 `invalid_grant` 时，item 进入 `auth_required`，该 episode 只通知
-一次，queue 不丢。`disconnect` 只删除 Keychain refresh token，不删除 config、queue、CAS 或 Drive 文件。
+不支持 service account。`auth-status` 会实际验证 refresh token，并区分 `token_present` 与 `connected`；
+`invalid_grant` 会清除已经无效的 Keychain token，之后不会继续报告 connected。Item 进入
+`auth_required`，该 episode 只通知一次，queue 不丢。`disconnect` 只删除 Keychain refresh token，不删除
+config、queue、CAS 或 Drive 文件。
 
 ### Drive identity 与 projection
 
@@ -264,6 +275,13 @@ config 或 tracked source。Refresh token 只存 macOS Keychain，access token �
 不会重复。多个 remote object 命中同 digest 时选择一个 canonical Drive ID，记录
 `remote_duplicate_detected`，不上传第三份。Verification 优先比较 `sha256Checksum`；字段缺失时必须同时
 匹配 size 与 `md5Checksum`，才写 `uploaded_verified`。
+
+超过 5 MiB 的 object 使用真正的 resumable session：每个 `308` 都按 response `Range` 的 server-confirmed
+offset 续传；network/429/5xx 后先用空 PUT 与 `Content-Range: bytes */<total>` 查询 session。Probe 若表明
+lost final response 实际已完成，会直接采用完成 response；404 expired session 在同一 one-shot run 中最多
+重建一次。Malformed/missing/regressing Range 明确失败，不会把整 chunk 猜成已接收。Session URI 不跨进程
+持久化：进程中断后的下一 run 重新建 session，并仍通过 remote `appProperties` adopt 已完成 object；这是
+明确的 bounded restart policy，不是 blind chunk restart。
 
 同一 object 在全局只上传一次。Placement identity 是
 `(hashed_chat_key, source_month, sha256)`：同 bytes 出现在另一群或另一月份只加 shortcut。同名不同 hash
@@ -295,9 +313,12 @@ Auth、选群、enable、历史 backfill 与真实 upload 是五个分开的动�
 .venv/bin/python scripts/google_drive_file_sync.py disconnect
 ```
 
-`backfill` 不带 `--apply` 时完全只读。`enable` 只初始化当前 selected chat cursor，不会 auth、选群、运行
+`backfill` 不带 `--apply` 时完全只读。`enable` 只初始化当前 selected chat cursor seed，不会 auth、选群、运行
 backfill 或上传。菜单栏的 **Google Drive 群文件备份** submenu 提供 status、enable/disable、pause/resume、
 立即同步、选择群聊、打开 root 与重新授权；选择群聊本身也不会 enable 或 upload。
+
+CLI 的 `auth-status` 会验证 refresh token；`auth_required`、`retry_wait`、`remote_degraded`、
+`source_degraded` 和 failed one-shot result 返回非零 exit status，避免 shell 或 scheduler 把错误 JSON 当成功。
 
 ## 5. 可选 filesystem backup target
 
@@ -323,7 +344,13 @@ Target layout 完全 provider-neutral：
   receipts/<snapshot-id>.json
 ```
 
-`plan` 对 `attachment_objects` 与 privacy-bounded attachment catalog 取 stable read view，检查
+Archive root 现在持有 provider-neutral `cas_catalog.db`，记录唯一 SHA-256 object identity 与
+content-bounded source binding；Knowledge attachment lane 与 selected-chat Drive lane 都写同一个 catalog，
+不复制 bytes、不创建第二种 object identity。Filesystem snapshot 对该 catalog 与 Knowledge attachment
+catalog 取 authoritative union，因此从未命中 KnowledgeStore 的 Drive-only selected-chat object 也会进入
+plan/run/verify 和 DB-free restore plan，同时保留原有 topic/event binding 与 privacy-bounded export。
+
+`plan` 对 provider-neutral CAS objects 与 privacy-bounded attachment catalog 取 stable read view，检查
 target object 是 missing、`target_verified` 还是 `target_failed`，不写 target。`run` 用 partial file
 复制缺失 immutable object、验证 source hash 并 atomic publish target object。只有全部 object 成功，
 才写 `manifest.json` 与 `catalog.json`，最后发布 `COMPLETE`。Catalog 包含 object SHA-256/size、原始

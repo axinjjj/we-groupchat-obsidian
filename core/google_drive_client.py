@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import re
 import secrets
 
 import requests
@@ -52,6 +53,7 @@ class GoogleDriveClient:
 
     def _request(self, method, url, *, retry_auth=True, **kwargs):
         headers = dict(kwargs.pop("headers", {}) or {})
+        allowed_statuses = set(kwargs.pop("allowed_statuses", ()) or ())
         try:
             headers["Authorization"] = "Bearer " + self.oauth.access_token()
         except GoogleDriveAuthRequired:
@@ -73,8 +75,10 @@ class GoogleDriveClient:
             if retry_auth:
                 return self._request(method, url, retry_auth=False, headers={
                     key: value for key, value in headers.items() if key.lower() != "authorization"
-                }, **kwargs)
+                }, allowed_statuses=allowed_statuses, **kwargs)
             raise GoogleDriveAuthRequired("drive_unauthorized")
+        if response.status_code in allowed_statuses:
+            return response
         if response.status_code == 429 or response.status_code >= 500:
             raise GoogleDriveRetryableError(
                 f"drive_http_{response.status_code}",
@@ -92,6 +96,72 @@ class GoogleDriveClient:
                 pass
             raise GoogleDriveError(code, status_code=response.status_code)
         return response
+
+    @staticmethod
+    def _resumable_offset(response, total, previous_offset, *, allow_empty=False):
+        range_value = response.headers.get("Range") or response.headers.get("range")
+        if not range_value:
+            if allow_empty and int(previous_offset) == 0:
+                return 0
+            raise GoogleDriveError("resumable_range_missing", status_code=response.status_code)
+        match = re.fullmatch(r"bytes=0-([0-9]+)", str(range_value).strip())
+        if not match:
+            raise GoogleDriveError("resumable_range_invalid", status_code=response.status_code)
+        confirmed = int(match.group(1)) + 1
+        if confirmed < int(previous_offset):
+            raise GoogleDriveError("resumable_offset_regressed", status_code=response.status_code)
+        if confirmed >= int(total):
+            raise GoogleDriveError(
+                "resumable_range_complete_without_result",
+                status_code=response.status_code,
+            )
+        return confirmed
+
+    def _start_resumable_session(self, metadata, mime_type, size):
+        response = self._request(
+            "POST",
+            f"{DRIVE_UPLOAD_API}/files",
+            params={"uploadType": "resumable", "fields": FILE_FIELDS},
+            headers={
+                "Content-Type": "application/json; charset=UTF-8",
+                "X-Upload-Content-Type": mime_type,
+                "X-Upload-Content-Length": str(size),
+            },
+            data=json.dumps(metadata, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        )
+        location = response.headers.get("Location") or response.headers.get("location")
+        if not location:
+            raise GoogleDriveError("resumable_location_missing")
+        return location
+
+    def _probe_resumable_session(self, location, mime_type, size, previous_offset):
+        response = self._request(
+            "PUT",
+            location,
+            headers={
+                "Content-Type": mime_type,
+                "Content-Length": "0",
+                "Content-Range": f"bytes */{size}",
+            },
+            data=b"",
+            timeout=max(self.timeout, 180),
+            allowed_statuses=(308, 404),
+        )
+        if response.status_code == 404:
+            return "expired", None
+        if response.status_code in {200, 201}:
+            return "complete", self._json(response)
+        if response.status_code == 308:
+            return "resume", self._resumable_offset(
+                response,
+                size,
+                previous_offset,
+                allow_empty=True,
+            )
+        raise GoogleDriveError(
+            "resumable_probe_unexpected",
+            status_code=response.status_code,
+        )
 
     @staticmethod
     def _json(response):
@@ -212,36 +282,66 @@ class GoogleDriveClient:
                 data=body,
             ))
 
-        response = self._request(
-            "POST",
-            f"{DRIVE_UPLOAD_API}/files",
-            params={"uploadType": "resumable", "fields": FILE_FIELDS},
-            headers={
-                "Content-Type": "application/json; charset=UTF-8",
-                "X-Upload-Content-Type": mime_type,
-                "X-Upload-Content-Length": str(size),
-            },
-            data=json.dumps(metadata, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
-        )
-        location = response.headers.get("Location")
-        if not location:
-            raise GoogleDriveError("resumable_location_missing")
+        location = self._start_resumable_session(metadata, mime_type, size)
         chunk_size = 8 * 1024 * 1024
         offset = 0
+        session_restarts = 0
+        stalled_responses = 0
         with open(path, "rb") as handle:
             while offset < size:
-                chunk = handle.read(chunk_size)
+                handle.seek(offset)
+                chunk = handle.read(min(chunk_size, size - offset))
                 end = offset + len(chunk) - 1
-                response = self._request(
-                    "PUT",
-                    location,
-                    headers={
-                        "Content-Type": mime_type,
-                        "Content-Length": str(len(chunk)),
-                        "Content-Range": f"bytes {offset}-{end}/{size}",
-                    },
-                    data=chunk,
-                    timeout=max(self.timeout, 180),
-                )
-                offset = end + 1
-        return self._json(response)
+                try:
+                    response = self._request(
+                        "PUT",
+                        location,
+                        headers={
+                            "Content-Type": mime_type,
+                            "Content-Length": str(len(chunk)),
+                            "Content-Range": f"bytes {offset}-{end}/{size}",
+                        },
+                        data=chunk,
+                        timeout=max(self.timeout, 180),
+                        allowed_statuses=(308, 404),
+                    )
+                except GoogleDriveRetryableError:
+                    probe_state, probe_value = self._probe_resumable_session(
+                        location, mime_type, size, offset
+                    )
+                    if probe_state == "complete":
+                        return probe_value
+                    if probe_state == "expired":
+                        if session_restarts >= 1:
+                            raise GoogleDriveError("resumable_session_expired")
+                        session_restarts += 1
+                        location = self._start_resumable_session(metadata, mime_type, size)
+                        offset = 0
+                        stalled_responses = 0
+                        continue
+                    confirmed = int(probe_value)
+                else:
+                    if response.status_code == 404:
+                        if session_restarts >= 1:
+                            raise GoogleDriveError("resumable_session_expired")
+                        session_restarts += 1
+                        location = self._start_resumable_session(metadata, mime_type, size)
+                        offset = 0
+                        stalled_responses = 0
+                        continue
+                    if response.status_code in {200, 201}:
+                        return self._json(response)
+                    if response.status_code != 308:
+                        raise GoogleDriveError(
+                            "resumable_upload_unexpected",
+                            status_code=response.status_code,
+                        )
+                    confirmed = self._resumable_offset(response, size, offset)
+                if confirmed == offset:
+                    stalled_responses += 1
+                    if stalled_responses > 2:
+                        raise GoogleDriveError("resumable_no_progress")
+                else:
+                    stalled_responses = 0
+                offset = confirmed
+        raise GoogleDriveError("resumable_completed_without_result")

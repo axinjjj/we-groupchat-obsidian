@@ -95,9 +95,11 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
 - 文件附件可以进入本机私有的 SHA-256 content-addressed archive，同一份 bytes 只保留一个 object。
   可选 backup 只把 immutable objects 复制到普通 filesystem target；验证的是目标目录 bytes，
   不是 sync provider 的云端上传状态。
-- Direct Google Drive 文件同步是另一条 public-default-off lane：只扫描用户选定群聊，file message 不需要
-  Knowledge hit 就会进入 durable queue，复用同一 CAS，每个 digest 只上传一次，再按群聊/月份创建可读
-  shortcut。Remote identity 由 Drive file ID 持有，不由可见名称或路径持有。
+- Direct Google Drive 文件同步是另一条 public-default-off lane：只扫描用户选定群聊，以 per-chat ×
+  message-shard cursor 防止 partial shard read 推进遗漏。File message 不需要 Knowledge hit 就会进入
+  durable queue 和 archive-owned provider-neutral CAS catalog；每个 digest 只上传一次，>5 MiB upload 按
+  server-confirmed offset resumable，再按群聊/月份创建可读 shortcut。Remote identity 由 Drive file ID
+  持有，不由可见名称或路径持有。
 - 远程 AI 调用和显式开启的公开网页预览会跨出 Mac 本地边界；Ollama 可以让 AI 解释留在本机，
   而公开网页上下文默认关闭，并始终按 untrusted input 处理。
 - 保存知识、立刻发通知、进入 Review Queue 供以后行动，是三个独立判断。微信 UI 发送属于另一条受控路径，

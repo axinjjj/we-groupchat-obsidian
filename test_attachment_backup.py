@@ -6,6 +6,7 @@ import stat
 import tempfile
 import unittest
 
+from core.attachment_archive import AttachmentArchive
 from core.attachment_backup import AttachmentBackup, BACKUP_SCHEMA
 from core.knowledge import KnowledgeStore
 
@@ -311,6 +312,51 @@ class AttachmentBackupTests(unittest.TestCase):
         self.assertEqual(plan["restore_objects"], 1)
         self.assertEqual(plan["catalog_entries"], 1)
         self.assertFalse(os.path.exists(self.db_path))
+
+    def test_drive_only_cas_object_is_snapshotted_verified_and_restore_planned(self):
+        db_dir = os.path.join(self.tmp.name, "xwechat_files", "fixture", "db_storage")
+        file_root = os.path.join(os.path.dirname(db_dir), "msg", "file", "2026-05")
+        os.makedirs(file_root, exist_ok=True)
+        data = b"selected chat only bytes"
+        source_path = os.path.join(file_root, "selected-only.txt")
+        with open(source_path, "wb") as handle:
+            handle.write(data)
+        archive = AttachmentArchive(
+            self.db_path,
+            self.archive_root,
+            db_dir=db_dir,
+            min_free_bytes=0,
+        )
+
+        preserved = archive.preserve_file_mention({
+            "kind": "file",
+            "source_message_id": "wgmsg_selected_only",
+            "resource_index": 0,
+            "source_month": "2026-05",
+            "original_name": "selected-only.txt",
+            "declared_size": len(data),
+            "declared_hash": hashlib.sha256(data).hexdigest(),
+        })
+
+        self.assertEqual(preserved["status"], "ready_local")
+        self.assertEqual(archive.status()["objects"], 1)
+        conn = sqlite3.connect(self.db_path)
+        try:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM attachment_objects").fetchone()[0], 0)
+        finally:
+            conn.close()
+        backup = self.backup(suffix="drive-only")
+        self.assertEqual(backup.plan()["objects"], 1)
+        completed = backup.run()
+        self.assertEqual(backup.verify(completed["snapshot_id"])["state"], "target_verified")
+        os.unlink(os.path.join(self.archive_root, preserved["object_relpath"]))
+        restore = backup.restore_plan(completed["snapshot_id"])
+        self.assertEqual(restore["restore_objects"], 1)
+        snapshot_dir = os.path.join(self.target, "v2", "snapshots", completed["snapshot_id"])
+        with open(os.path.join(snapshot_dir, "catalog.json"), encoding="utf-8") as handle:
+            catalog = json.load(handle)
+        self.assertEqual(catalog["entries"][0]["source_message_id"], "wgmsg_selected_only")
+        self.assertNotIn("fixture", json.dumps(catalog))
 
     def test_plan_and_run_reject_unsafe_target_boundaries(self):
         self.add_object(b"boundary", "boundary.bin")

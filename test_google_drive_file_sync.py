@@ -13,6 +13,7 @@ from core.google_drive_client import (
     GoogleDriveRetryableError,
 )
 from core.google_drive_file_sync import GoogleDriveFileSync, _month
+from core.wechat_db import WeChatSourceDegraded
 
 
 ARCHIVE_ID = "11111111-2222-4333-8444-555555555555"
@@ -57,6 +58,61 @@ class FakeSource:
             else message["timestamp"] > since_ts
         )
         rows = [dict(message) for message in self.messages_by_chat.get(username, []) if comparison(message)]
+        rows.sort(key=lambda message: (message["timestamp"], message["source_message_id"]))
+        return rows[:limit] if page_forward else rows[-limit:]
+
+    def get_message_shards(self, _username):
+        return ["fixture-shard"]
+
+    def get_messages_for_shard(
+        self,
+        username,
+        _source_shard_id,
+        *,
+        since_ts=0,
+        limit=500,
+        page_forward=False,
+        since_inclusive=False,
+    ):
+        return self.get_messages(
+            username,
+            since_ts=since_ts,
+            limit=limit,
+            page_forward=page_forward,
+            since_inclusive=since_inclusive,
+        )
+
+
+class RecoveringShardSource:
+    def __init__(self, chat, shard_messages):
+        self.chat = chat
+        self.shard_messages = shard_messages
+        self.failed = {"shard-a"}
+
+    def get_message_shards(self, username):
+        return ["shard-a", "shard-b"] if username == self.chat else []
+
+    def get_messages_for_shard(
+        self,
+        username,
+        source_shard_id,
+        *,
+        since_ts=0,
+        limit=500,
+        page_forward=False,
+        since_inclusive=False,
+    ):
+        if username != self.chat or source_shard_id in self.failed:
+            raise WeChatSourceDegraded("source_shard_unavailable")
+        rows = [
+            dict(message)
+            for message in self.shard_messages[source_shard_id]
+            if message["timestamp"] >= since_ts
+            and not (
+                message["timestamp"] == since_ts
+                and not since_inclusive
+            )
+        ]
         rows.sort(key=lambda message: (message["timestamp"], message["source_message_id"]))
         return rows[:limit] if page_forward else rows[-limit:]
 
@@ -269,6 +325,52 @@ class GoogleDriveFileSyncTests(unittest.TestCase):
         self.assertFalse(os.path.exists(self.config["monitor_knowledge_db"]))
         self.assertNotIn(self.chat_b, {call[0] for call in source.calls})
 
+    def test_failed_shard_never_advances_past_unseen_file_and_recovers_exactly_once(self):
+        source = RecoveringShardSource(
+            self.chat_a,
+            {
+                "shard-a": [file_message("wgmsg_unseen_a", 100, "unseen.txt")],
+                "shard-b": [file_message("wgmsg_seen_b", 200, "seen.txt", kind="image")],
+            },
+        )
+        service = self.service(source)
+        service.initialize_selected_chat_cursors(99)
+
+        degraded = service.scan()
+
+        self.assertEqual(degraded["state"], "source_degraded")
+        shard_rows = {
+            row["source_shard_id"]: row
+            for row in self.rows("drive_scan_shards")
+        }
+        self.assertEqual(shard_rows["shard-a"]["cursor_timestamp"], 99)
+        self.assertEqual(shard_rows["shard-a"]["source_state"], "source_degraded")
+        self.assertEqual(shard_rows["shard-b"]["cursor_timestamp"], 200)
+        self.assertEqual(self.rows("drive_sync_items"), [])
+        run_result = service.run()
+        self.assertEqual(run_result["state"], "source_degraded")
+        receipt = self.rows("drive_sync_runs")[-1]
+        receipt_text = json.dumps(receipt)
+        self.assertEqual(receipt["error_code"], "source_shard_unavailable")
+        self.assertNotIn(self.chat_a, receipt_text)
+        self.assertNotIn("shard-a", receipt_text)
+        self.assertNotIn("message_", receipt_text)
+        status = service.status()
+        self.assertEqual(status["source_state"], "source_degraded")
+        self.assertEqual(status["source_degraded_shards"], 1)
+
+        source.failed.clear()
+        recovered = service.scan()
+        repeated = service.scan()
+
+        self.assertEqual(recovered["state"], "healthy")
+        self.assertEqual(recovered["queued"], 1)
+        self.assertEqual(repeated["queued"], 0)
+        self.assertEqual(
+            [row["source_message_id"] for row in self.rows("drive_sync_items")],
+            ["wgmsg_unseen_a"],
+        )
+
     def test_default_cursor_skips_history_and_explicit_backfill_is_dry_then_apply(self):
         data = b"history"
         source = FakeSource({
@@ -311,6 +413,28 @@ class GoogleDriveFileSyncTests(unittest.TestCase):
         self.assertEqual(len(self.rows("drive_objects")), 1)
         self.assertEqual(len(self.rows("drive_placements")), 2)
         self.assertTrue(all(row["status"] == "complete" for row in self.rows("drive_sync_items")))
+
+    def test_successful_state_transitions_do_not_inflate_retry_backoff(self):
+        source = FakeSource({
+            self.chat_a: [file_message("wgmsg_attempts", self.timestamp, "attempts.txt")]
+        })
+        service = self.service(source)
+        self.initialize(service)
+        service.scan()
+        item_id = self.rows("drive_sync_items")[0]["item_id"]
+
+        for state in ("upload_pending", "uploading", "shortcut_pending", "complete"):
+            service._set_item_state(item_id, state)
+
+        self.assertEqual(self.rows("drive_sync_items")[0]["attempt_count"], 0)
+        service._set_item_state(item_id, "retry_wait", error_code="drive_http_503")
+        first = self.rows("drive_sync_items")[0]
+        service._set_item_state(item_id, "retry_wait", error_code="drive_http_503")
+        second = self.rows("drive_sync_items")[0]
+        self.assertEqual(first["attempt_count"], 1)
+        self.assertEqual(second["attempt_count"], 2)
+        self.assertEqual(first["next_retry_at"], self.timestamp + 110)
+        self.assertEqual(second["next_retry_at"], self.timestamp + 120)
 
     def test_same_hash_in_two_chats_uses_one_object_and_two_shortcuts(self):
         data = b"cross chat"
@@ -493,6 +617,14 @@ class GoogleDriveFileSyncTests(unittest.TestCase):
         self.assertEqual(result["completed"], 1)
         self.assertEqual(self.drive.upload_calls, 1)
         self.assertEqual(self.drive.shortcut_calls, 2)
+
+    def test_root_lookup_preserves_retryable_failure(self):
+        service = self.service(FakeSource({}))
+        service._record_folder("root", "drive-root")
+        self.drive.fail_mode = "retry"
+
+        with self.assertRaises(GoogleDriveRetryableError):
+            service._ensure_root()
 
     def test_deselected_chat_keeps_its_queue_but_stops_resolve_and_remote_work(self):
         data = b"scope retained"

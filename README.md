@@ -113,10 +113,12 @@ Its most important boundaries are:
   ordinary filesystem target; verification proves the target bytes only, not a
   sync provider's cloud-upload state.
 - Direct Google Drive file sync is a separate, public-default-off path. It scans
-  only user-selected chats, queues file messages independently of Knowledge
-  hits, reuses the local CAS, uploads each unique digest once, and creates
-  human-readable chat/month shortcuts. Google Drive file IDs, not visible
-  names or paths, own remote identity.
+  only user-selected chats with per-chat x message-shard cursors so a partial
+  shard read cannot skip files. File messages need no Knowledge hit and enter
+  the archive-owned provider-neutral CAS catalog. Each digest uploads once,
+  transfers larger than 5 MiB resume from server-confirmed offsets, and
+  human-readable chat/month shortcuts provide the visible projection. Google
+  Drive file IDs, not visible names or paths, own remote identity.
 - Remote AI calls and opt-in public URL previews cross the Mac-local boundary.
   Ollama can keep AI interpretation local, while public URL context remains off
   by default and is treated as untrusted input.

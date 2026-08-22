@@ -223,11 +223,155 @@ class AttachmentArchive:
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
+    @property
+    def cas_catalog_path(self):
+        return os.path.join(self.archive_root, "cas_catalog.db")
+
+    def _cas_connect(self):
+        conn = sqlite3.connect(self.cas_catalog_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+    def _ensure_cas_catalog(self):
+        conn = self._cas_connect()
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS cas_objects (
+                    sha256 TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    object_relpath TEXT NOT NULL,
+                    original_name TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS cas_sources (
+                    source_message_id TEXT NOT NULL,
+                    resource_index INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    original_name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    resolution_method TEXT NOT NULL,
+                    object_sha256 TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(source_message_id, resource_index),
+                    FOREIGN KEY(object_sha256) REFERENCES cas_objects(sha256)
+                );
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        try:
+            os.chmod(self.cas_catalog_path, 0o600)
+        except OSError:
+            pass
+
+    def _record_cas_object(self, digest, size, relpath, original_name):
+        self._ensure_cas_catalog()
+        now = self.now_func()
+        conn = self._cas_connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO cas_objects(
+                    sha256, size, object_relpath, original_name, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(sha256) DO UPDATE SET
+                    size = excluded.size,
+                    object_relpath = excluded.object_relpath,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    digest,
+                    int(size),
+                    str(relpath),
+                    _safe_object_name(original_name),
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _record_cas_source(self, mention, digest, resolution_method):
+        source_message_id = str(mention.get("source_message_id") or "")
+        if not source_message_id:
+            return
+        now = self.now_func()
+        conn = self._cas_connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO cas_sources(
+                    source_message_id, resource_index, kind, original_name,
+                    status, resolution_method, object_sha256, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'ready_local', ?, ?, ?, ?)
+                ON CONFLICT(source_message_id, resource_index) DO UPDATE SET
+                    kind = excluded.kind,
+                    original_name = excluded.original_name,
+                    status = excluded.status,
+                    resolution_method = excluded.resolution_method,
+                    object_sha256 = excluded.object_sha256,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    source_message_id[:80],
+                    int(mention.get("resource_index") or 0),
+                    str(mention.get("kind") or "file")[:20],
+                    _safe_object_name(mention.get("original_name") or "attachment"),
+                    str(resolution_method or "shared_cas")[:80],
+                    digest,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def cas_catalog_snapshot(self):
+        """Return provider-neutral CAS metadata without creating catalog state."""
+        if not os.path.isfile(self.cas_catalog_path):
+            return None
+        conn = self._cas_connect()
+        try:
+            conn.execute("BEGIN")
+            objects = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT sha256, size, object_relpath, original_name FROM cas_objects ORDER BY sha256"
+                )
+            ]
+            sources = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT source_message_id, resource_index, kind, original_name,
+                           status, resolution_method, object_sha256
+                    FROM cas_sources
+                    ORDER BY object_sha256, source_message_id, resource_index
+                    """
+                )
+            ]
+            conn.commit()
+            return {"objects": objects, "sources": sources}
+        except sqlite3.Error:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def ensure_layout(self):
         _ensure_private_dir(self.archive_root)
         _ensure_private_dir(os.path.join(self.archive_root, "objects"))
         _ensure_private_dir(os.path.join(self.archive_root, "objects", "sha256"))
         _ensure_private_dir(os.path.join(self.archive_root, "tmp"))
+        self._ensure_cas_catalog()
         self.recover_partials()
 
     def _enforce_object_policy(self, size):
@@ -521,7 +665,9 @@ class AttachmentArchive:
             temp_fd = None
             final_path, size = self._finalize_temp(temp_path, digest, size, object_name)
             temp_path = ""
-            return digest, size, os.path.relpath(final_path, self.archive_root)
+            relpath = os.path.relpath(final_path, self.archive_root)
+            self._record_cas_object(digest, size, relpath, object_name)
+            return digest, size, relpath
         finally:
             os.close(source_fd)
             if temp_fd is not None:
@@ -544,7 +690,9 @@ class AttachmentArchive:
             digest = hashlib.sha256(data).hexdigest()
             final_path, size = self._finalize_temp(temp_path, digest, len(data), object_name)
             temp_path = ""
-            return digest, size, os.path.relpath(final_path, self.archive_root)
+            relpath = os.path.relpath(final_path, self.archive_root)
+            self._record_cas_object(digest, size, relpath, object_name)
+            return digest, size, relpath
         finally:
             if temp_fd >= 0:
                 os.close(temp_fd)
@@ -574,6 +722,7 @@ class AttachmentArchive:
                     declared_size=mention.get("declared_size"),
                     declared_hash=mention.get("declared_hash") or "",
                 )
+                self._record_cas_source(mention, digest, resolution.method)
                 return {
                     "status": "ready_local",
                     "resolution_method": resolution.method,
@@ -591,7 +740,7 @@ class AttachmentArchive:
                 "resolution_method": "shared_cas",
                 "error_code": exc.code,
             }
-        except (OSError, ValueError):
+        except (OSError, ValueError, sqlite3.Error):
             return {
                 "status": "retry_wait",
                 "resolution_method": "shared_cas",
@@ -838,7 +987,7 @@ class AttachmentArchive:
                                 self._record_success(conn, mention, resolution, digest, size, relpath, now)
                                 conn.commit()
                                 archived += 1
-                            except (ArchiveError, OSError, ValueError) as exc:
+                            except (ArchiveError, OSError, ValueError, sqlite3.Error) as exc:
                                 code = exc.code if isinstance(exc, ArchiveError) else "archive_failed"
                                 status = code if code in {
                                     "source_changed",
@@ -867,12 +1016,29 @@ class AttachmentArchive:
             }
 
     def status(self):
+        cas_snapshot = None
+        cas_catalog_error = False
+        try:
+            cas_snapshot = self.cas_catalog_snapshot()
+        except sqlite3.Error:
+            cas_catalog_error = True
+        if cas_catalog_error:
+            return {
+                "state": "catalog_unavailable",
+                "counts": {},
+                "objects": 0,
+                "object_bytes": 0,
+            }
+        cas_objects = {
+            row["sha256"]: (int(row["size"]), row["object_relpath"])
+            for row in (cas_snapshot or {}).get("objects", [])
+        }
         if not os.path.exists(self.db_path):
             return {
                 "state": "knowledge_db_missing",
                 "counts": {},
-                "objects": 0,
-                "object_bytes": 0,
+                "objects": len(cas_objects),
+                "object_bytes": sum(value[0] for value in cas_objects.values()),
             }
         conn = self._connect()
         try:
@@ -882,14 +1048,16 @@ class AttachmentArchive:
                     "SELECT status, COUNT(*) AS count FROM attachment_mentions GROUP BY status"
                 )
             }
-            objects = conn.execute(
-                "SELECT COUNT(*) AS count, COALESCE(SUM(size), 0) AS bytes FROM attachment_objects"
-            ).fetchone()
+            for row in conn.execute("SELECT sha256, size, object_relpath FROM attachment_objects"):
+                cas_objects.setdefault(
+                    str(row["sha256"]),
+                    (int(row["size"]), str(row["object_relpath"])),
+                )
             return {
                 "state": "healthy",
                 "counts": counts,
-                "objects": int(objects["count"]),
-                "object_bytes": int(objects["bytes"]),
+                "objects": len(cas_objects),
+                "object_bytes": sum(value[0] for value in cas_objects.values()),
             }
         except sqlite3.Error:
             return {"state": "catalog_unavailable", "counts": {}, "objects": 0, "object_bytes": 0}

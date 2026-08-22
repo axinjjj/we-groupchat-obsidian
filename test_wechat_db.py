@@ -9,7 +9,7 @@ import unittest
 from Crypto.Cipher import AES
 
 from core.image_decoder import decode_wechat_image_data, detect_mime
-from core.wechat_db import WeChatDB
+from core.wechat_db import WeChatDB, WeChatSourceDegraded
 
 
 class WeChatDBCacheRefreshTests(unittest.TestCase):
@@ -120,6 +120,57 @@ class WeChatDBPagingTests(unittest.TestCase):
         )
 
         self.assertEqual([m["timestamp"] for m in messages], [103, 104, 105])
+
+
+class WeChatDBShardCompletenessTests(unittest.TestCase):
+    def test_get_messages_raises_content_free_error_instead_of_returning_partial_shards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            message_dir = os.path.join(tmp, "message")
+            os.makedirs(message_dir)
+            healthy_path = os.path.join(message_dir, "message_0.db")
+            broken_path = os.path.join(message_dir, "message_1.db")
+            username = "strict-room@chatroom"
+            table_name = f"Msg_{hashlib.md5(username.encode()).hexdigest()}"
+            conn = sqlite3.connect(healthy_path)
+            try:
+                conn.execute(
+                    f"""
+                    CREATE TABLE [{table_name}] (
+                        local_type INTEGER,
+                        create_time INTEGER,
+                        message_content TEXT,
+                        WCDB_CT_message_content INTEGER,
+                        status INTEGER
+                    )
+                    """
+                )
+                conn.execute(
+                    f"INSERT INTO [{table_name}] VALUES (1, 200, 'sender:\nhealthy', NULL, 0)"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            with open(broken_path, "wb") as handle:
+                handle.write(b"not sqlite")
+            db = WeChatDB(tmp, {
+                "message/message_0.db": {"enc_key": "fixture"},
+                "message/message_1.db": {"enc_key": "fixture"},
+            })
+            db._contacts = {"sender": "成员"}
+            db._contacts_full = []
+            db._nick_to_remark = {}
+            db._load_contacts = lambda: None
+            db._get_decrypted_db = lambda rel_key: (
+                healthy_path if rel_key.endswith("message_0.db") else broken_path
+            )
+
+            with self.assertRaises(WeChatSourceDegraded) as raised:
+                db.get_messages(username, since_ts=100, page_forward=True)
+
+            self.assertEqual(raised.exception.code, "source_shard_unavailable")
+            self.assertNotIn(tmp, str(raised.exception))
+            self.assertNotIn(username, str(raised.exception))
+            self.assertNotIn("message_1.db", str(raised.exception))
 
 
 class WeChatSourceEnvelopeTests(unittest.TestCase):

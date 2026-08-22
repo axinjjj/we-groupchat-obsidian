@@ -25,6 +25,7 @@ from .google_drive_client import (
     GoogleDriveError,
     GoogleDriveRetryableError,
 )
+from .wechat_db import WeChatSourceDegraded
 
 
 SCHEMA_VERSION = 1
@@ -179,6 +180,17 @@ class GoogleDriveFileSync:
                     cursor_timestamp INTEGER NOT NULL,
                     cursor_message_ids_json TEXT NOT NULL DEFAULT '[]',
                     updated_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS drive_scan_shards (
+                    chat_username TEXT NOT NULL,
+                    source_shard_id TEXT NOT NULL,
+                    cursor_timestamp INTEGER NOT NULL,
+                    cursor_message_ids_json TEXT NOT NULL DEFAULT '[]',
+                    source_state TEXT NOT NULL DEFAULT 'healthy',
+                    last_error_code TEXT NOT NULL DEFAULT '',
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(chat_username, source_shard_id)
                 );
 
                 CREATE TABLE IF NOT EXISTS drive_sync_items (
@@ -341,12 +353,13 @@ class GoogleDriveFileSync:
             state.get("google_drive_file_sync_paused", False)
         )
 
-    def _source_page(self, username, cursor_timestamp, seen_ids, limit):
+    def _source_page(self, username, source_shard_id, cursor_timestamp, seen_ids, limit):
         if self.source is None:
             raise DriveSyncError("source_unavailable")
         request_limit = max(1, int(limit)) + len(seen_ids)
-        messages = self.source.get_messages(
+        messages = self.source.get_messages_for_shard(
             username,
+            source_shard_id,
             since_ts=max(0, int(cursor_timestamp)),
             limit=request_limit,
             page_forward=True,
@@ -363,6 +376,62 @@ class GoogleDriveFileSync:
             fresh.append(message)
         fresh.sort(key=lambda item: (int(item.get("timestamp") or 0), str(item.get("source_message_id") or "")))
         return fresh[:limit]
+
+    @staticmethod
+    def _source_error_code(exc):
+        code = str(getattr(exc, "code", "") or "")
+        if code in {
+            "source_shard_unavailable",
+            "source_shard_unknown",
+            "source_shards_unavailable",
+        }:
+            return code
+        return "source_shard_unavailable"
+
+    def _shard_state(self, chat_username, source_shard_id, seed):
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO drive_scan_shards(
+                    chat_username, source_shard_id, cursor_timestamp,
+                    cursor_message_ids_json, source_state, last_error_code, updated_at
+                ) VALUES (?, ?, ?, ?, 'healthy', '', ?)
+                """,
+                (
+                    chat_username,
+                    source_shard_id,
+                    int(seed["cursor_timestamp"]),
+                    str(seed["cursor_message_ids_json"] or "[]"),
+                    self.now_func(),
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM drive_scan_shards
+                WHERE chat_username = ? AND source_shard_id = ?
+                """,
+                (chat_username, source_shard_id),
+            ).fetchone()
+            conn.commit()
+            return row
+        finally:
+            conn.close()
+
+    def _mark_shard_degraded(self, chat_username, source_shard_id, error_code):
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                UPDATE drive_scan_shards
+                SET source_state = 'source_degraded', last_error_code = ?, updated_at = ?
+                WHERE chat_username = ? AND source_shard_id = ?
+                """,
+                (error_code, self.now_func(), chat_username, source_shard_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     @staticmethod
     def _cursor_after(messages, old_timestamp, old_ids):
@@ -429,6 +498,8 @@ class GoogleDriveFileSync:
         scanned = 0
         queued = 0
         initialized = 0
+        degraded_shards = 0
+        source_error_code = ""
         for chat in chats:
             conn = self._connect()
             try:
@@ -442,41 +513,74 @@ class GoogleDriveFileSync:
                 self.initialize_selected_chat_cursors()
                 initialized += 1
                 continue
-            cursor_timestamp = int(state["cursor_timestamp"])
             try:
-                seen_ids = set(json.loads(state["cursor_message_ids_json"] or "[]"))
-            except (TypeError, ValueError, json.JSONDecodeError):
-                seen_ids = set()
-            messages = self._source_page(
-                chat["username"], cursor_timestamp, seen_ids, max_messages
-            )
-            new_timestamp, new_ids = self._cursor_after(messages, cursor_timestamp, seen_ids)
-            now = self.now_func()
-            conn = self._connect()
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                queued += self._insert_file_items(conn, chat, messages, now)
-                conn.execute(
-                    """
-                    UPDATE drive_scan_state
-                    SET cursor_timestamp = ?, cursor_message_ids_json = ?, updated_at = ?
-                    WHERE chat_username = ?
-                    """,
-                    (new_timestamp, json.dumps(sorted(new_ids)), now, chat["username"]),
+                source_shards = list(self.source.get_message_shards(chat["username"]))
+            except WeChatSourceDegraded as exc:
+                degraded_shards += 1
+                source_error_code = self._source_error_code(exc)
+                continue
+            if not source_shards:
+                degraded_shards += 1
+                source_error_code = "source_shards_unavailable"
+                continue
+            for source_shard_id in source_shards:
+                shard_state = self._shard_state(chat["username"], source_shard_id, state)
+                cursor_timestamp = int(shard_state["cursor_timestamp"])
+                try:
+                    seen_ids = set(json.loads(shard_state["cursor_message_ids_json"] or "[]"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    seen_ids = set()
+                try:
+                    messages = self._source_page(
+                        chat["username"], source_shard_id,
+                        cursor_timestamp, seen_ids, max_messages,
+                    )
+                except WeChatSourceDegraded as exc:
+                    code = self._source_error_code(exc)
+                    self._mark_shard_degraded(chat["username"], source_shard_id, code)
+                    degraded_shards += 1
+                    source_error_code = code
+                    continue
+                new_timestamp, new_ids = self._cursor_after(
+                    messages, cursor_timestamp, seen_ids
                 )
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-            finally:
-                conn.close()
-            scanned += len(messages)
+                now = self.now_func()
+                conn = self._connect()
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    queued += self._insert_file_items(conn, chat, messages, now)
+                    conn.execute(
+                        """
+                        UPDATE drive_scan_shards
+                        SET cursor_timestamp = ?, cursor_message_ids_json = ?,
+                            source_state = 'healthy', last_error_code = '', updated_at = ?
+                        WHERE chat_username = ? AND source_shard_id = ?
+                        """,
+                        (
+                            new_timestamp,
+                            json.dumps(sorted(new_ids)),
+                            now,
+                            chat["username"],
+                            source_shard_id,
+                        ),
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+                finally:
+                    conn.close()
+                scanned += len(messages)
         self._meta_set("last_scan_at", self.now_func())
+        self._meta_set("source_state", "source_degraded" if degraded_shards else "healthy")
+        self._meta_set("source_error_code", source_error_code)
         return {
-            "state": "healthy",
+            "state": "source_degraded" if degraded_shards else "healthy",
             "scanned": scanned,
             "queued": queued,
             "initialized_chats": initialized,
+            "degraded_shards": degraded_shards,
+            "error_code": source_error_code,
         }
 
     def backfill(self, from_timestamp, *, apply=False):
@@ -485,42 +589,69 @@ class GoogleDriveFileSync:
         scanned = 0
         discovered = 0
         inserted = 0
+        degraded_shards = 0
+        source_error_code = ""
         for chat in chats:
-            cursor_timestamp = int(from_timestamp)
-            seen_ids = set()
-            while True:
-                page = self._source_page(chat["username"], cursor_timestamp, seen_ids, max_messages)
-                if not page:
-                    break
-                scanned += len(page)
-                file_count = sum(
-                    1
-                    for message in page
-                    for resource in (message.get("resources") or [])
-                    if isinstance(resource, dict) and resource.get("kind") == "file"
-                )
-                discovered += file_count
-                if apply and file_count:
-                    conn = self._connect()
+            try:
+                source_shards = list(self.source.get_message_shards(chat["username"]))
+            except WeChatSourceDegraded as exc:
+                degraded_shards += 1
+                source_error_code = self._source_error_code(exc)
+                continue
+            if not source_shards:
+                degraded_shards += 1
+                source_error_code = "source_shards_unavailable"
+                continue
+            for source_shard_id in source_shards:
+                cursor_timestamp = int(from_timestamp)
+                seen_ids = set()
+                while True:
                     try:
-                        conn.execute("BEGIN IMMEDIATE")
-                        inserted += self._insert_file_items(conn, chat, page, self.now_func())
-                        conn.commit()
-                    except Exception:
-                        conn.rollback()
-                        raise
-                    finally:
-                        conn.close()
-                cursor_timestamp, seen_ids = self._cursor_after(
-                    page, cursor_timestamp, seen_ids
-                )
-                if len(page) < max_messages:
-                    break
+                        page = self._source_page(
+                            chat["username"], source_shard_id,
+                            cursor_timestamp, seen_ids, max_messages,
+                        )
+                    except WeChatSourceDegraded as exc:
+                        degraded_shards += 1
+                        source_error_code = self._source_error_code(exc)
+                        break
+                    if not page:
+                        break
+                    scanned += len(page)
+                    file_count = sum(
+                        1
+                        for message in page
+                        for resource in (message.get("resources") or [])
+                        if isinstance(resource, dict) and resource.get("kind") == "file"
+                    )
+                    discovered += file_count
+                    if apply and file_count:
+                        conn = self._connect()
+                        try:
+                            conn.execute("BEGIN IMMEDIATE")
+                            inserted += self._insert_file_items(conn, chat, page, self.now_func())
+                            conn.commit()
+                        except Exception:
+                            conn.rollback()
+                            raise
+                        finally:
+                            conn.close()
+                    cursor_timestamp, seen_ids = self._cursor_after(
+                        page, cursor_timestamp, seen_ids
+                    )
+                    if len(page) < max_messages:
+                        break
         return {
-            "state": "applied" if apply else "planned",
+            "state": (
+                "source_degraded"
+                if degraded_shards
+                else "applied" if apply else "planned"
+            ),
             "scanned": scanned,
             "discovered_files": discovered,
             "inserted": inserted,
+            "degraded_shards": degraded_shards,
+            "error_code": source_error_code,
         }
 
     def _retry_delay(self, attempt_count, retry_after=0):
@@ -536,7 +667,21 @@ class GoogleDriveFileSync:
             row = conn.execute(
                 "SELECT attempt_count FROM drive_sync_items WHERE item_id = ?", (item_id,)
             ).fetchone()
-            attempt = int(row["attempt_count"] or 0) + 1 if row else 1
+            previous_attempts = int(row["attempt_count"] or 0) if row else 0
+            retry_failure_states = {
+                "waiting_cache",
+                "retry_wait",
+                "insufficient_local_space",
+                "auth_required",
+                "remote_degraded",
+            }
+            retry_phase_reset_states = {"upload_pending", "shortcut_pending", "complete"}
+            if status in retry_failure_states:
+                attempt = previous_attempts + 1
+            elif status in retry_phase_reset_states:
+                attempt = 0
+            else:
+                attempt = previous_attempts
             next_retry = 0
             if status in {"waiting_cache", "retry_wait", "insufficient_local_space"}:
                 next_retry = self.now_func() + self._retry_delay(attempt, retry_after)
@@ -686,6 +831,8 @@ class GoogleDriveFileSync:
         if row:
             try:
                 item = self.drive_client.get_file(row["drive_file_id"])
+            except GoogleDriveRetryableError:
+                raise
             except GoogleDriveError as exc:
                 self._meta_set("root_state", "missing")
                 raise RemoteDegraded("root_missing_or_inaccessible") from exc
@@ -1054,7 +1201,11 @@ class GoogleDriveFileSync:
             scan_result = self.scan() if scan_first else {"state": "healthy", "scanned": 0, "queued": 0}
             resolved = self._resolve_due()
             result = {
-                "state": "healthy",
+                "state": (
+                    "source_degraded"
+                    if scan_result.get("state") == "source_degraded"
+                    else "healthy"
+                ),
                 "scanned": int(scan_result.get("scanned", 0)),
                 "queued": int(scan_result.get("queued", 0)),
                 "resolved": resolved,
@@ -1062,7 +1213,7 @@ class GoogleDriveFileSync:
                 "upload_bytes": 0,
                 "shortcuts": 0,
                 "completed": 0,
-                "error_code": "",
+                "error_code": str(scan_result.get("error_code") or ""),
             }
             if self.drive_client is None:
                 result.update(state="auth_required", error_code="drive_client_unavailable")
@@ -1164,6 +1315,8 @@ class GoogleDriveFileSync:
             "next_retry_at": 0.0,
             "root_state": "unknown",
             "root_web_view_link": "",
+            "source_state": "unknown",
+            "source_degraded_shards": 0,
             "uploaded_unique_objects": 0,
             "shortcut_placements": 0,
             "last_error_code": "",
@@ -1194,12 +1347,22 @@ class GoogleDriveFileSync:
             retry = conn.execute(
                 "SELECT MIN(next_retry_at) AS next_retry FROM drive_sync_items WHERE next_retry_at > 0"
             ).fetchone()
+            has_shard_state = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'drive_scan_shards'"
+            ).fetchone()
+            degraded = (
+                conn.execute(
+                    "SELECT COUNT(*) AS count FROM drive_scan_shards WHERE source_state = 'source_degraded'"
+                ).fetchone()
+                if has_shard_state
+                else {"count": 0}
+            )
             meta = {
                 row["key"]: row["value"]
                 for row in conn.execute(
                     "SELECT key, value FROM drive_meta WHERE key IN ("
                     "'last_scan_at', 'last_verified_upload_at', 'root_state', "
-                    "'root_web_view_link')"
+                    "'root_web_view_link', 'source_state', 'source_error_code')"
                 )
             }
             last_run = conn.execute(
@@ -1213,9 +1376,15 @@ class GoogleDriveFileSync:
                 "next_retry_at": float(retry["next_retry"] or 0),
                 "root_state": str(meta.get("root_state") or "unknown"),
                 "root_web_view_link": str(meta.get("root_web_view_link") or ""),
+                "source_state": str(meta.get("source_state") or "unknown"),
+                "source_degraded_shards": int(degraded["count"]),
                 "uploaded_unique_objects": int(objects["count"]),
                 "shortcut_placements": int(placements["count"]),
-                "last_error_code": str(last_run["error_code"] or "") if last_run else "",
+                "last_error_code": (
+                    str(last_run["error_code"] or "")
+                    if last_run and last_run["error_code"]
+                    else str(meta.get("source_error_code") or "")
+                ),
             })
         except (OSError, sqlite3.Error, TypeError, ValueError):
             result["last_error_code"] = "local_ledger_unreadable"

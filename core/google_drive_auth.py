@@ -129,13 +129,67 @@ class GoogleDriveOAuth:
         self._access_token = ""
         self._access_token_expires_at = 0.0
 
-    def status(self) -> dict:
+    def status(self, *, validate=False) -> dict:
         configured = os.path.isfile(self.client_config_path)
-        connected = bool(self.token_store.load())
+        token_present = bool(self.token_store.load())
+        cached_valid = bool(
+            self._access_token and self.now_func() < self._access_token_expires_at
+        )
+        if not configured or not token_present:
+            return {
+                "state": "auth_required",
+                "client_configured": configured,
+                "token_present": token_present,
+                "refresh_token_valid": False if not token_present else None,
+                "connected": False,
+                "scope": DRIVE_FILE_SCOPE,
+            }
+        if cached_valid:
+            return {
+                "state": "connected",
+                "client_configured": True,
+                "token_present": True,
+                "refresh_token_valid": True,
+                "connected": True,
+                "scope": DRIVE_FILE_SCOPE,
+            }
+        if validate:
+            try:
+                self.access_token()
+            except GoogleDriveAuthRequired as exc:
+                return {
+                    "state": "auth_required",
+                    "client_configured": True,
+                    "token_present": bool(self.token_store.load()),
+                    "refresh_token_valid": False,
+                    "connected": False,
+                    "scope": DRIVE_FILE_SCOPE,
+                    "error_code": exc.code,
+                }
+            except GoogleDriveAuthError as exc:
+                return {
+                    "state": "validation_unavailable",
+                    "client_configured": True,
+                    "token_present": True,
+                    "refresh_token_valid": None,
+                    "connected": False,
+                    "scope": DRIVE_FILE_SCOPE,
+                    "error_code": exc.code,
+                }
+            return {
+                "state": "connected",
+                "client_configured": True,
+                "token_present": True,
+                "refresh_token_valid": True,
+                "connected": True,
+                "scope": DRIVE_FILE_SCOPE,
+            }
         return {
-            "state": "connected" if configured and connected else "auth_required",
-            "client_configured": configured,
-            "connected": configured and connected,
+            "state": "token_present",
+            "client_configured": True,
+            "token_present": True,
+            "refresh_token_valid": None,
+            "connected": False,
             "scope": DRIVE_FILE_SCOPE,
         }
 
@@ -289,6 +343,8 @@ class GoogleDriveOAuth:
         if response.status_code >= 400:
             code = str(payload.get("error") or "refresh_failed")
             if code in {"invalid_grant", "invalid_client", "unauthorized_client"}:
+                self.invalidate_access_token()
+                self.token_store.delete()
                 raise GoogleDriveAuthRequired(code)
             raise GoogleDriveAuthError(code)
         return self._cache_access_token(payload)

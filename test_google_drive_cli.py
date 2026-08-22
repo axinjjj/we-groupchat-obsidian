@@ -61,6 +61,31 @@ class GoogleDriveFileSyncCliTests(unittest.TestCase):
         self.assertEqual(result, 0)
         oauth.disconnect.assert_called_once_with()
 
+    def test_auth_status_validates_refresh_token_and_exits_nonzero_when_required(self):
+        oauth = Mock()
+        oauth.status.return_value = {"state": "auth_required", "connected": False}
+        with patch.object(cli, "GoogleDriveOAuth", return_value=oauth):
+            result = cli.main(["auth-status"])
+
+        self.assertEqual(result, 1)
+        oauth.status.assert_called_once_with(validate=True)
+
+    def test_failed_one_shot_states_exit_nonzero(self):
+        for command, state in (
+            ("scan", "source_degraded"),
+            ("run", "auth_required"),
+            ("run", "retry_wait"),
+            ("reconcile", "remote_degraded"),
+            ("run", "failed"),
+        ):
+            with self.subTest(command=command, state=state):
+                service = Mock()
+                getattr(service, command).return_value = {"state": state}
+                with patch.object(cli, "load_config", return_value={}), \
+                     patch.object(cli, "_service", return_value=service):
+                    result = cli.main([command])
+                self.assertEqual(result, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

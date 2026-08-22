@@ -295,6 +295,14 @@ def _file_resource_metadata(text):
     return resource
 
 
+class WeChatSourceDegraded(RuntimeError):
+    """A privacy-safe source read failure that must not advance a consumer cursor."""
+
+    def __init__(self, code="source_shard_unavailable"):
+        super().__init__(code)
+        self.code = str(code or "source_shard_unavailable")
+
+
 class WeChatDB:
     """WeChat database query interface."""
 
@@ -696,32 +704,18 @@ class WeChatDB:
             resources.append(image)
         return resources
 
-    def get_messages(
+    def _get_messages_from_paths(
         self,
         username,
+        db_paths,
+        table_name,
         since_ts=0,
         limit=500,
         page_forward=False,
         since_inclusive=False,
     ):
-        """Get group/private chat messages.
-
-        Args:
-            username: Username or group chat ID (xxx@chatroom).
-            since_ts: Start timestamp (only get messages after this time).
-            limit: Maximum number of messages.
-            page_forward: When True with since_ts, return the earliest next
-                page after the bookmark instead of the newest page. This is
-                used by "summarize new messages" so large backlogs are consumed
-                over multiple clicks without skipping messages.
-
-        Returns:
-            list[dict]: [{"sender": "name", "text": "content", "timestamp": ts, "type": int}, ...]
-        """
         self._load_contacts()
         is_group = "@chatroom" in username
-
-        db_paths, table_name = self._find_msg_table(username)
         if not db_paths:
             return []
 
@@ -767,8 +761,8 @@ class WeChatDB:
                     item = dict(row)
                     item["db_shard_id"] = shard_id
                     all_rows.append(item)
-            except Exception:
-                pass
+            except Exception as exc:
+                raise WeChatSourceDegraded("source_shard_unavailable") from exc
             finally:
                 conn.close()
 
@@ -862,6 +856,153 @@ class WeChatDB:
             })
 
         return messages
+
+    @staticmethod
+    def _source_shard_identity(rel_key):
+        normalized = str(rel_key or "").replace("\\", "/").lower()
+        return hashlib.sha256(
+            f"wechat-message-source-shard-v1\0{normalized}".encode("utf-8")
+        ).hexdigest()[:20]
+
+    def _message_shard_specs(self):
+        specs = []
+        keys = getattr(self, "keys", {}) or {}
+        db_dir = str(getattr(self, "db_dir", "") or "")
+        rel_key_set = {
+            str(key).replace("\\", "/")
+            for key in keys
+            if re.search(r"message/(?:biz_)?message_\d+\.db$", str(key).replace("\\", "/"))
+        }
+        message_dir = os.path.join(db_dir, "message") if db_dir else ""
+        if message_dir and os.path.isdir(message_dir):
+            try:
+                for entry in os.scandir(message_dir):
+                    if entry.is_file(follow_symlinks=False) and re.fullmatch(
+                        r"(?:biz_)?message_\d+\.db", entry.name
+                    ):
+                        rel_key_set.add("message/" + entry.name)
+            except OSError:
+                pass
+        rel_keys = sorted(rel_key_set)
+        for rel_key in rel_keys:
+            if db_dir and os.path.exists(os.path.join(db_dir, rel_key)):
+                specs.append({
+                    "source_shard_id": self._source_shard_identity(rel_key),
+                    "rel_key": rel_key,
+                    "cache_path": "",
+                })
+        if specs:
+            return specs
+
+        # Compatibility for an old decrypted cache when no live message shard is available.
+        for prefix in ("message", "biz_message"):
+            for index in range(10):
+                rel_key = f"message/{prefix}_{index}.db"
+                if rel_key in rel_keys:
+                    continue
+                digest = hashlib.md5(rel_key.encode()).hexdigest()[:12]
+                cache_path = os.path.join(self.CACHE_DIR, f"{digest}.db")
+                if os.path.isfile(cache_path):
+                    specs.append({
+                        "source_shard_id": self._source_shard_identity(rel_key),
+                        "rel_key": rel_key,
+                        "cache_path": cache_path,
+                    })
+        return specs
+
+    def get_message_shards(self, _username):
+        """Return privacy-safe identities for every known message shard."""
+        return [spec["source_shard_id"] for spec in self._message_shard_specs()]
+
+    def get_messages_for_shard(
+        self,
+        username,
+        source_shard_id,
+        since_ts=0,
+        limit=500,
+        page_forward=False,
+        since_inclusive=False,
+    ):
+        """Read one complete shard page or raise a content-free degraded error."""
+        spec = next(
+            (
+                item
+                for item in self._message_shard_specs()
+                if item["source_shard_id"] == str(source_shard_id or "")
+            ),
+            None,
+        )
+        if spec is None:
+            raise WeChatSourceDegraded("source_shard_unknown")
+        path = spec["cache_path"] or self._get_decrypted_db(spec["rel_key"])
+        if not path:
+            raise WeChatSourceDegraded("source_shard_unavailable")
+        table_name = f"Msg_{hashlib.md5(username.encode()).hexdigest()}"
+        conn = None
+        try:
+            conn = sqlite3.connect(path)
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table_name,),
+            ).fetchone()
+        except Exception as exc:
+            raise WeChatSourceDegraded("source_shard_unavailable") from exc
+        finally:
+            if conn is not None:
+                conn.close()
+        if not exists:
+            return []
+        return self._get_messages_from_paths(
+            username,
+            [path],
+            table_name,
+            since_ts=since_ts,
+            limit=limit,
+            page_forward=page_forward,
+            since_inclusive=since_inclusive,
+        )
+
+    def get_messages(
+        self,
+        username,
+        since_ts=0,
+        limit=500,
+        page_forward=False,
+        since_inclusive=False,
+    ):
+        """Get messages only when every known source shard page is complete."""
+        # Small fixture/legacy adapters historically supply only _find_msg_table.
+        if not hasattr(self, "keys") or not hasattr(self, "db_dir"):
+            db_paths, table_name = self._find_msg_table(username)
+            return self._get_messages_from_paths(
+                username,
+                db_paths,
+                table_name,
+                since_ts=since_ts,
+                limit=limit,
+                page_forward=page_forward,
+                since_inclusive=since_inclusive,
+            )
+
+        all_messages = []
+        for source_shard_id in self.get_message_shards(username):
+            all_messages.extend(self.get_messages_for_shard(
+                username,
+                source_shard_id,
+                since_ts=since_ts,
+                limit=limit,
+                page_forward=page_forward,
+                since_inclusive=since_inclusive,
+            ))
+        all_messages.sort(
+            key=lambda message: (
+                int(message.get("timestamp") or 0),
+                str(message.get("source_message_id") or ""),
+            )
+        )
+        if since_ts > 0 and page_forward:
+            return all_messages[:limit]
+        return all_messages[-limit:]
 
     def _get_fts_db(self):
         """Get decrypted FTS full-text search database path."""

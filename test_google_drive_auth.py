@@ -134,7 +134,32 @@ class GoogleDriveOAuthTests(unittest.TestCase):
         with self.assertRaisesRegex(GoogleDriveAuthRequired, "invalid_grant"):
             oauth.access_token()
 
-        self.assertEqual(token_store.token, "persisted-refresh")
+        self.assertEqual(token_store.token, "")
+        status = oauth.status()
+        self.assertEqual(status["state"], "auth_required")
+        self.assertFalse(status["connected"])
+        self.assertFalse(status["token_present"])
+
+    def test_status_distinguishes_token_present_from_refresh_valid(self):
+        install_client_config(self.source, self.target)
+        oauth = GoogleDriveOAuth(
+            client_config_path=self.target,
+            token_store=FakeTokenStore("persisted-refresh"),
+            session=FakeSession([FakeResponse(200, {
+                "access_token": "validated-access",
+                "expires_in": 3600,
+            })]),
+            now_func=lambda: 100,
+        )
+
+        present = oauth.status()
+        valid = oauth.status(validate=True)
+
+        self.assertEqual(present["state"], "token_present")
+        self.assertTrue(present["token_present"])
+        self.assertIsNone(present["refresh_token_valid"])
+        self.assertEqual(valid["state"], "connected")
+        self.assertTrue(valid["refresh_token_valid"])
 
     def test_disconnect_deletes_refresh_token_and_clears_memory_access(self):
         install_client_config(self.source, self.target)

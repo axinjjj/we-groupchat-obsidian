@@ -12,7 +12,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 
-from .attachment_archive import ArchiveError
+from .attachment_archive import ArchiveError, AttachmentArchive
 from .config import DATA_DIR
 from .knowledge import KNOWLEDGE_DB
 
@@ -183,80 +183,169 @@ class AttachmentBackup:
         return {"state": "invalid_target", "error_code": error_code, **values}
 
     def _snapshot_data(self):
-        if not os.path.exists(self.db_path):
-            raise sqlite3.OperationalError("attachment catalog is unavailable")
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
+        knowledge_available = False
+        knowledge_error = False
+        knowledge_objects = []
+        knowledge_catalog = []
+        if os.path.exists(self.db_path):
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.execute("BEGIN")
+                knowledge_objects = [
+                    dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT sha256, size, object_relpath, original_name
+                        FROM attachment_objects
+                        ORDER BY sha256
+                        """
+                    )
+                ]
+                knowledge_catalog = [
+                    dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT
+                            COALESCE(o.sha256, '') AS object_sha256,
+                            o.size AS object_size,
+                            COALESCE(m.original_name, o.original_name, '') AS original_name,
+                            m.kind,
+                            m.source_message_id,
+                            m.topic_id,
+                            m.event_id,
+                            m.status,
+                            m.resolution_method
+                        FROM attachment_mentions m
+                        LEFT JOIN attachment_objects o ON o.sha256 = m.object_sha256
+                        ORDER BY object_sha256, m.mention_id
+                        """
+                    )
+                ]
+                conn.commit()
+                knowledge_available = True
+            except sqlite3.Error:
+                conn.rollback()
+                knowledge_error = True
+            finally:
+                conn.close()
+
         try:
-            conn.execute("BEGIN")
-            objects = conn.execute(
-                """
-                SELECT sha256, size, object_relpath
-                FROM attachment_objects
-                ORDER BY sha256
-                """
-            ).fetchall()
-            catalog = conn.execute(
-                """
-                SELECT
-                    o.sha256 AS object_sha256,
-                    o.size AS object_size,
-                    COALESCE(m.original_name, o.original_name) AS original_name,
-                    m.kind,
-                    m.source_message_id,
-                    m.topic_id,
-                    m.event_id,
-                    m.status,
-                    m.resolution_method,
-                    m.mention_id AS sort_mention_id
-                FROM attachment_mentions m
-                LEFT JOIN attachment_objects o ON o.sha256 = m.object_sha256
-                UNION ALL
-                SELECT
-                    o.sha256 AS object_sha256,
-                    o.size AS object_size,
-                    o.original_name,
-                    '' AS kind,
-                    '' AS source_message_id,
-                    NULL AS topic_id,
-                    NULL AS event_id,
-                    'orphaned_object' AS status,
-                    '' AS resolution_method,
-                    NULL AS sort_mention_id
-                FROM attachment_objects o
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM attachment_mentions m WHERE m.object_sha256 = o.sha256
-                )
-                ORDER BY object_sha256, sort_mention_id
-                """
-            ).fetchall()
-            conn.commit()
-            return {
-                "objects": [dict(row) for row in objects],
-                "catalog": [
-                    {
-                        "object_sha256": str(row["object_sha256"] or ""),
-                        "object_size": (
-                            int(row["object_size"])
-                            if row["object_size"] is not None
-                            else None
-                        ),
-                        "original_name": str(row["original_name"] or ""),
-                        "kind": str(row["kind"] or ""),
-                        "source_message_id": str(row["source_message_id"] or ""),
-                        "topic_id": row["topic_id"],
-                        "event_id": row["event_id"],
-                        "status": str(row["status"] or ""),
-                        "resolution_method": str(row["resolution_method"] or ""),
-                    }
-                    for row in catalog
-                ],
-            }
+            cas_snapshot = AttachmentArchive(
+                self.db_path,
+                self.archive_root,
+            ).cas_catalog_snapshot()
         except sqlite3.Error:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+            cas_snapshot = None
+        if knowledge_error or (not knowledge_available and cas_snapshot is None):
+            raise sqlite3.OperationalError("attachment catalog is unavailable")
+
+        objects_by_sha = {}
+
+        def merge_object(row):
+            digest = str(row.get("sha256") or "")
+            size = int(row.get("size") or 0)
+            relpath = str(row.get("object_relpath") or "")
+            original_name = str(row.get("original_name") or "")
+            existing = objects_by_sha.get(digest)
+            if existing and int(existing["size"]) != size:
+                raise sqlite3.OperationalError("CAS object identity conflict")
+            if existing:
+                if relpath:
+                    existing["object_relpath"] = relpath
+                if not existing.get("original_name") and original_name:
+                    existing["original_name"] = original_name
+                return
+            objects_by_sha[digest] = {
+                "sha256": digest,
+                "size": size,
+                "object_relpath": relpath,
+                "original_name": original_name,
+            }
+
+        for row in knowledge_objects:
+            merge_object(row)
+        for row in (cas_snapshot or {}).get("objects", []):
+            merge_object(row)
+
+        catalog = [
+            {
+                "object_sha256": str(row.get("object_sha256") or ""),
+                "object_size": (
+                    int(row["object_size"])
+                    if row.get("object_size") is not None
+                    else None
+                ),
+                "original_name": str(row.get("original_name") or ""),
+                "kind": str(row.get("kind") or ""),
+                "source_message_id": str(row.get("source_message_id") or ""),
+                "topic_id": row.get("topic_id"),
+                "event_id": row.get("event_id"),
+                "status": str(row.get("status") or ""),
+                "resolution_method": str(row.get("resolution_method") or ""),
+            }
+            for row in knowledge_catalog
+        ]
+        catalog_keys = {
+            (
+                entry["source_message_id"],
+                entry["kind"],
+                entry["original_name"],
+                entry["object_sha256"],
+            )
+            for entry in catalog
+        }
+        for row in (cas_snapshot or {}).get("sources", []):
+            digest = str(row.get("object_sha256") or "")
+            obj = objects_by_sha.get(digest)
+            entry = {
+                "object_sha256": digest,
+                "object_size": int(obj["size"]) if obj else None,
+                "original_name": str(row.get("original_name") or ""),
+                "kind": str(row.get("kind") or ""),
+                "source_message_id": str(row.get("source_message_id") or ""),
+                "topic_id": None,
+                "event_id": None,
+                "status": str(row.get("status") or ""),
+                "resolution_method": str(row.get("resolution_method") or ""),
+            }
+            key = (
+                entry["source_message_id"],
+                entry["kind"],
+                entry["original_name"],
+                entry["object_sha256"],
+            )
+            if key not in catalog_keys:
+                catalog.append(entry)
+                catalog_keys.add(key)
+
+        referenced = {
+            entry["object_sha256"] for entry in catalog if entry["object_sha256"]
+        }
+        for digest, row in objects_by_sha.items():
+            if digest in referenced:
+                continue
+            catalog.append({
+                "object_sha256": digest,
+                "object_size": int(row["size"]),
+                "original_name": str(row.get("original_name") or ""),
+                "kind": "",
+                "source_message_id": "",
+                "topic_id": None,
+                "event_id": None,
+                "status": "orphaned_object",
+                "resolution_method": "",
+            })
+
+        catalog.sort(key=lambda entry: (
+            entry["object_sha256"],
+            entry["source_message_id"],
+            entry["original_name"],
+        ))
+        return {
+            "objects": [objects_by_sha[key] for key in sorted(objects_by_sha)],
+            "catalog": catalog,
+        }
 
     def _target_object_path(self, digest):
         return os.path.join(self.backup_root, "objects", "sha256", digest[:2], digest)

@@ -24,6 +24,30 @@ def _print(value):
     print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
 
 
+def _result_exit_code(value):
+    if not isinstance(value, dict):
+        return 1
+    state = str(value.get("state") or "")
+    auth = str(value.get("auth") or "")
+    if state in {
+        "auth_required",
+        "retry_wait",
+        "remote_degraded",
+        "source_degraded",
+        "failed",
+        "validation_unavailable",
+    }:
+        return 1
+    if state.endswith("_failed") or auth == "auth_required":
+        return 1
+    return 0
+
+
+def _print_result(value):
+    _print(value)
+    return _result_exit_code(value)
+
+
 def _source(config):
     keys = get_cached_keys() or {}
     if not keys or not config.get("db_dir"):
@@ -91,8 +115,7 @@ def main(argv=None):
             _print({"state": "auth_required", "error_code": exc.code})
             return 1
     if args.command == "auth-status":
-        _print(GoogleDriveOAuth().status())
-        return 0
+        return _print_result(GoogleDriveOAuth().status(validate=True))
     if args.command == "disconnect":
         GoogleDriveOAuth().disconnect()
         print("Google Drive refresh token removed from Keychain. Queue and remote files were not deleted.")
@@ -121,25 +144,19 @@ def main(argv=None):
 
     config = load_config()
     if args.command == "status":
-        _print(_service(config).status())
-        return 0
+        return _print_result(_service(config).status())
     if args.command == "scan":
-        _print(_service(config, source=True).scan())
-        return 0
+        return _print_result(_service(config, source=True).scan())
     if args.command == "run":
-        _print(_service(config, source=True, remote=True).run())
-        return 0
+        return _print_result(_service(config, source=True, remote=True).run())
     if args.command == "reconcile":
-        _print(_service(config, remote=True).reconcile())
-        return 0
+        return _print_result(_service(config, remote=True).reconcile())
     if args.command == "backfill":
-        _print(
+        return _print_result(
             _service(config, source=True).backfill(
-                _from_timestamp(args.from_date),
-                apply=args.apply,
+                _from_timestamp(args.from_date), apply=args.apply
             )
         )
-        return 0
     return 1
 
 

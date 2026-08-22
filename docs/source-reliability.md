@@ -221,7 +221,7 @@ snapshot backend:
 
 ```text
 selected WeChat chats
-  -> per-chat scan cursor + durable file-message queue
+  -> per-chat x message-shard cursor + durable file-message queue
   -> exact file resolver + shared local SHA-256 CAS
   -> one Drive object per unique byte digest
   -> chat / source-month Drive shortcuts
@@ -230,9 +230,18 @@ selected WeChat chats
 Only resources whose source envelope says `kind=file` are eligible in this
 release. Images, voice messages, videos, and stickers do not enter this queue.
 The scanner advances over missing and non-file messages, so a file that has not
-yet appeared in WeChat's cache cannot block later messages. `missing_retryable`
-uses due-only bounded exponential retry; `ambiguous` is terminal until a human
-changes the local evidence and explicitly retries through a future workflow.
+yet appeared in WeChat's cache cannot block later messages. Its bookmark is a
+per-chat x privacy-safe message-shard cursor: a failed shard is persisted as
+`source_degraded` without moving that shard cursor, while healthy shards may
+advance. Recovery queues the previously unseen file exactly once. Ordinary
+`WeChatDB.get_messages()` also uses a strict all-known-shards contract and never
+returns remaining rows as a falsely complete page. Receipts and health expose
+only content-free error codes and degraded-shard counts, never raw paths, chat
+IDs, or database names.
+
+`missing_retryable` uses due-only bounded exponential retry; `ambiguous` is
+terminal until a human changes the local evidence and explicitly retries
+through a future workflow.
 
 The first enable initializes each currently selected chat at the current time.
 It does not silently upload history. Historical discovery is a separate
@@ -261,18 +270,24 @@ Public defaults are off:
 Selected chat usernames live only in private local config and the independent
 local ledger. Each remote chat identity is a salted SHA-256 key derived from a
 random local `archive_id`; raw `@chatroom` usernames are never Drive metadata.
-The ledger stores per-chat cursor timestamp plus the complete set of message
-identities already seen at that timestamp, making same-second pagination and
-restart idempotent. `(source_message_id, resource_index)` is globally unique.
+The ledger stores a timestamp and complete same-timestamp message identity set
+for each chat x shard cursor, making same-second pagination and restart
+idempotent. `(source_message_id, resource_index)` is globally unique.
 Raw chat bodies are not stored in this database or its run receipts.
 
-The principal tables are `drive_scan_state`, `drive_sync_items`,
-`drive_objects`, `drive_placements`, `drive_folders`, and content-free
-`drive_sync_runs`. A non-blocking process lock makes menu timer, CLI, and app
+`drive_scan_state` retains the enable-time chat seed; canonical incremental
+positions live in `drive_scan_shards`. The other principal tables are
+`drive_sync_items`, `drive_objects`, `drive_placements`, `drive_folders`, and
+content-free `drive_sync_runs`. A non-blocking process lock makes menu timer, CLI, and app
 startup recovery safe callers of the same one-shot worker; there is no new
 infinite loop. Disabling or pausing prevents a new scan/upload. If the setting
 changes during one file, that file finishes safely and the worker stops before
 taking the next item.
+
+`attempt_count` counts retry failures only. Successful transitions such as
+`uploading -> shortcut_pending -> complete` no longer inflate exponential
+backoff, and progress across a resolve, object, or shortcut phase resets that
+phase's consecutive failure count.
 
 ### OAuth and credential boundary
 
@@ -286,9 +301,11 @@ https://www.googleapis.com/auth/drive.file
 The user's own OAuth client JSON is normalized into the private runtime data
 directory with mode `0600`; it is never ordinary config or tracked source. The
 refresh token is stored only in macOS Keychain. Access tokens remain in memory.
-Offline access is requested. Service accounts are unsupported. A refresh-token
-`invalid_grant` changes queued work to `auth_required` and emits one notification
-for that episode; it does not discard the queue. `disconnect` removes the
+Offline access is requested. Service accounts are unsupported. `auth-status`
+validates the refresh token and distinguishes `token_present` from `connected`.
+`invalid_grant` removes the already-invalid Keychain token so later status does
+not keep reporting a connection. Queued work becomes `auth_required`, emits one
+notification for that episode, and remains durable. `disconnect` removes the
 Keychain refresh token but does not delete config, queue, CAS objects, or Drive
 files.
 
@@ -313,6 +330,16 @@ object or shortcut. Duplicate remote object matches select one canonical Drive
 ID, record `remote_duplicate_detected`, and never upload a third copy. Remote
 verification prefers `sha256Checksum`; when unavailable it requires matching
 size plus `md5Checksum` before recording `uploaded_verified`.
+
+Objects larger than 5 MiB use a real resumable session. Every `308` advances
+only to the server-confirmed `Range` offset. After network/429/5xx interruption,
+an empty PUT with `Content-Range: bytes */<total>` probes the session. A completed
+lost final response is adopted, while an expired 404 session is recreated at
+most once in the same one-shot run. Missing, malformed, or regressing ranges
+fail explicitly. Session URIs are not persisted across processes: a later run
+starts a fresh session and still adopts any completed remote object through
+`appProperties`. This is a documented bounded restart policy, not a blind
+chunk restart.
 
 One object is shared globally. The placement identity is
 `(hashed_chat_key, source_month, sha256)`, so the same bytes in another chat or
@@ -350,10 +377,15 @@ real upload are separate actions:
 ```
 
 `backfill` without `--apply` is read-only. `enable` initializes current selected
-chat cursors but does not authenticate, select chats, run backfill, or upload.
+chat cursor seeds but does not authenticate, select chats, run backfill, or upload.
 The menu bar's **Google Drive group-file backup** submenu provides status,
 enable/disable, pause/resume, sync now, chat selection, open root, and
 reauthorize. Selecting chats also does not enable or upload.
+
+CLI `auth-status` validates the refresh token. `auth_required`, `retry_wait`,
+`remote_degraded`, `source_degraded`, and failed one-shot results return a
+non-zero exit status so operators and schedulers cannot mistake printed error
+JSON for success.
 
 ## 5. Optional filesystem backup target
 
@@ -380,7 +412,16 @@ The target layout is provider-neutral:
   receipts/<snapshot-id>.json
 ```
 
-`plan` takes a stable read view of `attachment_objects` and the privacy-bounded
+The archive root now owns a provider-neutral `cas_catalog.db` containing one
+SHA-256 object identity and content-bounded source bindings. Both the Knowledge
+attachment lane and the selected-chat Drive lane write that catalog without
+duplicating bytes or creating a second object identity. Filesystem snapshots
+take an authoritative union with the Knowledge attachment catalog, so a
+Drive-only selected-chat object that never hit KnowledgeStore participates in
+plan/run/verify and DB-free restore planning while existing topic/event bindings
+and privacy-bounded exports remain intact.
+
+`plan` takes a stable read view of provider-neutral CAS objects and the privacy-bounded
 attachment catalog, then checks which target objects are missing,
 `target_verified`, or `target_failed` without writing the target.
 `run` copies missing immutable objects through partial files, verifies source
