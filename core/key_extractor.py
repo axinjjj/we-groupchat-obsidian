@@ -45,8 +45,15 @@ def _first_pid(args):
 def process_lookup_available():
     """Return whether this process can inspect macOS process names."""
     try:
-        result = subprocess.run(["pgrep", "-x", "launchd"], capture_output=True, text=True)
-        return result.returncode == 0
+        pid = str(os.getpid())
+        result = subprocess.run(
+            ["ps", "-p", pid, "-o", "pid="],
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0 and any(
+            line.strip() == pid for line in result.stdout.splitlines()
+        )
     except Exception:
         return False
 

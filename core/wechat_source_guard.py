@@ -19,7 +19,7 @@ import time
 import uuid
 from typing import Callable
 
-from .key_extractor import is_wechat_running, process_lookup_available
+from .key_extractor import get_cached_keys, is_wechat_running, process_lookup_available
 from .project_identity import data_dir
 
 
@@ -176,19 +176,22 @@ def latest_source_mtime(db_dir: str | os.PathLike[str]) -> float | None:
     if not root.is_dir():
         return None
     latest = 0.0
-    try:
-        for current, _dirs, files in os.walk(root):
-            for name in files:
-                if not (name.endswith(".db") or ".db-" in name):
-                    continue
-                path = Path(current) / name
-                try:
-                    value = path.stat().st_mtime
-                except OSError:
-                    continue
-                latest = max(latest, value)
-    except OSError:
-        return None
+    keys = get_cached_keys() or {}
+    for relative in keys:
+        relative_path = Path(str(relative))
+        if (
+            relative_path.is_absolute()
+            or len(relative_path.parts) != 2
+            or relative_path.parts[0] != "message"
+        ):
+            continue
+        base = root / relative_path
+        for path in (base, Path(f"{base}-wal"), Path(f"{base}-shm")):
+            try:
+                value = path.stat().st_mtime
+            except OSError:
+                continue
+            latest = max(latest, value)
     return latest or None
 
 

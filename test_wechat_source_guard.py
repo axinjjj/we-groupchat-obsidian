@@ -11,6 +11,7 @@ from core.wechat_source_guard import (
     OPEN_WECHAT_ARGV,
     WeChatSourceGuard,
     atomic_write_json,
+    latest_source_mtime,
     load_state,
     source_guard_status,
 )
@@ -71,6 +72,25 @@ class WeChatSourceGuardTests(unittest.TestCase):
         state = load_state(self.state)
         state.update(values)
         atomic_write_json(self.state, state)
+
+    def test_source_freshness_uses_message_database_directory_only(self):
+        db_root = self.root / "db"
+        message_dir = db_root / "message"
+        unrelated_dir = db_root / "hardlink"
+        message_dir.mkdir(parents=True)
+        unrelated_dir.mkdir(parents=True)
+        source_db = message_dir / "message_0.db"
+        unrelated_db = unrelated_dir / "unrelated.db"
+        source_db.write_bytes(b"source")
+        unrelated_db.write_bytes(b"unrelated")
+        os.utime(source_db, (1000, 1000))
+        os.utime(unrelated_db, (2000, 2000))
+
+        with patch(
+            "core.wechat_source_guard.get_cached_keys",
+            return_value={"message/message_0.db": {"enc_key": "fixture"}},
+        ):
+            self.assertEqual(latest_source_mtime(db_root), 1000)
 
     def test_disabled_never_launches(self):
         self.config["wechat_source_guard_enabled"] = False

@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -8,10 +9,27 @@ from core.key_extractor import (
     _parse_raw_keys_from_log,
     _parse_raw_keys_from_text,
     _rematch_keys_from_output,
+    process_lookup_available,
 )
 
 
 class KeyExtractorTests(unittest.TestCase):
+    def test_process_lookup_availability_uses_current_process_as_visible_sentinel(self):
+        result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=f"{os.getpid()}\n",
+            stderr="",
+        )
+        with patch("core.key_extractor.subprocess.run", return_value=result) as run:
+            self.assertTrue(process_lookup_available())
+
+        run.assert_called_once_with(
+            ["ps", "-p", str(os.getpid()), "-o", "pid="],
+            capture_output=True,
+            text=True,
+        )
+
     def test_missing_extract_log_returns_empty_list(self):
         with tempfile.TemporaryDirectory() as tmp:
             missing = os.path.join(tmp, "missing.log")

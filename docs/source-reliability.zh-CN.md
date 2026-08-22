@@ -29,6 +29,11 @@ Source guard 默认关闭。开启 policy、安装 LaunchAgent plist、加载 La
 写入很小的私有 state，然后退出。构建 plist 时如果设置了
 `WE_GROUPCHAT_OBSIDIAN_DATA_DIR`，LaunchAgent 会显式保留这个 override。
 
+Process-list availability 通过读取 guard 当前进程自身来证明，不依赖普通用户 session
+能否看见系统级 `launchd`。Source freshness 只对 cached key inventory 中已知的
+`message/` shard 路径及其 WAL/SHM siblings 做 exact stat；它不会递归遍历 DB root 或
+微信 hardlink/cache tree，因此 one-shot 在 LaunchAgent context 下仍然有界。
+
 只有 process lookup 明确确认微信不在运行时，guard 才会先进入 grace。Grace 结束后，
 还必须同时满足 restart budget 与 exponential backoff，唯一可能发出的启动请求等价于：
 

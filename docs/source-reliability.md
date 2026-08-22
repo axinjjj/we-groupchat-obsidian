@@ -33,6 +33,12 @@ runs one check, takes a non-blocking lock, persists a small private state file,
 and exits. If `WE_GROUPCHAT_OBSIDIAN_DATA_DIR` is set when the plist is built,
 the LaunchAgent preserves that override explicitly.
 
+Process-list availability is proven by inspecting the guard process itself; it
+does not depend on whether a normal user session can see the system `launchd`.
+Source freshness uses exact stats for cached known `message/` shard paths and
+their WAL/SHM siblings. It never recursively walks the DB root or WeChat
+hardlink/cache trees, so the one-shot remains bounded in a LaunchAgent context.
+
 When process lookup confirms that WeChat is absent, the guard first enters a
 grace period. After grace, and only while restart budget and exponential
 backoff allow it, the sole launch request is equivalent to:
