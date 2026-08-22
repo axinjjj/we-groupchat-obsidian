@@ -144,6 +144,7 @@ class AttachmentBackupTests(unittest.TestCase):
         self.assertTrue(all(isinstance(entry["event_id"], int) for entry in resolved))
         self.assertEqual({entry["status"] for entry in resolved}, {"original_archived"})
         self.assertEqual(len(unresolved), 1)
+        self.assertEqual(unresolved[0]["object_sha256"], "")
         self.assertEqual(unresolved[0]["status"], "missing_retryable")
         self.assertIsNone(unresolved[0]["object_size"])
         catalog_text = json.dumps(catalog)
@@ -152,6 +153,78 @@ class AttachmentBackupTests(unittest.TestCase):
         self.assertNotIn("raw chat body", catalog_text.lower())
         self.assertEqual(stat.S_IMODE(os.stat(manifest_path).st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(os.stat(catalog_path).st_mode), 0o600)
+        with open(complete_path, encoding="utf-8") as file:
+            complete_marker = json.load(file)
+        with open(manifest_path, "rb") as file:
+            self.assertEqual(
+                complete_marker["manifest_sha256"],
+                hashlib.sha256(file.read()).hexdigest(),
+            )
+        with open(catalog_path, "rb") as file:
+            self.assertEqual(
+                complete_marker["catalog_sha256"],
+                hashlib.sha256(file.read()).hexdigest(),
+            )
+
+    def test_complete_digest_and_catalog_consistency_are_required_across_restore_stages(self):
+        digest, source_path = self.add_object(b"cross-stage", "cross-stage.bin")
+        completed = self.backup(suffix="cross-stage").run()
+        snapshot_dir = os.path.join(
+            self.target,
+            "v2",
+            "snapshots",
+            completed["snapshot_id"],
+        )
+        os.unlink(source_path)
+        os.unlink(self.db_path)
+
+        catalog_path = os.path.join(snapshot_dir, "catalog.json")
+        with open(catalog_path, encoding="utf-8") as file:
+            catalog = json.load(file)
+        catalog["entries"][0]["object_size"] += 1
+        with open(catalog_path, "w", encoding="utf-8") as file:
+            json.dump(catalog, file)
+
+        self.assertEqual(
+            self.backup().restore_plan(completed["snapshot_id"])["state"],
+            "snapshot_unavailable",
+        )
+
+        with open(catalog_path, "w", encoding="utf-8") as file:
+            json.dump(
+                {
+                    "schema": BACKUP_SCHEMA,
+                    "snapshot_id": completed["snapshot_id"],
+                    "entry_count": 1,
+                    "entries": [{
+                        "object_sha256": digest,
+                        "object_size": len(b"cross-stage") + 1,
+                        "original_name": "cross-stage.bin",
+                        "kind": "file",
+                        "source_message_id": "wgmsg_fixture",
+                        "topic_id": 1,
+                        "event_id": 1,
+                        "status": "original_archived",
+                        "resolution_method": "fixture",
+                    }],
+                },
+                file,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            file.write("\n")
+        complete_path = os.path.join(snapshot_dir, "COMPLETE")
+        with open(complete_path, encoding="utf-8") as file:
+            complete_marker = json.load(file)
+        with open(catalog_path, "rb") as file:
+            complete_marker["catalog_sha256"] = hashlib.sha256(file.read()).hexdigest()
+        with open(complete_path, "w", encoding="utf-8") as file:
+            json.dump(complete_marker, file)
+
+        self.assertEqual(
+            self.backup().verify(completed["snapshot_id"])["state"],
+            "snapshot_unavailable",
+        )
 
     def test_second_run_verifies_existing_target_without_duplicate_objects(self):
         digest, _ = self.add_object(b"immutable", "immutable.bin")

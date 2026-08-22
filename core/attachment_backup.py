@@ -235,7 +235,7 @@ class AttachmentBackup:
                 "objects": [dict(row) for row in objects],
                 "catalog": [
                     {
-                        "object_sha256": row["object_sha256"],
+                        "object_sha256": str(row["object_sha256"] or ""),
                         "object_size": (
                             int(row["object_size"])
                             if row["object_size"] is not None
@@ -456,9 +456,17 @@ class AttachmentBackup:
         }
         _atomic_json(os.path.join(snapshot_dir, "manifest.json"), manifest)
         _atomic_json(os.path.join(snapshot_dir, "catalog.json"), catalog)
+        _, manifest_sha256 = _hash_path(os.path.join(snapshot_dir, "manifest.json"))
+        _, catalog_sha256 = _hash_path(os.path.join(snapshot_dir, "catalog.json"))
         _atomic_json(
             os.path.join(snapshot_dir, "COMPLETE"),
-            {"schema": BACKUP_SCHEMA, "snapshot_id": snapshot_id, "state": "complete"},
+            {
+                "schema": BACKUP_SCHEMA,
+                "snapshot_id": snapshot_id,
+                "state": "complete",
+                "manifest_sha256": manifest_sha256,
+                "catalog_sha256": catalog_sha256,
+            },
         )
         return receipt
 
@@ -487,17 +495,26 @@ class AttachmentBackup:
         try:
             with open(os.path.join(directory, "COMPLETE"), encoding="utf-8") as handle:
                 complete = json.load(handle)
-            with open(os.path.join(directory, "manifest.json"), encoding="utf-8") as handle:
-                manifest = json.load(handle)
-            with open(os.path.join(directory, "catalog.json"), encoding="utf-8") as handle:
-                catalog = json.load(handle)
-        except (OSError, json.JSONDecodeError):
+            with open(os.path.join(directory, "manifest.json"), "rb") as handle:
+                manifest_bytes = handle.read()
+            with open(os.path.join(directory, "catalog.json"), "rb") as handle:
+                catalog_bytes = handle.read()
+            manifest = json.loads(manifest_bytes.decode("utf-8"))
+            catalog = json.loads(catalog_bytes.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return None
         if not all(isinstance(value, dict) for value in (complete, manifest, catalog)):
+            return None
+        if (
+            complete.get("manifest_sha256") != hashlib.sha256(manifest_bytes).hexdigest()
+            or complete.get("catalog_sha256") != hashlib.sha256(catalog_bytes).hexdigest()
+        ):
             return None
         snapshot_identity = manifest.get("snapshot_id")
         objects = manifest.get("objects")
         entries = catalog.get("entries")
+        if not isinstance(objects, list) or not isinstance(entries, list):
+            return None
         try:
             counts_match = (
                 int(manifest.get("object_count", -1)) == len(objects)
@@ -515,6 +532,12 @@ class AttachmentBackup:
             and row["size"] >= 0
             for row in objects
         )
+        object_sizes = {
+            row["sha256"]: row["size"]
+            for row in objects
+            if isinstance(row, dict) and "sha256" in row and "size" in row
+        }
+        objects_valid = objects_valid and len(object_sizes) == len(objects)
         entries_valid = all(
             isinstance(entry, dict)
             and set(entry) == CATALOG_FIELDS
@@ -522,7 +545,17 @@ class AttachmentBackup:
                 entry["object_sha256"] == ""
                 or re.fullmatch(r"[0-9a-f]{64}", str(entry["object_sha256"] or ""))
             )
-            and (entry["object_size"] is None or isinstance(entry["object_size"], int))
+            and (
+                (
+                    entry["object_sha256"] == ""
+                    and entry["object_size"] is None
+                )
+                or (
+                    entry["object_sha256"] in object_sizes
+                    and isinstance(entry["object_size"], int)
+                    and entry["object_size"] == object_sizes[entry["object_sha256"]]
+                )
+            )
             and all(
                 isinstance(entry[key], str)
                 for key in (
@@ -542,10 +575,8 @@ class AttachmentBackup:
             or complete.get("snapshot_id") != snapshot_identity
             or manifest.get("schema") != BACKUP_SCHEMA
             or manifest.get("catalog_file") != "catalog.json"
-            or not isinstance(objects, list)
             or catalog.get("schema") != BACKUP_SCHEMA
             or catalog.get("snapshot_id") != snapshot_identity
-            or not isinstance(entries, list)
             or not counts_match
             or not objects_valid
             or not entries_valid

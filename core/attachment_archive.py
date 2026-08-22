@@ -554,6 +554,50 @@ class AttachmentArchive:
                 except OSError:
                     pass
 
+    def preserve_file_mention(self, mention):
+        """Resolve one selected-chat file into the shared CAS without Knowledge state."""
+        mention = dict(mention)
+        if str(mention.get("kind") or "") != "file":
+            return {"status": "source_rejected", "resolution_method": "unsupported_kind"}
+        try:
+            with self._worker_lock():
+                resolution = self.resolve_file(mention)
+                if resolution.status != "resolved":
+                    return {
+                        "status": resolution.status,
+                        "resolution_method": resolution.method,
+                    }
+                digest, size, relpath = self.store_source(
+                    resolution.path,
+                    self.file_cache_root,
+                    resolution.object_name or mention.get("original_name") or "attachment",
+                    declared_size=mention.get("declared_size"),
+                    declared_hash=mention.get("declared_hash") or "",
+                )
+                return {
+                    "status": "ready_local",
+                    "resolution_method": resolution.method,
+                    "sha256": digest,
+                    "size": size,
+                    "object_relpath": relpath,
+                }
+        except ArchiveError as exc:
+            status = {
+                "worker_busy": "retry_wait",
+                "insufficient_archive_space": "insufficient_local_space",
+            }.get(exc.code, exc.code)
+            return {
+                "status": status,
+                "resolution_method": "shared_cas",
+                "error_code": exc.code,
+            }
+        except (OSError, ValueError):
+            return {
+                "status": "retry_wait",
+                "resolution_method": "shared_cas",
+                "error_code": "archive_failed",
+            }
+
     def _record_failure(self, conn, mention, status, method, code, now):
         attempt_count = int(mention["attempt_count"] or 0) + 1
         if status in AUTO_RETRY_STATUSES:
@@ -679,6 +723,14 @@ class AttachmentArchive:
         latest_wake, drained = self._worker_generation(conn)
         return latest_wake == drained
 
+    def _wake_pending(self):
+        conn = self._connect()
+        try:
+            wake_generation, drained_generation = self._worker_generation(conn)
+            return wake_generation > drained_generation
+        finally:
+            conn.close()
+
     def process_pending(self, limit=50):
         if not self.archive_kinds:
             return {"state": "disabled", "processed": 0, "archived": 0, "failed": 0}
@@ -690,116 +742,129 @@ class AttachmentArchive:
         except sqlite3.Error:
             return {"state": "catalog_unavailable", "processed": 0, "archived": 0, "failed": 0}
 
-        try:
-            lock = self._worker_lock()
-            lock.__enter__()
-        except ArchiveError as exc:
-            return {
-                "state": exc.code,
-                "processed": 0,
-                "archived": 0,
-                "failed": 0,
-                "wake_generation": wake_generation,
-            }
-        try:
-            conn = self._connect()
+        batch_size = max(1, int(limit))
+        processed = 0
+        archived = 0
+        failed = 0
+        acquired_once = False
+        while True:
             try:
-                placeholders = ",".join("?" for _ in self.archive_kinds)
-                retry_placeholders = ",".join("?" for _ in AUTO_RETRY_STATUSES)
-                batch_size = max(1, int(limit))
-                processed = 0
-                archived = 0
-                failed = 0
-                touched_topics = []
-                while True:
-                    now = self.now_func()
-                    rows = conn.execute(
-                        f"""
-                        SELECT m.*, COALESCE(e.source_chat_username, '') AS source_chat_username
-                        FROM attachment_mentions m
-                        LEFT JOIN events e ON e.event_id = m.event_id
-                        WHERE m.kind IN ({placeholders})
-                          AND (
-                            m.status = 'pending'
-                            OR (m.status IN ({retry_placeholders}) AND m.next_retry_at <= ?)
-                          )
-                        ORDER BY CASE WHEN m.status = 'pending' THEN 0 ELSE 1 END,
-                                 m.next_retry_at,
-                                 m.mention_id
-                        LIMIT ?
-                        """,
-                        (*self.archive_kinds, *AUTO_RETRY_STATUSES, now, batch_size),
-                    ).fetchall()
-                    if not rows:
-                        if self._mark_drained(conn):
-                            break
-                        continue
-
-                    for mention in rows:
+                lock = self._worker_lock()
+                lock.__enter__()
+            except ArchiveError as exc:
+                if acquired_once:
+                    return {
+                        "state": "healthy",
+                        "processed": processed,
+                        "archived": archived,
+                        "failed": failed,
+                    }
+                return {
+                    "state": exc.code,
+                    "processed": 0,
+                    "archived": 0,
+                    "failed": 0,
+                    "wake_generation": wake_generation,
+                }
+            acquired_once = True
+            touched_topics = []
+            try:
+                conn = self._connect()
+                try:
+                    placeholders = ",".join("?" for _ in self.archive_kinds)
+                    retry_placeholders = ",".join("?" for _ in AUTO_RETRY_STATUSES)
+                    while True:
                         now = self.now_func()
-                        if (
-                            mention["declared_size"] is not None
-                            and int(mention["declared_size"]) > self.max_object_bytes
-                        ):
-                            resolution = Resolution("object_too_large", "declared_size_policy")
-                        else:
-                            resolution = self.resolve(mention)
-                        if resolution.status not in {"resolved", "original_archived", "thumbnail_only"}:
-                            self._record_failure(
-                                conn,
-                                mention,
-                                resolution.status,
-                                resolution.method,
-                                resolution.status,
-                                now,
-                            )
-                            conn.commit()
-                            failed += 1
+                        rows = conn.execute(
+                            f"""
+                            SELECT m.*, COALESCE(e.source_chat_username, '') AS source_chat_username
+                            FROM attachment_mentions m
+                            LEFT JOIN events e ON e.event_id = m.event_id
+                            WHERE m.kind IN ({placeholders})
+                              AND (
+                                m.status = 'pending'
+                                OR (m.status IN ({retry_placeholders}) AND m.next_retry_at <= ?)
+                              )
+                            ORDER BY CASE WHEN m.status = 'pending' THEN 0 ELSE 1 END,
+                                     m.next_retry_at,
+                                     m.mention_id
+                            LIMIT ?
+                            """,
+                            (*self.archive_kinds, *AUTO_RETRY_STATUSES, now, batch_size),
+                        ).fetchall()
+                        if not rows:
+                            if self._mark_drained(conn):
+                                break
+                            continue
+
+                        for mention in rows:
+                            now = self.now_func()
+                            if (
+                                mention["declared_size"] is not None
+                                and int(mention["declared_size"]) > self.max_object_bytes
+                            ):
+                                resolution = Resolution("object_too_large", "declared_size_policy")
+                            else:
+                                resolution = self.resolve(mention)
+                            if resolution.status not in {"resolved", "original_archived", "thumbnail_only"}:
+                                self._record_failure(
+                                    conn,
+                                    mention,
+                                    resolution.status,
+                                    resolution.method,
+                                    resolution.status,
+                                    now,
+                                )
+                                conn.commit()
+                                failed += 1
+                                processed += 1
+                                touched_topics.append(mention["topic_id"])
+                                continue
+                            try:
+                                if resolution.decoded is not None:
+                                    digest, size, relpath = self.store_bytes(
+                                        resolution.decoded,
+                                        resolution.object_name,
+                                    )
+                                else:
+                                    allowed_root = self.file_cache_root if mention["kind"] == "file" else self.image_cache_root
+                                    digest, size, relpath = self.store_source(
+                                        resolution.path,
+                                        allowed_root,
+                                        resolution.object_name or mention["original_name"],
+                                        declared_size=mention["declared_size"],
+                                        declared_hash=mention["declared_hash"],
+                                    )
+                                self._record_success(conn, mention, resolution, digest, size, relpath, now)
+                                conn.commit()
+                                archived += 1
+                            except (ArchiveError, OSError, ValueError) as exc:
+                                code = exc.code if isinstance(exc, ArchiveError) else "archive_failed"
+                                status = code if code in {
+                                    "source_changed",
+                                    "source_rejected",
+                                    "object_too_large",
+                                    "insufficient_archive_space",
+                                } else "archive_failed"
+                                self._record_failure(conn, mention, status, resolution.method, code, now)
+                                conn.commit()
+                                failed += 1
                             processed += 1
                             touched_topics.append(mention["topic_id"])
-                            continue
-                        try:
-                            if resolution.decoded is not None:
-                                digest, size, relpath = self.store_bytes(
-                                    resolution.decoded,
-                                    resolution.object_name,
-                                )
-                            else:
-                                allowed_root = self.file_cache_root if mention["kind"] == "file" else self.image_cache_root
-                                digest, size, relpath = self.store_source(
-                                    resolution.path,
-                                    allowed_root,
-                                    resolution.object_name or mention["original_name"],
-                                    declared_size=mention["declared_size"],
-                                    declared_hash=mention["declared_hash"],
-                                )
-                            self._record_success(conn, mention, resolution, digest, size, relpath, now)
-                            conn.commit()
-                            archived += 1
-                        except (ArchiveError, OSError, ValueError) as exc:
-                            code = exc.code if isinstance(exc, ArchiveError) else "archive_failed"
-                            status = code if code in {
-                                "source_changed",
-                                "source_rejected",
-                                "object_too_large",
-                                "insufficient_archive_space",
-                            } else "archive_failed"
-                            self._record_failure(conn, mention, status, resolution.method, code, now)
-                            conn.commit()
-                            failed += 1
-                        processed += 1
-                        touched_topics.append(mention["topic_id"])
-                self._rewrite_topics(topic_id for topic_id in touched_topics if topic_id is not None)
-                return {
-                    "state": "healthy",
-                    "processed": processed,
-                    "archived": archived,
-                    "failed": failed,
-                }
+                finally:
+                    conn.close()
             finally:
-                conn.close()
-        finally:
-            lock.__exit__(None, None, None)
+                lock.__exit__(None, None, None)
+
+            self._rewrite_topics(topic_id for topic_id in touched_topics if topic_id is not None)
+            if self._wake_pending():
+                continue
+            return {
+                "state": "healthy",
+                "processed": processed,
+                "archived": archived,
+                "failed": failed,
+            }
 
     def status(self):
         if not os.path.exists(self.db_path):

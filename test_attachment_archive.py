@@ -68,6 +68,9 @@ class AttachmentArchiveTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def archive(self, kinds=("file",), image_aes_key="", now_func=None, **kwargs):
+        # Resolver/CAS tests must not depend on the host's current free space.
+        # The dedicated object-policy test passes its own threshold explicitly.
+        kwargs.setdefault("min_free_bytes", 0)
         return AttachmentArchive(
             self.db_path,
             self.archive_root,
@@ -417,6 +420,34 @@ class AttachmentArchiveTests(unittest.TestCase):
         self.assertEqual(outcome["processed"], 2)
         self.assertEqual(seen, ["first.txt", "inserted-while-active.txt"])
         self.assertEqual(nested_results[0]["state"], "worker_busy")
+        worker = self.rows(
+            "SELECT wake_generation, drained_generation FROM attachment_worker_state"
+        )[0]
+        self.assertEqual(worker["wake_generation"], worker["drained_generation"])
+
+    def test_final_wake_after_drain_recompetes_and_processes_inserted_row(self):
+        self.add_file_mention("first.txt")
+        archive = self.archive(retry_base_seconds=10, retry_max_seconds=40)
+        original_mark_drained = archive._mark_drained
+        nested_results = []
+        fired = [False]
+
+        def wake_after_drain(conn):
+            drained = original_mark_drained(conn)
+            if drained and not fired[0]:
+                fired[0] = True
+                self.add_file_mention("final-wake.txt")
+                nested_results.append(archive.process_pending(limit=1))
+            return drained
+
+        with patch.object(archive, "_mark_drained", side_effect=wake_after_drain):
+            outcome = archive.process_pending(limit=1)
+
+        self.assertEqual(outcome["processed"], 2)
+        self.assertEqual(nested_results[0]["state"], "worker_busy")
+        mentions = self.rows("SELECT original_name, attempt_count FROM attachment_mentions")
+        self.assertEqual({row["original_name"] for row in mentions}, {"first.txt", "final-wake.txt"})
+        self.assertTrue(all(row["attempt_count"] == 1 for row in mentions))
         worker = self.rows(
             "SELECT wake_generation, drained_generation FROM attachment_worker_state"
         )[0]
