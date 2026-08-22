@@ -1,17 +1,19 @@
 # Source reliability
 
-This guide covers three deliberately separate responsibilities:
+This guide covers four deliberately separate responsibilities:
 
 1. the optional WeChat source guard, which may request a normal macOS
    application launch;
-2. the attachment catalog and private local content-addressed archive; and
-3. an optional provider-neutral filesystem snapshot target.
+2. the attachment catalog and private local content-addressed archive;
+3. direct selected-chat file sync to the user's authorized Google Drive; and
+4. an optional provider-neutral filesystem snapshot target.
 
 They do not form a single always-on daemon. `TopicMonitor` reads messages and
 owns checkpoints; it does not import or invoke the source guard. The Knowledge
 transaction owns attachment mentions; a post-commit worker owns byte copying.
-The backup command reads immutable local archive objects and writes only to the
-configured filesystem target.
+The selected-chat scanner owns an independent cursor and queue and may reuse the
+same local CAS without a Knowledge hit. The backup command reads immutable local
+archive objects and writes only to the configured filesystem target.
 
 ## 1. Optional WeChat source guard
 
@@ -211,7 +213,149 @@ historical catalog rows; `--run` then consumes pending rows.
 `--limit` is the worker batch size, not a total cap: an acquired worker keeps
 draining fresh and currently due rows before it exits.
 
-## 4. Optional filesystem backup target
+## 4. Direct selected-chat Google Drive file sync
+
+This is the ordinary automatic file-backup lane. It is independent of
+`TopicMonitor`, Knowledge selection, the source guard, and the filesystem
+snapshot backend:
+
+```text
+selected WeChat chats
+  -> per-chat scan cursor + durable file-message queue
+  -> exact file resolver + shared local SHA-256 CAS
+  -> one Drive object per unique byte digest
+  -> chat / source-month Drive shortcuts
+```
+
+Only resources whose source envelope says `kind=file` are eligible in this
+release. Images, voice messages, videos, and stickers do not enter this queue.
+The scanner advances over missing and non-file messages, so a file that has not
+yet appeared in WeChat's cache cannot block later messages. `missing_retryable`
+uses due-only bounded exponential retry; `ambiguous` is terminal until a human
+changes the local evidence and explicitly retries through a future workflow.
+
+The first enable initializes each currently selected chat at the current time.
+It does not silently upload history. Historical discovery is a separate
+plan/apply operation. Removing a chat from the selected set retains its cursor,
+queue, and retry state but stops resolving or uploading its pending items until
+the chat is selected again.
+
+### Local configuration and ledger
+
+Public defaults are off:
+
+```json
+{
+  "google_drive_file_sync_enabled": false,
+  "google_drive_file_sync_paused": false,
+  "google_drive_file_sync_selected_chats": [],
+  "google_drive_file_sync_interval_seconds": 300,
+  "google_drive_file_sync_max_messages_per_scan": 500,
+  "google_drive_file_sync_max_uploads_per_run": 20,
+  "google_drive_file_sync_max_bytes_per_run": 536870912,
+  "google_drive_file_sync_root_name": "微信群文件归档",
+  "google_drive_file_sync_keep_local_objects": true
+}
+```
+
+Selected chat usernames live only in private local config and the independent
+local ledger. Each remote chat identity is a salted SHA-256 key derived from a
+random local `archive_id`; raw `@chatroom` usernames are never Drive metadata.
+The ledger stores per-chat cursor timestamp plus the complete set of message
+identities already seen at that timestamp, making same-second pagination and
+restart idempotent. `(source_message_id, resource_index)` is globally unique.
+Raw chat bodies are not stored in this database or its run receipts.
+
+The principal tables are `drive_scan_state`, `drive_sync_items`,
+`drive_objects`, `drive_placements`, `drive_folders`, and content-free
+`drive_sync_runs`. A non-blocking process lock makes menu timer, CLI, and app
+startup recovery safe callers of the same one-shot worker; there is no new
+infinite loop. Disabling or pausing prevents a new scan/upload. If the setting
+changes during one file, that file finishes safely and the worker stops before
+taking the next item.
+
+### OAuth and credential boundary
+
+Authentication is Installed desktop app OAuth 2.0 with a system browser,
+loopback callback, and PKCE. The only requested scope is:
+
+```text
+https://www.googleapis.com/auth/drive.file
+```
+
+The user's own OAuth client JSON is normalized into the private runtime data
+directory with mode `0600`; it is never ordinary config or tracked source. The
+refresh token is stored only in macOS Keychain. Access tokens remain in memory.
+Offline access is requested. Service accounts are unsupported. A refresh-token
+`invalid_grant` changes queued work to `auth_required` and emits one notification
+for that episode; it does not discard the queue. `disconnect` removes the
+Keychain refresh token but does not delete config, queue, CAS objects, or Drive
+files.
+
+### Drive identity and projection
+
+The first successful remote run creates or adopts one app-owned root folder,
+whose default visible name is `微信群文件归档`. Its Drive file ID is authority:
+rename or move does not matter. If that known root is trashed, missing, invalid,
+or inaccessible, the worker enters `remote_degraded` and does not create a
+second root.
+
+```text
+微信群文件归档/
+  群聊/<stable-local-alias>/<source YYYY-MM>/<Drive shortcut>
+  _系统/objects/<sha256-prefix>/<full-sha256>--<safe-original-name>
+```
+
+Local SHA-256 is the canonical byte identity. The worker first checks the local
+object ledger and then searches `appProperties` before uploading, so a crash
+after a successful remote write but before local commit adopts the existing
+object or shortcut. Duplicate remote object matches select one canonical Drive
+ID, record `remote_duplicate_detected`, and never upload a third copy. Remote
+verification prefers `sha256Checksum`; when unavailable it requires matching
+size plus `md5Checksum` before recording `uploaded_verified`.
+
+One object is shared globally. The placement identity is
+`(hashed_chat_key, source_month, sha256)`, so the same bytes in another chat or
+month produce another shortcut, not another upload. A same-name/different-hash
+collision uses `stem--<hash8>.ext`. A deleted ordinary shortcut or child folder
+can be rebuilt by `reconcile`; the project never automatically deletes or
+trashes any Drive item.
+
+Remote `appProperties` contain only schema version, random archive ID, role,
+SHA-256 where relevant, hashed chat key, and source month. Full source-message
+provenance stays local. Google Drive receives the selected chat's configured
+alias, original/safe file name, and attachment bytes. It does **not** receive
+raw chat usernames, raw message XML/body, `source_message_id`, `wxid`, or local
+WeChat cache paths through this lane.
+
+### CLI and menu controls
+
+Authentication, selected-chat choice, enablement, historical backfill, and a
+real upload are separate actions:
+
+```bash
+.venv/bin/python scripts/google_drive_file_sync.py auth --client-secrets "<installed-desktop-client.json>"
+.venv/bin/python scripts/google_drive_file_sync.py auth-status
+.venv/bin/python scripts/google_drive_file_sync.py status
+.venv/bin/python scripts/google_drive_file_sync.py enable
+.venv/bin/python scripts/google_drive_file_sync.py disable
+.venv/bin/python scripts/google_drive_file_sync.py pause
+.venv/bin/python scripts/google_drive_file_sync.py resume
+.venv/bin/python scripts/google_drive_file_sync.py scan
+.venv/bin/python scripts/google_drive_file_sync.py run
+.venv/bin/python scripts/google_drive_file_sync.py reconcile
+.venv/bin/python scripts/google_drive_file_sync.py backfill --from YYYY-MM-DD
+.venv/bin/python scripts/google_drive_file_sync.py backfill --from YYYY-MM-DD --apply
+.venv/bin/python scripts/google_drive_file_sync.py disconnect
+```
+
+`backfill` without `--apply` is read-only. `enable` initializes current selected
+chat cursors but does not authenticate, select chats, run backfill, or upload.
+The menu bar's **Google Drive group-file backup** submenu provides status,
+enable/disable, pause/resume, sync now, chat selection, open root, and
+reauthorize. Selecting chats also does not enable or upload.
+
+## 5. Optional filesystem backup target
 
 The backup layer knows only filesystem paths. It has no Google Drive, Dropbox,
 iCloud, or other provider API; it stores no OAuth token or provider credential.
@@ -271,27 +415,36 @@ locally. It reads the snapshot catalog and scans the local CAS directly, so the
 plan still works when the local Knowledge database/catalog is absent. This
 tranche deliberately provides no automatic restore or deletion.
 
-## 5. Health and safe rollout
+## 6. Health and safe rollout
 
 The redacted health check reports source-guard effective state, last result,
 remaining restart budget, source freshness, attachment catalog counts/object
-count, and whether an optional backup target has complete snapshots:
+count, optional backup snapshots, and privacy-safe direct Drive state: auth,
+enabled/paused, selected-chat count, queue counts, last scan/upload, next retry,
+root state, object/shortcut counts, and last error code:
 
 ```bash
 .venv/bin/python scripts/health_check.py
 ```
 
-A safe first rollout is:
+A safe first direct-Drive rollout is:
 
-1. inspect `wechat_source_guard.py status` and `attachment_archive.py status`;
-2. leave source guard disabled until its policy values are reviewed;
-3. run attachment historical `backfill` in plan mode;
-4. configure a backup target and run `attachment_backup.py plan`;
-5. use each explicit apply/run/load action only after reviewing the plan and
-   local privacy implications; and
-6. run health plus backup `verify` after any activated change.
+1. obtain your own Google Cloud Installed desktop app OAuth client JSON;
+2. run `auth`, then confirm `auth-status` without enabling sync;
+3. choose chats in the menu and review the stable aliases that will be visible
+   in Drive;
+4. run historical `backfill --from ...` without `--apply` if history is wanted;
+5. run `enable`, then one explicit `run`, and inspect `status` plus Drive root;
+6. apply historical backfill only after reviewing its counts; and
+7. run the redacted health check after activation.
 
-Installing or loading the source guard, applying historical backfill, writing a
-real backup target, pruning WeChat cache data, or asserting provider upload are
-all separate operational actions. Source availability, local preservation,
-target-byte verification, and remote sync are distinct facts.
+The source guard and filesystem snapshot have their own rollouts: inspect their
+status/plan first and keep them disabled or unconfigured until separately
+reviewed.
+
+Installing/loading the source guard, authorizing Google, choosing chats,
+enabling direct sync, applying either historical backfill, writing a real
+filesystem target, pruning WeChat cache data, and deleting Drive files are all
+separate operational actions. Source availability, local preservation,
+filesystem target-byte verification, and verified Drive object/shortcut state
+are distinct facts.

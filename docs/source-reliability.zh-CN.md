@@ -1,15 +1,17 @@
-# 来源可靠性：source guard、附件归档与 filesystem backup
+# 来源可靠性：source guard、本地 CAS、Google Drive 直传与 filesystem backup
 
-这一层故意拆成三项互不冒充的责任：
+这一层故意拆成四项互不冒充的责任：
 
 1. 可选 WeChat source guard：只负责在安全状态下请求 macOS 正常打开微信；
 2. Attachment catalog 与本机私有 content-addressed archive；
-3. 可选、provider-neutral 的 filesystem snapshot target。
+3. Selected-chat files 直传用户授权的 Google Drive；
+4. 可选、provider-neutral 的 filesystem snapshot target。
 
 它们不是一个永不退出的“大守护进程”。`TopicMonitor` 负责读消息与 checkpoint，
 不 import、也不调用 source guard。Knowledge transaction 负责登记 attachment mention；
 commit 之后的 worker 才负责找 bytes 和复制。Backup 命令只读本机 immutable archive object，
-并且只写 configured filesystem target。
+并且只写 configured filesystem target。Selected-chat scanner 则拥有独立 cursor/queue；即使消息没有
+Knowledge hit，也可以复用同一个本地 CAS。
 
 ## 1. 可选 WeChat source guard
 
@@ -182,7 +184,122 @@ low-space failure 进入正常的 due-only retry schedule。
 `--limit` 是 batch size，不是本次总上限；worker 一旦获得 lock，会在退出前 drain 所有 fresh 与
 当前已 due 的 rows。
 
-## 4. 可选 filesystem backup target
+## 4. Selected-chat files → Google Drive 直传
+
+这是日常自动文件备份主线。它独立于 `TopicMonitor`、Knowledge selection、source guard 与 filesystem
+snapshot：
+
+```text
+用户选定的微信群聊
+  -> 每群 scan cursor + durable file-message queue
+  -> 既有精确 resolver + 共享本地 SHA-256 CAS
+  -> 每份唯一 bytes 一个 Drive object
+  -> 群聊 / source month 的 Drive shortcut projection
+```
+
+第一版只接受 source envelope 中 `kind=file` 的真实文件。图片、语音、视频与表情不会进入这条 queue。
+Scanner 会跨过缺失文件与非 file 消息继续推进，因此一个暂时没有自动下载到微信 cache 的文件不会堵住
+后面的消息。`missing_retryable` 只在 due 时按有上限的 exponential backoff 重试；`ambiguous` 不猜测、
+不上传。
+
+第一次 enable 会把当前已选择群聊的 cursor 初始化到“现在”，不会静默上传全部历史。历史发现严格是另一条
+plan/apply action。把某个群聊从 selected set 移除时，其 cursor、queue 与 retry state 都保留，但该群 pending
+item 会停止 resolve/upload；重新选中后再继续。
+
+### 本地 config 与独立 ledger
+
+Public 默认全部关闭：
+
+```json
+{
+  "google_drive_file_sync_enabled": false,
+  "google_drive_file_sync_paused": false,
+  "google_drive_file_sync_selected_chats": [],
+  "google_drive_file_sync_interval_seconds": 300,
+  "google_drive_file_sync_max_messages_per_scan": 500,
+  "google_drive_file_sync_max_uploads_per_run": 20,
+  "google_drive_file_sync_max_bytes_per_run": 536870912,
+  "google_drive_file_sync_root_name": "微信群文件归档",
+  "google_drive_file_sync_keep_local_objects": true
+}
+```
+
+Selected chat username 只存在 private local config 和独立本机 ledger。Remote chat identity 是由随机本地
+`archive_id` 加盐派生的 SHA-256 key；Drive metadata 永远不写 raw `@chatroom` username。每群 cursor
+保存 timestamp 和该 timestamp 已见过的完整 message identity set，因此同秒分页、restart 都不会漏或重。
+`(source_message_id, resource_index)` 全局幂等。这套 DB 与 run receipt 不保存 raw chat body。
+
+主要表是 `drive_scan_state`、`drive_sync_items`、`drive_objects`、`drive_placements`、
+`drive_folders` 和 content-free `drive_sync_runs`。Menu timer、CLI 与 app startup recovery 都调用同一个
+带 non-blocking process lock 的 one-shot worker，不新增 infinite loop。Disable/pause 后不开始新的 scan/upload；
+如果开关在一个文件处理中改变，当前单文件安全结束，worker 不再取下一项。
+
+### OAuth 与 credential boundary
+
+Auth 使用 Installed desktop app OAuth 2.0、system browser、loopback callback 和 PKCE。唯一 scope 是：
+
+```text
+https://www.googleapis.com/auth/drive.file
+```
+
+用户自己的 OAuth client JSON 会被 normalize 到 private runtime directory，权限 `0600`；它不进入普通
+config 或 tracked source。Refresh token 只存 macOS Keychain，access token 只在内存里；请求 offline access。
+不支持 service account。Refresh token 失效或 `invalid_grant` 时，item 进入 `auth_required`，该 episode 只通知
+一次，queue 不丢。`disconnect` 只删除 Keychain refresh token，不删除 config、queue、CAS 或 Drive 文件。
+
+### Drive identity 与 projection
+
+第一次成功 remote run 会创建或 adopt 一个 app-owned root，默认可见名称是 `微信群文件归档`。Drive file ID
+才是 authority：用户改名或移动不影响。已知 root 被 trashed、丢失、invalid 或权限不可读时进入
+`remote_degraded`，不会偷偷建第二个 root。
+
+```text
+微信群文件归档/
+  群聊/<stable-local-alias>/<source YYYY-MM>/<Drive shortcut>
+  _系统/objects/<sha256-prefix>/<full-sha256>--<safe-original-name>
+```
+
+本地 SHA-256 是 canonical byte identity。上传前先查 local object ledger；ledger 不确定时再按
+`appProperties` 搜索。因此 remote create 成功、local commit 前 crash，下次会 adopt 已存在 object/shortcut，
+不会重复。多个 remote object 命中同 digest 时选择一个 canonical Drive ID，记录
+`remote_duplicate_detected`，不上传第三份。Verification 优先比较 `sha256Checksum`；字段缺失时必须同时
+匹配 size 与 `md5Checksum`，才写 `uploaded_verified`。
+
+同一 object 在全局只上传一次。Placement identity 是
+`(hashed_chat_key, source_month, sha256)`：同 bytes 出现在另一群或另一月份只加 shortcut。同名不同 hash
+使用 `stem--<hash8>.ext`。普通 child folder 或 shortcut 被删除后，`reconcile` 可重建；程序永不自动删除或
+trash Drive item。
+
+Remote `appProperties` 只含 schema version、随机 archive ID、role，以及相应 SHA-256、hashed chat key 和
+source month。完整 source-message provenance 只留在本机。Google Drive 会收到被选群聊的 configured
+alias、原始/安全文件名与文件 bytes；不会通过这条 lane 收到 raw chat username、raw XML/body、
+`source_message_id`、`wxid` 或本机 WeChat cache path。
+
+### CLI 与菜单控制
+
+Auth、选群、enable、历史 backfill 与真实 upload 是五个分开的动作：
+
+```bash
+.venv/bin/python scripts/google_drive_file_sync.py auth --client-secrets "<installed-desktop-client.json>"
+.venv/bin/python scripts/google_drive_file_sync.py auth-status
+.venv/bin/python scripts/google_drive_file_sync.py status
+.venv/bin/python scripts/google_drive_file_sync.py enable
+.venv/bin/python scripts/google_drive_file_sync.py disable
+.venv/bin/python scripts/google_drive_file_sync.py pause
+.venv/bin/python scripts/google_drive_file_sync.py resume
+.venv/bin/python scripts/google_drive_file_sync.py scan
+.venv/bin/python scripts/google_drive_file_sync.py run
+.venv/bin/python scripts/google_drive_file_sync.py reconcile
+.venv/bin/python scripts/google_drive_file_sync.py backfill --from YYYY-MM-DD
+.venv/bin/python scripts/google_drive_file_sync.py backfill --from YYYY-MM-DD --apply
+.venv/bin/python scripts/google_drive_file_sync.py disconnect
+```
+
+`backfill` 不带 `--apply` 时完全只读。`enable` 只初始化当前 selected chat cursor，不会 auth、选群、运行
+backfill 或上传。菜单栏的 **Google Drive 群文件备份** submenu 提供 status、enable/disable、pause/resume、
+立即同步、选择群聊、打开 root 与重新授权；选择群聊本身也不会 enable 或 upload。
+
+## 5. 可选 filesystem backup target
 
 Backup layer 只认识 filesystem path。它没有 Google Drive、Dropbox、iCloud 或其他 provider API，
 不保存 OAuth token/provider credential。Target 可以位于 provider desktop sync folder 内，
@@ -234,25 +351,31 @@ cloud-upload verification。`restore-plan` 是 read-only，只统计 target 上�
 的 object 数量与 bytes；它读取 snapshot catalog 并直接扫描本地 CAS，因此本地 Knowledge
 DB/catalog 缺失时仍能工作。这一 tranche 故意没有 automatic restore 或删除功能。
 
-## 5. Health 与安全 rollout
+## 6. Health 与安全 rollout
 
 Redacted health check 现在会报告 source guard effective state、last result、剩余 restart budget、
 source freshness、attachment catalog counts/object count，以及 optional backup target 是否存在
-complete snapshot：
+complete snapshot；同时报告 privacy-safe Drive 状态：auth、enabled/paused、selected chat count、queue
+counts、last scan/upload、next retry、root state、object/shortcut count 与 last error code：
 
 ```bash
 .venv/bin/python scripts/health_check.py
 ```
 
-第一次安全 rollout 建议按下面顺序：
+第一次安全启用 Direct Drive 建议按下面顺序：
 
-1. 先看 `wechat_source_guard.py status` 和 `attachment_archive.py status`；
-2. 在 policy values 没审完前保持 source guard disabled；
-3. 历史附件只跑 `backfill` plan；
-4. 配置 backup target 后先跑 `attachment_backup.py plan`；
-5. 逐项审查本机隐私和计划结果，再分别执行明确的 apply/run/load；
-6. 激活任何变化后，重新跑 health 与 backup `verify`。
+1. 准备自己的 Google Cloud Installed desktop app OAuth client JSON；
+2. 只执行 `auth`，用 `auth-status` 确认，不 enable；
+3. 在菜单选择群聊，检查将显示到 Drive 的 stable alias；
+4. 如果需要历史，只跑一次 `backfill --from ...` dry plan；
+5. 执行 `enable`，再手动 `run` 一次，检查本地 `status` 与 Drive root；
+6. 审查 counts 后才决定是否运行历史 `--apply`；
+7. 激活后重新跑 redacted health check。
 
-安装/加载 source guard、历史 backfill apply、写真实 backup target、清理微信 cache、以及断言 provider
-上传成功，始终是五个不同的 operational actions。Source availability、本机保存、target-byte
-verification 与 remote sync 也是四个不同事实。
+Source guard 与 filesystem snapshot 各有自己的 rollout：先看 status/plan，未单独审查前保持 disabled 或
+unconfigured。
+
+安装/加载 source guard、Google auth、选群、enable direct sync、两类历史 backfill apply、写真实
+filesystem target、清理微信 cache 与删除 Drive 文件，始终是分开的 operational actions。Source
+availability、本机保存、filesystem target-byte verification 与已验证的 Drive object/shortcut state
+也是不同事实。

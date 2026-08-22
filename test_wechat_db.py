@@ -110,6 +110,17 @@ class WeChatDBPagingTests(unittest.TestCase):
         self.assertEqual([m["timestamp"] for m in first], [101, 102, 103])
         self.assertEqual([m["timestamp"] for m in second], [104, 105, 106])
 
+    def test_get_messages_can_include_cursor_timestamp_for_identity_dedup(self):
+        messages = self.db.get_messages(
+            "room@chatroom",
+            since_ts=103,
+            limit=3,
+            page_forward=True,
+            since_inclusive=True,
+        )
+
+        self.assertEqual([m["timestamp"] for m in messages], [103, 104, 105])
+
 
 class WeChatSourceEnvelopeTests(unittest.TestCase):
     def setUp(self):

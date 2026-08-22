@@ -16,6 +16,8 @@ if str(PROJECT_DIR) not in sys.path:
 from core.config import DATA_DIR, active_monitor_chats, load_config
 from core.attachment_archive import AttachmentArchive
 from core.attachment_backup import AttachmentBackup
+from core.google_drive_auth import GoogleDriveOAuth
+from core.google_drive_file_sync import GoogleDriveFileSync
 from core.knowledge import TAXONOMY_PROFILES
 from core.key_extractor import (
     EXTRACT_LOG,
@@ -234,6 +236,10 @@ def main(argv: list[str] | None = None) -> int:
     guard = source_guard_status(config)
     attachment_archive = AttachmentArchive.from_config(config).status()
     attachment_backup = AttachmentBackup.from_config(config).status()
+    drive_sync = GoogleDriveFileSync.inspect_status(
+        config,
+        oauth=GoogleDriveOAuth(),
+    )
 
     print("微信总结 health check")
     print("")
@@ -344,6 +350,36 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"[{ok(backup_ok)}] Attachment backup target: {backup_label}; "
         f"complete snapshots={attachment_backup.get('complete_snapshots', 0)}"
+    )
+    drive_enabled = bool(config.get("google_drive_file_sync_enabled", False))
+    drive_paused = bool(config.get("google_drive_file_sync_paused", False))
+    drive_auth = drive_sync.get("auth") or "auth_required"
+    drive_root = drive_sync.get("root_state") or "unknown"
+    drive_ok = (
+        not drive_enabled
+        or drive_paused
+        or (
+            drive_auth == "connected"
+            and int(drive_sync.get("selected_chat_count") or 0) > 0
+            and drive_root not in {"missing", "trashed", "duplicate", "invalid"}
+            and drive_sync.get("last_error_code") != "local_ledger_unreadable"
+        )
+    )
+    drive_counts = drive_sync.get("queue_counts") or {}
+    drive_count_text = ", ".join(
+        f"{key}={drive_counts[key]}" for key in sorted(drive_counts)
+    ) or "empty"
+    print(
+        f"[{ok(drive_ok)}] Google Drive selected-chat files: "
+        f"{'enabled' if drive_enabled else 'disabled'} / "
+        f"{'paused' if drive_paused else 'active'}; "
+        f"auth={drive_auth}; selected={int(drive_sync.get('selected_chat_count') or 0)}; "
+        f"queue={drive_count_text}; last_scan={float(drive_sync.get('last_scan_at') or 0):.0f}; "
+        f"last_verified_upload={float(drive_sync.get('last_verified_upload_at') or 0):.0f}; "
+        f"next_retry={float(drive_sync.get('next_retry_at') or 0):.0f}; "
+        f"root={drive_root}; objects={int(drive_sync.get('uploaded_unique_objects') or 0)}; "
+        f"shortcuts={int(drive_sync.get('shortcut_placements') or 0)}; "
+        f"last_error={drive_sync.get('last_error_code') or '-'}"
     )
     print("")
     plist_label = agent_record.plist_path if args.sensitive else ("present" if agent_record.plist_path.exists() else "missing")

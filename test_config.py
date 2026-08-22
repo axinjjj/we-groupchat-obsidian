@@ -8,6 +8,7 @@ from core.config import (
     _sanitize_config,
     active_monitor_chats,
     merge_monitor_chat_preferences,
+    selected_drive_sync_chats,
 )
 from core.taxonomy_assignment import FREE_FORM_PROFILE
 
@@ -124,6 +125,11 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(DEFAULT_CONFIG["attachment_archive_max_object_bytes"], 512 * 1024 * 1024)
         self.assertEqual(DEFAULT_CONFIG["attachment_archive_min_free_bytes"], 1024 * 1024 * 1024)
         self.assertEqual(DEFAULT_CONFIG["attachment_backup_target"], "")
+        self.assertFalse(DEFAULT_CONFIG["google_drive_file_sync_enabled"])
+        self.assertFalse(DEFAULT_CONFIG["google_drive_file_sync_paused"])
+        self.assertEqual(DEFAULT_CONFIG["google_drive_file_sync_selected_chats"], [])
+        self.assertEqual(DEFAULT_CONFIG["google_drive_file_sync_root_name"], "微信群文件归档")
+        self.assertTrue(DEFAULT_CONFIG["google_drive_file_sync_keep_local_objects"])
 
         cfg = _sanitize_config({
             "wechat_source_guard_enabled": True,
@@ -157,6 +163,42 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg["attachment_archive_retry_base_seconds"], 15)
         self.assertEqual(cfg["attachment_archive_retry_max_seconds"], 300)
         self.assertTrue(cfg["attachment_backup_target"].endswith("Google Drive/WeChat backup"))
+
+    def test_google_drive_file_sync_config_is_private_opt_in_and_sanitized(self):
+        cfg = _sanitize_config({
+            "google_drive_file_sync_enabled": True,
+            "google_drive_file_sync_paused": True,
+            "google_drive_file_sync_selected_chats": [
+                {"username": " room@chatroom ", "alias": " 稳定群名 "},
+                {"username": "room@chatroom", "alias": "duplicate"},
+                {"username": "wxid_person", "alias": "ignored"},
+                {"username": "other@chatroom", "alias": 7},
+            ],
+            "google_drive_file_sync_interval_seconds": 600,
+            "google_drive_file_sync_max_messages_per_scan": 750,
+            "google_drive_file_sync_max_uploads_per_run": 30,
+            "google_drive_file_sync_max_bytes_per_run": 1024 * 1024 * 1024,
+            "google_drive_file_sync_root_name": " 私有群文件 ",
+            "google_drive_file_sync_keep_local_objects": False,
+            "google_drive_file_sync_db": "~/.we-groupchat-obsidian/drive.db",
+        })
+
+        self.assertTrue(cfg["google_drive_file_sync_enabled"])
+        self.assertTrue(cfg["google_drive_file_sync_paused"])
+        self.assertEqual(
+            selected_drive_sync_chats(cfg),
+            [
+                {"username": "room@chatroom", "alias": "稳定群名"},
+                {"username": "other@chatroom", "alias": ""},
+            ],
+        )
+        self.assertEqual(cfg["google_drive_file_sync_interval_seconds"], 600)
+        self.assertEqual(cfg["google_drive_file_sync_max_messages_per_scan"], 750)
+        self.assertEqual(cfg["google_drive_file_sync_max_uploads_per_run"], 30)
+        self.assertEqual(cfg["google_drive_file_sync_max_bytes_per_run"], 1024 * 1024 * 1024)
+        self.assertEqual(cfg["google_drive_file_sync_root_name"], "私有群文件")
+        self.assertTrue(cfg["google_drive_file_sync_keep_local_objects"])
+        self.assertTrue(cfg["google_drive_file_sync_db"].endswith("drive.db"))
 
         invalid = _sanitize_config({
             "wechat_source_guard_pause_until": "tomorrow",

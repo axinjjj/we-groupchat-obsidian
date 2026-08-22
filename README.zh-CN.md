@@ -95,6 +95,9 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
 - 文件附件可以进入本机私有的 SHA-256 content-addressed archive，同一份 bytes 只保留一个 object。
   可选 backup 只把 immutable objects 复制到普通 filesystem target；验证的是目标目录 bytes，
   不是 sync provider 的云端上传状态。
+- Direct Google Drive 文件同步是另一条 public-default-off lane：只扫描用户选定群聊，file message 不需要
+  Knowledge hit 就会进入 durable queue，复用同一 CAS，每个 digest 只上传一次，再按群聊/月份创建可读
+  shortcut。Remote identity 由 Drive file ID 持有，不由可见名称或路径持有。
 - 远程 AI 调用和显式开启的公开网页预览会跨出 Mac 本地边界；Ollama 可以让 AI 解释留在本机，
   而公开网页上下文默认关闭，并始终按 untrusted input 处理。
 - 保存知识、立刻发通知、进入 Review Queue 供以后行动，是三个独立判断。微信 UI 发送属于另一条受控路径，
@@ -117,6 +120,7 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
 - 附件 catalog 与本地 content-addressed archive：archive 默认关闭；启用后相同 bytes 自动 dedup，图片仍需单独 opt-in。
 - 可选、单独安装的微信 source guard：grace、pause、restart budget、exponential backoff、content-free receipts，且没有 `KeepAlive` busy loop。
 - Provider-neutral filesystem snapshot：支持 attachment archive 的 plan、run、verify 和只读 restore plan。
+- 可选 selected-chat files 直传用户授权的 Google Drive：durable queue、全局 bytes 去重、群聊/月 shortcut、retry/reconcile，且不自动删除。
 - 链接和转发展开：可选择补充公开网页标题/摘要；远程链接预览默认关闭。本地微信 XML 里可见的转发聊天记录会尽量解析。
 - MCP Server：让 Claude Desktop、Claude Code、Cursor、OpenClaw 等 MCP 客户端只读查询群聊、搜索、总结、查看图片；发送消息默认关闭。
 - 运维命令：即使菜单栏图标被隐藏，也可以用 `.command` 文件配置关注推送、健康检查、刷新数据源、历史回填和安装自启动。
@@ -133,8 +137,13 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
 - Attachment catalog、本地 archive、source-guard state/receipts 和 backup snapshot manifest/catalog 都是私有 runtime data。
   Archive object 含原始附件 bytes，绝不能提交或公开。
 - Backup target 只是一个 filesystem path。如果它位于 Google Drive、Dropbox、iCloud Drive 等同步目录，
-  对应 provider 可能按自己的隐私规则接收附件 bytes 和 manifest。本项目没有 provider API/OAuth，
-  也不能验证远端 upload 是否完成。
+  对应 provider 可能按自己的隐私规则接收附件 bytes 和 manifest。Filesystem snapshot backend 仍然没有
+  provider API，也不能验证 provider-side upload 是否完成。
+- Direct Google Drive sync 是不同的 opt-in backend，只请求 `drive.file` OAuth scope。Refresh token 只在
+  macOS Keychain，access token 只在内存；用户自己的 Installed desktop app OAuth client JSON 会复制到
+  `0600` private runtime storage，绝不能提交。被选群聊的 configured stable alias、文件名与文件 bytes 会
+  上传到用户自己的 Drive；raw `@chatroom` username、消息 body/XML、`source_message_id`、`wxid` 与
+  WeChat cache path 不进入 Drive metadata。程序不删除 Drive 文件、微信 cache 或本地 CAS object。
 - 远程链接预览默认关闭。只有显式设置 `monitor_fetch_links: true` 后，程序才会请求关注消息里的公开 URL；远端网站可能收到你的请求元数据。链接预览有保守的 SSRF 防护，但它仍然只是 best-effort public URL preview，不是 hardened crawler。
 - MCP read tools 会把本地 chat-derived data 暴露给 MCP client；部分管理工具可以修改本地 metadata，例如分组或配置衍生状态。
 - MCP 的发送微信消息能力默认关闭。真实 UI 发送需要显式设置 `mcp_send_mode`（`allowlist` 或 `enabled`）、授予辅助功能权限，并走 `prepare_send_message` -> 用户确认 -> `confirm_send_message` nonce 流程。
@@ -260,6 +269,21 @@ Source reliability 运维脚本：
 .venv/bin/python scripts/attachment_archive.py backfill
 .venv/bin/python scripts/attachment_archive.py backfill --apply
 
+# Direct selected-chat Google Drive files：auth、enable、选群、backfill、upload 各自独立。
+.venv/bin/python scripts/google_drive_file_sync.py auth --client-secrets "<installed-desktop-client.json>"
+.venv/bin/python scripts/google_drive_file_sync.py auth-status
+.venv/bin/python scripts/google_drive_file_sync.py status
+.venv/bin/python scripts/google_drive_file_sync.py enable
+.venv/bin/python scripts/google_drive_file_sync.py disable
+.venv/bin/python scripts/google_drive_file_sync.py pause
+.venv/bin/python scripts/google_drive_file_sync.py resume
+.venv/bin/python scripts/google_drive_file_sync.py scan
+.venv/bin/python scripts/google_drive_file_sync.py run
+.venv/bin/python scripts/google_drive_file_sync.py reconcile
+.venv/bin/python scripts/google_drive_file_sync.py backfill --from YYYY-MM-DD
+.venv/bin/python scripts/google_drive_file_sync.py backfill --from YYYY-MM-DD --apply
+.venv/bin/python scripts/google_drive_file_sync.py disconnect
+
 # 可选 filesystem backup target，也可以指向某个同步目录。
 .venv/bin/python scripts/attachment_backup.py set-target "<filesystem-target>"
 .venv/bin/python scripts/attachment_backup.py plan
@@ -270,9 +294,10 @@ Source reliability 运维脚本：
 ```
 
 `install-agent` 只写入 one-shot `StartInterval` plist，不会加载；`--load-now` 才是单独的 activation。
-`attachment_archive.py backfill` 默认是 dry plan，只有显式 `--apply` 才登记历史 mention。
-Backup `verify` 只验证 configured target 上看得到的 bytes，绝不宣称 provider-side upload 已完成。
-完整状态、resolver 规则、存储结构和失败边界见
+`attachment_archive.py backfill` 和 `google_drive_file_sync.py backfill` 默认都是 dry plan，只有显式
+`--apply` 才登记历史 item。Drive `enable` 不会顺手 auth、选群、backfill 或 upload。Backup `verify`
+只验证 configured filesystem target 上看得到的 bytes，绝不宣称 provider-side upload 已完成。Drive
+folder/OAuth contract、完整状态、resolver 规则、存储结构和失败边界见
 [来源可靠性指南](docs/source-reliability.zh-CN.md)。
 
 菜单栏的 `关注推送 -> 后台通知：开/关` 是自动 banner 总开关。关闭后，
@@ -505,9 +530,13 @@ core/
   daily_digest.py        # 每日摘要
   review_queue.py        # 本地待审阅队列
   notification_target.py # 通知点击打开本地文件
+  google_drive_auth.py    # Installed-app OAuth + Keychain refresh token
+  google_drive_client.py  # Google Drive v3 REST wrapper
+  google_drive_file_sync.py # selected-chat queue、CAS 与 Drive projection
   sender.py              # 微信 UI 发送消息，可选且默认关闭
 scripts/
   configure_monitor.py   # CLI 配置关注推送
+  google_drive_file_sync.py # Google Drive 文件同步的显式 one-shot actions
   health_check.py        # privacy-safe 健康检查
   refresh_data_source.py # CLI 刷新数据库 key
   backfill_history.py    # 历史回填到 Obsidian
@@ -525,7 +554,7 @@ test_*.py                # unittest 测试
 
 ```bash
 .venv/bin/python -m unittest discover -p 'test_*.py'
-.venv/bin/python -m py_compile app.py mcp_server.py core/launch_agent.py core/monitor.py core/knowledge.py core/config.py core/wechat_db.py core/daily_digest.py core/link_preview.py core/notification_target.py core/notification_identity.py core/review_queue.py core/mcp_send_confirmation.py core/mcp_send_policy.py scripts/health_check.py scripts/refresh_data_source.py scripts/daily_digest.py scripts/review_queue.py scripts/organize_obsidian.py scripts/autostart.py
+.venv/bin/python -m py_compile app.py mcp_server.py core/launch_agent.py core/monitor.py core/knowledge.py core/config.py core/wechat_db.py core/daily_digest.py core/link_preview.py core/notification_target.py core/notification_identity.py core/review_queue.py core/mcp_send_confirmation.py core/mcp_send_policy.py core/google_drive_auth.py core/google_drive_client.py core/google_drive_file_sync.py scripts/google_drive_file_sync.py scripts/health_check.py scripts/refresh_data_source.py scripts/daily_digest.py scripts/review_queue.py scripts/organize_obsidian.py scripts/autostart.py
 bash -n 启动.command
 bash -n 刷新数据源.command
 ```

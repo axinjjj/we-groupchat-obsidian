@@ -1,0 +1,646 @@
+import hashlib
+import json
+import os
+import sqlite3
+import tempfile
+import unittest
+
+from core.google_drive_auth import GoogleDriveAuthRequired
+from core.google_drive_client import (
+    FOLDER_MIME,
+    SHORTCUT_MIME,
+    GoogleDriveError,
+    GoogleDriveRetryableError,
+)
+from core.google_drive_file_sync import GoogleDriveFileSync, _month
+
+
+ARCHIVE_ID = "11111111-2222-4333-8444-555555555555"
+
+
+def file_message(identity, timestamp, name, data=None, *, declared_hash="", kind="file"):
+    resource = {
+        "kind": kind,
+        "resource_index": 0,
+        "original_name": name,
+    }
+    if data is not None:
+        resource["declared_size"] = len(data)
+    if declared_hash:
+        resource["declared_hash"] = declared_hash
+    return {
+        "source_message_id": identity,
+        "timestamp": timestamp,
+        "resources": [resource],
+        "text": "private body must not persist",
+    }
+
+
+class FakeSource:
+    def __init__(self, messages_by_chat):
+        self.messages_by_chat = messages_by_chat
+        self.calls = []
+
+    def get_messages(
+        self,
+        username,
+        *,
+        since_ts=0,
+        limit=500,
+        page_forward=False,
+        since_inclusive=False,
+    ):
+        self.calls.append((username, since_ts, limit, page_forward, since_inclusive))
+        comparison = (
+            lambda message: message["timestamp"] >= since_ts
+            if since_inclusive
+            else message["timestamp"] > since_ts
+        )
+        rows = [dict(message) for message in self.messages_by_chat.get(username, []) if comparison(message)]
+        rows.sort(key=lambda message: (message["timestamp"], message["source_message_id"]))
+        return rows[:limit] if page_forward else rows[-limit:]
+
+
+class FakeDrive:
+    def __init__(self):
+        self.items = {}
+        self.next_id = 1
+        self.upload_calls = 0
+        self.shortcut_calls = 0
+        self.fail_mode = ""
+        self.bad_checksum = False
+
+    def _id(self):
+        value = f"drive-{self.next_id:04d}"
+        self.next_id += 1
+        return value
+
+    def _maybe_fail(self):
+        if self.fail_mode == "auth":
+            raise GoogleDriveAuthRequired("invalid_grant")
+        if self.fail_mode == "retry":
+            raise GoogleDriveRetryableError("drive_http_429", status_code=429, retry_after=17)
+
+    def get_file(self, file_id):
+        self._maybe_fail()
+        if file_id not in self.items:
+            raise GoogleDriveError("drive_http_404", status_code=404)
+        return dict(self.items[file_id])
+
+    def find_by_properties(self, properties, *, parent_id="", mime_type=""):
+        self._maybe_fail()
+        rows = []
+        for item in self.items.values():
+            if item.get("trashed"):
+                continue
+            if mime_type and item.get("mimeType") != mime_type:
+                continue
+            if parent_id and parent_id not in item.get("parents", []):
+                continue
+            actual = item.get("appProperties") or {}
+            if all(actual.get(key) == value for key, value in properties.items()):
+                rows.append(dict(item))
+        return rows
+
+    def list_children(self, parent_id):
+        self._maybe_fail()
+        return [
+            dict(item)
+            for item in self.items.values()
+            if not item.get("trashed") and parent_id in item.get("parents", [])
+        ]
+
+    def create_folder(self, name, parent_id, app_properties):
+        self._maybe_fail()
+        file_id = self._id()
+        item = {
+            "id": file_id,
+            "name": name,
+            "mimeType": FOLDER_MIME,
+            "parents": [parent_id] if parent_id else [],
+            "appProperties": dict(app_properties),
+            "trashed": False,
+            "webViewLink": f"https://drive.invalid/{file_id}",
+        }
+        self.items[file_id] = item
+        return dict(item)
+
+    def upload_file(self, path, name, parent_id, app_properties, *, mime_type=""):
+        self._maybe_fail()
+        self.upload_calls += 1
+        with open(path, "rb") as handle:
+            data = handle.read()
+        file_id = self._id()
+        sha256 = hashlib.sha256(data).hexdigest()
+        item = {
+            "id": file_id,
+            "name": name,
+            "size": str(len(data)),
+            "sha256Checksum": "0" * 64 if self.bad_checksum else sha256,
+            "md5Checksum": hashlib.md5(data).hexdigest(),
+            "mimeType": mime_type,
+            "parents": [parent_id],
+            "appProperties": dict(app_properties),
+            "trashed": False,
+            "webViewLink": f"https://drive.invalid/{file_id}",
+        }
+        self.items[file_id] = item
+        return dict(item)
+
+    def create_shortcut(self, name, target_id, parent_id, app_properties):
+        self._maybe_fail()
+        self.shortcut_calls += 1
+        file_id = self._id()
+        item = {
+            "id": file_id,
+            "name": name,
+            "mimeType": SHORTCUT_MIME,
+            "parents": [parent_id],
+            "shortcutDetails": {"targetId": target_id},
+            "appProperties": dict(app_properties),
+            "trashed": False,
+            "webViewLink": f"https://drive.invalid/{file_id}",
+        }
+        self.items[file_id] = item
+        return dict(item)
+
+
+class FakeOAuth:
+    def __init__(self, connected=True):
+        self.connected = connected
+
+    def status(self):
+        return {"state": "connected" if self.connected else "auth_required", "connected": self.connected}
+
+
+class GoogleDriveFileSyncTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_dir = os.path.join(self.tmp.name, "xwechat_files", "wxid_fixture", "db_storage")
+        os.makedirs(self.db_dir)
+        self.archive_root = os.path.join(self.tmp.name, "archive")
+        self.ledger = os.path.join(self.tmp.name, "drive-sync.db")
+        self.timestamp = 1_780_000_000
+        self.chat_a = "alpha-room@chatroom"
+        self.chat_b = "beta-room@chatroom"
+        self.config = {
+            "db_dir": self.db_dir,
+            "monitor_knowledge_db": os.path.join(self.tmp.name, "knowledge.db"),
+            "attachment_archive_root": self.archive_root,
+            "attachment_archive_max_object_bytes": 1024 * 1024,
+            "attachment_archive_min_free_bytes": 0,
+            "google_drive_file_sync_db": self.ledger,
+            "google_drive_file_sync_enabled": True,
+            "google_drive_file_sync_paused": False,
+            "google_drive_file_sync_selected_chats": [
+                {"username": self.chat_a, "alias": "Alpha group"},
+            ],
+            "google_drive_file_sync_max_messages_per_scan": 2,
+            "google_drive_file_sync_max_uploads_per_run": 20,
+            "google_drive_file_sync_max_bytes_per_run": 1024 * 1024,
+            "google_drive_file_sync_root_name": "微信群文件归档",
+            "google_drive_file_sync_retry_base_seconds": 10,
+            "google_drive_file_sync_retry_max_seconds": 40,
+        }
+        self.drive = FakeDrive()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    @property
+    def file_root(self):
+        return os.path.join(os.path.dirname(self.db_dir), "msg", "file")
+
+    def cache(self, name, data, timestamp=None):
+        directory = os.path.join(self.file_root, _month(timestamp or self.timestamp))
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, name)
+        with open(path, "wb") as handle:
+            handle.write(data)
+        return path
+
+    def service(self, source, **kwargs):
+        return GoogleDriveFileSync(
+            self.config,
+            source=source,
+            drive_client=self.drive,
+            oauth=FakeOAuth(),
+            now_func=lambda: self.timestamp + 100,
+            random_func=lambda: 0.5,
+            archive_id_factory=lambda: ARCHIVE_ID,
+            **kwargs,
+        )
+
+    def rows(self, table):
+        conn = sqlite3.connect(self.ledger)
+        conn.row_factory = sqlite3.Row
+        try:
+            return [dict(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY 1")]
+        finally:
+            conn.close()
+
+    def initialize(self, service, timestamp=None):
+        service.initialize_selected_chat_cursors(
+            self.timestamp - 1 if timestamp is None else timestamp
+        )
+
+    def test_scans_only_selected_chat_without_knowledge_gate_and_cursor_survives_restart(self):
+        data = b"selected bytes"
+        source = FakeSource({
+            self.chat_a: [
+                file_message("wgmsg_a1", self.timestamp, "one.txt", data),
+                file_message("wgmsg_a2", self.timestamp, "two.txt", data),
+                file_message("wgmsg_a3", self.timestamp, "three.txt", data),
+            ],
+            self.chat_b: [file_message("wgmsg_b1", self.timestamp, "private.txt", data)],
+        })
+        service = self.service(source)
+        self.initialize(service)
+
+        first = service.scan()
+        restarted = self.service(source)
+        second = restarted.scan()
+
+        self.assertEqual(first["queued"], 2)
+        self.assertEqual(second["queued"], 1)
+        items = self.rows("drive_sync_items")
+        self.assertEqual({row["source_message_id"] for row in items}, {"wgmsg_a1", "wgmsg_a2", "wgmsg_a3"})
+        self.assertTrue(all(row["chat_username"] == self.chat_a for row in items))
+        self.assertFalse(os.path.exists(self.config["monitor_knowledge_db"]))
+        self.assertNotIn(self.chat_b, {call[0] for call in source.calls})
+
+    def test_default_cursor_skips_history_and_explicit_backfill_is_dry_then_apply(self):
+        data = b"history"
+        source = FakeSource({
+            self.chat_a: [file_message("wgmsg_history", self.timestamp - 100, "old.txt", data)]
+        })
+        service = self.service(source)
+
+        initialized = service.scan()
+        plan = service.backfill(self.timestamp - 200, apply=False)
+        self.assertEqual(self.rows("drive_sync_items"), [])
+        applied = service.backfill(self.timestamp - 200, apply=True)
+
+        self.assertEqual(initialized["initialized_chats"], 1)
+        self.assertEqual(plan["discovered_files"], 1)
+        self.assertEqual(plan["inserted"], 0)
+        self.assertEqual(applied["inserted"], 1)
+
+    def test_same_hash_deduplicates_object_and_placement_but_projects_across_months(self):
+        data = b"same global object"
+        later = self.timestamp + 40 * 86400
+        source = FakeSource({
+            self.chat_a: [
+                file_message("wgmsg_same1", self.timestamp, "same-a.txt", data),
+                file_message("wgmsg_same2", self.timestamp, "same-b.txt", data),
+                file_message("wgmsg_same3", later, "same-c.txt", data),
+            ]
+        })
+        for name, ts in (("same-a.txt", self.timestamp), ("same-b.txt", self.timestamp), ("same-c.txt", later)):
+            self.cache(name, data, ts)
+        service = self.service(source)
+        self.config["google_drive_file_sync_max_messages_per_scan"] = 10
+        service.config["google_drive_file_sync_max_messages_per_scan"] = 10
+        self.initialize(service)
+
+        result = service.run()
+
+        self.assertEqual(result["uploaded"], 1)
+        self.assertEqual(self.drive.upload_calls, 1)
+        self.assertEqual(self.drive.shortcut_calls, 2)
+        self.assertEqual(len(self.rows("drive_objects")), 1)
+        self.assertEqual(len(self.rows("drive_placements")), 2)
+        self.assertTrue(all(row["status"] == "complete" for row in self.rows("drive_sync_items")))
+
+    def test_same_hash_in_two_chats_uses_one_object_and_two_shortcuts(self):
+        data = b"cross chat"
+        self.config["google_drive_file_sync_selected_chats"].append(
+            {"username": self.chat_b, "alias": "Beta group"}
+        )
+        source = FakeSource({
+            self.chat_a: [file_message("wgmsg_cross_a", self.timestamp, "cross.txt", data)],
+            self.chat_b: [file_message("wgmsg_cross_b", self.timestamp, "cross.txt", data)],
+        })
+        self.cache("cross.txt", data)
+        service = self.service(source)
+        self.initialize(service)
+
+        service.run()
+
+        self.assertEqual(self.drive.upload_calls, 1)
+        self.assertEqual(self.drive.shortcut_calls, 2)
+        self.assertEqual(len(self.rows("drive_placements")), 2)
+
+    def test_same_name_different_hash_gets_hash_suffix_without_overwrite(self):
+        first = b"first version"
+        second = b"second version"
+        first_hash = hashlib.sha256(first).hexdigest()
+        second_hash = hashlib.sha256(second).hexdigest()
+        source = FakeSource({
+            self.chat_a: [
+                file_message("wgmsg_name1", self.timestamp, "report.pdf", first, declared_hash=first_hash),
+                file_message("wgmsg_name2", self.timestamp, "report.pdf", second, declared_hash=second_hash),
+            ]
+        })
+        self.cache("report.pdf", first)
+        self.cache("report (1).pdf", second)
+        service = self.service(source)
+        self.initialize(service)
+
+        service.run()
+
+        names = {row["display_name"] for row in self.rows("drive_placements")}
+        self.assertIn("report.pdf", names)
+        self.assertIn(f"report--{second_hash[:8]}.pdf", names)
+        self.assertEqual(self.drive.upload_calls, 2)
+
+    def test_missing_cache_retries_without_blocking_and_ambiguous_never_uploads(self):
+        ready = b"ready"
+        source = FakeSource({
+            self.chat_a: [
+                file_message("wgmsg_missing", self.timestamp, "missing.txt"),
+                file_message("wgmsg_ready", self.timestamp + 1, "ready.txt", ready),
+                file_message("wgmsg_ambiguous", self.timestamp + 2, "ambiguous.txt"),
+            ]
+        })
+        self.cache("ready.txt", ready, self.timestamp + 1)
+        self.cache("ambiguous.txt", b"A", self.timestamp + 2)
+        self.cache("ambiguous (1).txt", b"B", self.timestamp + 2)
+        self.config["google_drive_file_sync_max_messages_per_scan"] = 10
+        service = self.service(source)
+        service.config["google_drive_file_sync_max_messages_per_scan"] = 10
+        self.initialize(service)
+
+        service.run()
+
+        states = {row["original_name"]: row["status"] for row in self.rows("drive_sync_items")}
+        self.assertEqual(states["missing.txt"], "waiting_cache")
+        self.assertEqual(states["ambiguous.txt"], "ambiguous")
+        self.assertEqual(states["ready.txt"], "complete")
+        self.assertEqual(self.drive.upload_calls, 1)
+
+    def test_disabled_and_paused_never_write_remote_and_resume_continues_queue(self):
+        data = b"resume"
+        source = FakeSource({self.chat_a: [file_message("wgmsg_resume", self.timestamp, "resume.txt", data)]})
+        self.cache("resume.txt", data)
+        service = self.service(source)
+        self.initialize(service)
+        service.scan()
+
+        service.config["google_drive_file_sync_enabled"] = False
+        disabled = service.run()
+        service.config["google_drive_file_sync_enabled"] = True
+        service.config["google_drive_file_sync_paused"] = True
+        paused = service.run()
+        service.config["google_drive_file_sync_paused"] = False
+        service.control_state_func = lambda: service.config
+        resumed = service.run()
+
+        self.assertEqual(disabled["state"], "disabled")
+        self.assertEqual(paused["state"], "paused")
+        self.assertEqual(self.drive.upload_calls, 1)
+        self.assertEqual(resumed["completed"], 1)
+
+    def test_images_are_ignored_but_do_not_hold_the_scan_cursor(self):
+        source = FakeSource({
+            self.chat_a: [
+                file_message(
+                    "wgmsg_image",
+                    self.timestamp,
+                    "image.png",
+                    b"image bytes",
+                    kind="image",
+                )
+            ]
+        })
+        service = self.service(source)
+        self.initialize(service)
+
+        first = service.scan()
+        second = service.scan()
+
+        self.assertEqual(first["scanned"], 1)
+        self.assertEqual(first["queued"], 0)
+        self.assertEqual(second["scanned"], 0)
+        self.assertEqual(self.rows("drive_sync_items"), [])
+
+    def test_per_run_budget_stops_before_a_second_object_upload(self):
+        source = FakeSource({
+            self.chat_a: [
+                file_message("wgmsg_budget_a", self.timestamp, "a.txt", b"a"),
+                file_message("wgmsg_budget_b", self.timestamp + 1, "b.txt", b"b"),
+            ]
+        })
+        self.cache("a.txt", b"a")
+        self.cache("b.txt", b"b", self.timestamp + 1)
+        self.config["google_drive_file_sync_max_uploads_per_run"] = 1
+        service = self.service(source)
+        self.initialize(service)
+
+        result = service.run()
+
+        self.assertEqual(result["state"], "budget_exhausted")
+        self.assertEqual(self.drive.upload_calls, 1)
+        self.assertEqual(
+            [row["status"] for row in self.rows("drive_sync_items")],
+            ["complete", "upload_pending"],
+        )
+
+    def test_disable_during_an_item_finishes_it_then_stops_before_the_next(self):
+        source = FakeSource({
+            self.chat_a: [
+                file_message("wgmsg_stop_a", self.timestamp, "stop-a.txt", b"a"),
+                file_message("wgmsg_stop_b", self.timestamp + 1, "stop-b.txt", b"b"),
+            ]
+        })
+        self.cache("stop-a.txt", b"a")
+        self.cache("stop-b.txt", b"b", self.timestamp + 1)
+        service = self.service(source)
+        self.initialize(service)
+
+        def disable_after_shortcut(_remote, _item):
+            service.config["google_drive_file_sync_enabled"] = False
+
+        service.after_remote_shortcut = disable_after_shortcut
+        result = service.run()
+
+        self.assertEqual(result["state"], "stopped_after_current_item")
+        self.assertEqual(self.drive.upload_calls, 1)
+        self.assertEqual(self.drive.shortcut_calls, 1)
+        self.assertEqual(
+            [row["status"] for row in self.rows("drive_sync_items")],
+            ["complete", "upload_pending"],
+        )
+
+    def test_reconcile_rebuilds_a_deleted_shortcut_without_uploading_bytes_again(self):
+        data = b"reconcile shortcut"
+        source = FakeSource({
+            self.chat_a: [file_message("wgmsg_reconcile", self.timestamp, "reconcile.txt", data)]
+        })
+        self.cache("reconcile.txt", data)
+        service = self.service(source)
+        self.initialize(service)
+        service.run()
+        shortcut_id = next(
+            item_id
+            for item_id, item in self.drive.items.items()
+            if item.get("appProperties", {}).get("wgo_role") == "placement"
+        )
+        del self.drive.items[shortcut_id]
+
+        result = service.reconcile()
+
+        self.assertEqual(result["completed"], 1)
+        self.assertEqual(self.drive.upload_calls, 1)
+        self.assertEqual(self.drive.shortcut_calls, 2)
+
+    def test_deselected_chat_keeps_its_queue_but_stops_resolve_and_remote_work(self):
+        data = b"scope retained"
+        source = FakeSource({
+            self.chat_a: [file_message("wgmsg_deselected", self.timestamp, "scope.txt", data)]
+        })
+        self.cache("scope.txt", data)
+        service = self.service(source)
+        self.initialize(service)
+        service.scan()
+        service.config["google_drive_file_sync_selected_chats"] = []
+
+        stopped = service.run(scan_first=False)
+
+        self.assertEqual(stopped["completed"], 0)
+        self.assertEqual(self.drive.upload_calls, 0)
+        self.assertEqual(self.rows("drive_sync_items")[0]["status"], "queued")
+
+        service.config["google_drive_file_sync_selected_chats"] = [
+            {"username": self.chat_a, "alias": "Alpha group"}
+        ]
+        resumed = service.run(scan_first=False)
+        self.assertEqual(resumed["completed"], 1)
+
+    def test_status_inspection_does_not_create_a_disabled_ledger(self):
+        missing = os.path.join(self.tmp.name, "never-created.db")
+        config = dict(self.config)
+        config["google_drive_file_sync_db"] = missing
+        config["google_drive_file_sync_enabled"] = False
+
+        status = GoogleDriveFileSync.inspect_status(
+            config,
+            oauth=FakeOAuth(connected=False),
+        )
+
+        self.assertEqual(status["state"], "disabled")
+        self.assertEqual(status["auth"], "auth_required")
+        self.assertFalse(os.path.exists(missing))
+
+    def test_object_and_shortcut_crash_recovery_adopt_remote_ids(self):
+        data = b"crash recovery"
+        source = FakeSource({self.chat_a: [file_message("wgmsg_crash", self.timestamp, "crash.txt", data)]})
+        self.cache("crash.txt", data)
+        crash = [True]
+
+        def crash_after_object(_remote, _item):
+            if crash[0]:
+                crash[0] = False
+                raise RuntimeError("simulated object commit crash")
+
+        first = self.service(source, after_remote_object=crash_after_object)
+        self.initialize(first)
+        with self.assertRaisesRegex(RuntimeError, "object commit crash"):
+            first.run()
+        self.assertEqual(self.drive.upload_calls, 1)
+
+        shortcut_crash = [True]
+
+        def crash_after_shortcut(_remote, _item):
+            if shortcut_crash[0]:
+                shortcut_crash[0] = False
+                raise RuntimeError("simulated shortcut commit crash")
+
+        second = self.service(source, after_remote_shortcut=crash_after_shortcut)
+        with self.assertRaisesRegex(RuntimeError, "shortcut commit crash"):
+            second.run(scan_first=False)
+        self.assertEqual(self.drive.upload_calls, 1)
+        self.assertEqual(self.drive.shortcut_calls, 1)
+
+        recovered = self.service(source).run(scan_first=False)
+        self.assertEqual(recovered["completed"], 1)
+        self.assertEqual(self.drive.upload_calls, 1)
+        self.assertEqual(self.drive.shortcut_calls, 1)
+
+    def test_checksum_auth_retry_and_root_degraded_states_are_fail_closed(self):
+        data = b"verification"
+        source = FakeSource({self.chat_a: [file_message("wgmsg_verify", self.timestamp, "verify.bin", data)]})
+        self.cache("verify.bin", data)
+        service = self.service(source)
+        self.initialize(service)
+        self.drive.bad_checksum = True
+
+        mismatch = service.run()
+
+        self.assertEqual(mismatch["state"], "remote_degraded")
+        self.assertNotEqual(self.rows("drive_objects")[0]["verification_state"], "uploaded_verified")
+
+        self.drive = FakeDrive()
+        self.ledger = os.path.join(self.tmp.name, "auth-sync.db")
+        self.config["google_drive_file_sync_db"] = self.ledger
+        service = self.service(source)
+        self.initialize(service)
+        service.scan()
+        self.drive.fail_mode = "auth"
+        auth = service.run(scan_first=False)
+        self.assertEqual(auth["state"], "auth_required")
+        self.assertEqual(self.rows("drive_sync_items")[0]["status"], "auth_required")
+
+        self.drive.fail_mode = "retry"
+        conn = sqlite3.connect(self.ledger)
+        conn.execute("UPDATE drive_sync_items SET status='upload_pending'")
+        conn.commit()
+        conn.close()
+        retry = service.run(scan_first=False)
+        self.assertEqual(retry["state"], "retry_wait")
+        self.assertGreaterEqual(self.rows("drive_sync_items")[0]["next_retry_at"], self.timestamp + 117)
+
+    def test_root_id_survives_rename_move_and_trashed_root_does_not_recreate(self):
+        data = b"root identity"
+        source = FakeSource({self.chat_a: [file_message("wgmsg_root", self.timestamp, "root.txt", data)]})
+        self.cache("root.txt", data)
+        service = self.service(source)
+        self.initialize(service)
+        service.run()
+        root_row = next(row for row in self.rows("drive_folders") if row["role"] == "root")
+        root_id = root_row["drive_file_id"]
+        created_before = self.drive.next_id
+        self.drive.items[root_id]["name"] = "User renamed root"
+        self.drive.items[root_id]["parents"] = ["user-moved-parent"]
+
+        renamed = service.reconcile()
+
+        self.assertNotEqual(renamed["state"], "remote_degraded")
+        self.assertEqual(self.drive.next_id, created_before)
+        self.drive.items[root_id]["trashed"] = True
+        trashed = service.reconcile()
+        self.assertEqual(trashed["state"], "remote_degraded")
+        self.assertEqual(self.drive.next_id, created_before)
+
+    def test_remote_metadata_receipts_and_public_contract_exclude_private_source_identity(self):
+        data = b"privacy"
+        source = FakeSource({self.chat_a: [file_message("wgmsg_private_source", self.timestamp, "公开文件名.txt", data)]})
+        self.cache("公开文件名.txt", data)
+        service = self.service(source)
+        self.initialize(service)
+        service.run()
+
+        remote_text = json.dumps(self.drive.items, ensure_ascii=False)
+        self.assertNotIn("@chatroom", remote_text)
+        self.assertNotIn("wxid", remote_text.lower())
+        self.assertNotIn("wgmsg_private_source", remote_text)
+        self.assertNotIn(self.file_root, remote_text)
+        receipt_text = json.dumps(self.rows("drive_sync_runs"), ensure_ascii=False)
+        self.assertNotIn("@chatroom", receipt_text)
+        self.assertNotIn("wgmsg", receipt_text)
+        roles = {item.get("appProperties", {}).get("wgo_role") for item in self.drive.items.values()}
+        self.assertTrue({"root", "chats_root", "system_root", "objects_root", "shard", "chat", "month", "object", "placement"}.issubset(roles))
+
+
+if __name__ == "__main__":
+    unittest.main()

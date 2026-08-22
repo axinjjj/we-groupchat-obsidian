@@ -78,6 +78,18 @@ DEFAULT_CONFIG = {
     "attachment_archive_retry_base_seconds": 300,
     "attachment_archive_retry_max_seconds": 6 * 60 * 60,
     "attachment_backup_target": "",
+    "google_drive_file_sync_enabled": False,
+    "google_drive_file_sync_paused": False,
+    "google_drive_file_sync_selected_chats": [],
+    "google_drive_file_sync_interval_seconds": 300,
+    "google_drive_file_sync_max_messages_per_scan": 500,
+    "google_drive_file_sync_max_uploads_per_run": 20,
+    "google_drive_file_sync_max_bytes_per_run": 512 * 1024 * 1024,
+    "google_drive_file_sync_root_name": "微信群文件归档",
+    "google_drive_file_sync_keep_local_objects": True,
+    "google_drive_file_sync_db": os.path.join(DATA_DIR, "google_drive_file_sync.db"),
+    "google_drive_file_sync_retry_base_seconds": 300,
+    "google_drive_file_sync_retry_max_seconds": 6 * 60 * 60,
     "mcp_enable_send_message": False,
     "mcp_send_mode": "disabled",
     "mcp_send_allowlist": [],
@@ -179,6 +191,33 @@ def _sanitize_monitor_chat_list(value):
     return clean_chats
 
 
+def _sanitize_drive_chat_list(value):
+    clean_chats = []
+    seen = set()
+    if not isinstance(value, list):
+        return clean_chats
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        username = item.get("username")
+        alias = item.get("alias")
+        if not isinstance(username, str) or not username.strip().endswith("@chatroom"):
+            continue
+        username = username.strip()
+        if username in seen:
+            continue
+        seen.add(username)
+        alias = alias.strip() if isinstance(alias, str) else ""
+        clean_chats.append({"username": username, "alias": alias})
+    return clean_chats
+
+
+def selected_drive_sync_chats(config: dict) -> list[dict]:
+    """Return private selected-chat identities and stable user-facing aliases."""
+    config = config if isinstance(config, dict) else {}
+    return _sanitize_drive_chat_list(config.get("google_drive_file_sync_selected_chats"))
+
+
 def active_monitor_chats(config: dict) -> list[dict]:
     """Return sanitized active chats, preserving the supported v1 singleton form."""
     config = config if isinstance(config, dict) else {}
@@ -204,6 +243,7 @@ def _sanitize_config(saved):
         "monitor_knowledge_db", "monitor_obsidian_root", "monitor_obsidian_subdir",
         "daily_digest_time", "daily_digest_timezone", "daily_digest_dir",
         "wechat_source_guard_pause_until",
+        "google_drive_file_sync_root_name", "google_drive_file_sync_db",
         "image_aes_key",
     ):
         value = saved.get(key)
@@ -213,6 +253,12 @@ def _sanitize_config(saved):
     monitor_chats = saved.get("monitor_chats")
     if isinstance(monitor_chats, list):
         cfg["monitor_chats"] = _sanitize_monitor_chat_list(monitor_chats)
+
+    selected_drive_chats = saved.get("google_drive_file_sync_selected_chats")
+    if isinstance(selected_drive_chats, list):
+        cfg["google_drive_file_sync_selected_chats"] = _sanitize_drive_chat_list(
+            selected_drive_chats
+        )
 
     cfg["monitor_chat_aliases"] = _sanitize_chat_map(saved.get("monitor_chat_aliases"))
     cfg["monitor_chat_taxonomy_profiles"] = _sanitize_chat_map(
@@ -226,6 +272,8 @@ def _sanitize_config(saved):
         "monitor_notify_writes", "monitor_notify_checkins",
         "daily_digest_enabled", "daily_digest_notify",
         "wechat_source_guard_enabled", "attachment_archive_enabled",
+        "google_drive_file_sync_enabled", "google_drive_file_sync_paused",
+        "google_drive_file_sync_keep_local_objects",
         "mcp_enable_send_message",
     ):
         value = saved.get(key)
@@ -270,6 +318,12 @@ def _sanitize_config(saved):
         "attachment_archive_min_free_bytes": (0, 1024 * 1024 * 1024 * 1024),
         "attachment_archive_retry_base_seconds": (1, 86400),
         "attachment_archive_retry_max_seconds": (1, 604800),
+        "google_drive_file_sync_interval_seconds": (60, 86400),
+        "google_drive_file_sync_max_messages_per_scan": (1, 5000),
+        "google_drive_file_sync_max_uploads_per_run": (1, 1000),
+        "google_drive_file_sync_max_bytes_per_run": (1024 * 1024, 100 * 1024 * 1024 * 1024),
+        "google_drive_file_sync_retry_base_seconds": (1, 86400),
+        "google_drive_file_sync_retry_max_seconds": (1, 604800),
     }
     for key, (min_value, max_value) in int_ranges.items():
         value = saved.get(key)
@@ -324,6 +378,17 @@ def _sanitize_config(saved):
     attachment_backup_target = normalize_path_value(saved.get("attachment_backup_target", ""))
     if attachment_backup_target:
         cfg["attachment_backup_target"] = attachment_backup_target
+
+    drive_sync_db = _rebase_legacy_data_path(saved.get("google_drive_file_sync_db", ""))
+    if drive_sync_db:
+        cfg["google_drive_file_sync_db"] = drive_sync_db
+
+    root_name = str(saved.get("google_drive_file_sync_root_name") or "").strip()
+    if root_name and len(root_name) <= 120 and not any(ord(char) < 32 for char in root_name):
+        cfg["google_drive_file_sync_root_name"] = root_name
+
+    # This release never deletes shared CAS objects. Keep the persisted policy honest.
+    cfg["google_drive_file_sync_keep_local_objects"] = True
 
     return cfg
 

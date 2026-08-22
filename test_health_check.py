@@ -90,6 +90,22 @@ class HealthCheckTests(unittest.TestCase):
                     {"status": lambda self: {"state": "target_not_configured", "complete_snapshots": 0}},
                 )(),
             ),
+            patch(
+                "scripts.health_check.GoogleDriveFileSync.inspect_status",
+                return_value={
+                    "state": "disabled",
+                    "auth": "auth_required",
+                    "selected_chat_count": 0,
+                    "queue_counts": {"waiting_cache": 2},
+                    "last_scan_at": 123,
+                    "last_verified_upload_at": 0,
+                    "next_retry_at": 456,
+                    "root_state": "unknown",
+                    "uploaded_unique_objects": 1,
+                    "shortcut_placements": 3,
+                    "last_error_code": "",
+                },
+            ),
         ):
             output = StringIO()
             with redirect_stdout(output):
@@ -105,6 +121,12 @@ class HealthCheckTests(unittest.TestCase):
         self.assertIn("WeChat source guard: disabled / disabled", text)
         self.assertIn("Attachment archive: enabled / healthy; objects=1; pending=2", text)
         self.assertIn("Attachment backup target: not configured (optional)", text)
+        self.assertIn(
+            "Google Drive selected-chat files: disabled / active; "
+            "auth=auth_required; selected=0; queue=waiting_cache=2;",
+            text,
+        )
+        self.assertIn("root=unknown; objects=1; shortcuts=3; last_error=-", text)
 
     def test_relation_integrity_status_is_counts_only(self):
         report = {

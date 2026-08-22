@@ -112,6 +112,11 @@ Its most important boundaries are:
   content-addressed archive. An optional backup copies immutable objects to an
   ordinary filesystem target; verification proves the target bytes only, not a
   sync provider's cloud-upload state.
+- Direct Google Drive file sync is a separate, public-default-off path. It scans
+  only user-selected chats, queues file messages independently of Knowledge
+  hits, reuses the local CAS, uploads each unique digest once, and creates
+  human-readable chat/month shortcuts. Google Drive file IDs, not visible
+  names or paths, own remote identity.
 - Remote AI calls and opt-in public URL previews cross the Mac-local boundary.
   Ollama can keep AI interpretation local, while public URL context remains off
   by default and is treated as untrusted input.
@@ -138,6 +143,7 @@ independently deployed microservices. Editable sources:
 - Opt-in attachment cataloging plus a private local content-addressed archive that deduplicates identical bytes; file and image kinds are selected explicitly.
 - Optional, separately installed WeChat source guard with grace, pause, restart budget, exponential backoff, content-free receipts, and no `KeepAlive` loop.
 - Provider-neutral filesystem snapshots for the attachment archive, including plan, run, verify, and read-only restore planning.
+- Opt-in selected-chat file sync directly to a user-authorized Google Drive, with a durable queue, global byte deduplication, chat/month shortcuts, retry/reconcile, and no automatic deletion.
 - Optional link preview context for public URLs; it is off by default and must be enabled explicitly.
 - CLI and `.command` maintenance entrypoints for users whose menu bar icon is hidden.
 - MCP server for read-only chat lookup, search, summaries, images, and optional UI-based sending.
@@ -152,8 +158,18 @@ independently deployed microservices. Editable sources:
   attachment bytes; do not commit or publish them.
 - A configured backup target is just a filesystem path. If that path sits in a
   Google Drive, Dropbox, iCloud Drive, or other sync folder, that provider may
-  receive the archived bytes and manifests under its own privacy rules. This
-  project has no provider API/OAuth integration and cannot verify remote upload.
+  receive the archived bytes and manifests under its own privacy rules. The
+  filesystem snapshot backend still has no provider API and cannot verify
+  provider-side upload.
+- Direct Google Drive sync is a different opt-in backend. It requests only the
+  `drive.file` OAuth scope. The refresh token stays in macOS Keychain; access
+  tokens stay in memory; the user's Installed desktop app OAuth client JSON is
+  copied to private runtime storage with mode `0600` and must never be
+  committed. For selected chats, the configured stable alias, file name, and
+  file bytes are sent to the user's Drive. Raw `@chatroom` usernames, message
+  bodies/XML, `source_message_id`, `wxid`, and WeChat cache paths are not Drive
+  metadata. The project does not delete Drive files, WeChat cache, or local CAS
+  objects.
 - Extracting database keys may require ad-hoc re-signing `WeChat.app`. The regular double-click flow does not silently do this; commands that perform it are explicit.
 - Cloud AI providers receive the text you ask them to summarize. Use Ollama if you want the AI step to stay local.
 - Remote link previews are disabled by default. If you set `monitor_fetch_links: true`, the app fetches public URLs found in monitored messages, and those remote sites may receive your request metadata. Link preview has a conservative SSRF guard, but it is still a best-effort public URL preview, not a hardened crawler.
@@ -277,6 +293,21 @@ Source reliability helpers:
 .venv/bin/python scripts/attachment_archive.py backfill
 .venv/bin/python scripts/attachment_archive.py backfill --apply
 
+# Direct selected-chat Google Drive files: auth, enable, selection, backfill, and upload are separate.
+.venv/bin/python scripts/google_drive_file_sync.py auth --client-secrets "<installed-desktop-client.json>"
+.venv/bin/python scripts/google_drive_file_sync.py auth-status
+.venv/bin/python scripts/google_drive_file_sync.py status
+.venv/bin/python scripts/google_drive_file_sync.py enable
+.venv/bin/python scripts/google_drive_file_sync.py disable
+.venv/bin/python scripts/google_drive_file_sync.py pause
+.venv/bin/python scripts/google_drive_file_sync.py resume
+.venv/bin/python scripts/google_drive_file_sync.py scan
+.venv/bin/python scripts/google_drive_file_sync.py run
+.venv/bin/python scripts/google_drive_file_sync.py reconcile
+.venv/bin/python scripts/google_drive_file_sync.py backfill --from YYYY-MM-DD
+.venv/bin/python scripts/google_drive_file_sync.py backfill --from YYYY-MM-DD --apply
+.venv/bin/python scripts/google_drive_file_sync.py disconnect
+
 # Optional filesystem backup target. The target may be inside a sync folder.
 .venv/bin/python scripts/attachment_backup.py set-target "<filesystem-target>"
 .venv/bin/python scripts/attachment_backup.py plan
@@ -288,10 +319,12 @@ Source reliability helpers:
 
 `install-agent` writes a one-shot `StartInterval` plist but does not load it;
 `--load-now` is the separate activation step. `attachment_archive.py backfill`
-is a dry plan unless `--apply` is present. Backup `verify` checks bytes visible
-at the configured target and deliberately makes no claim about provider-side
-upload. See the [source reliability guide](docs/source-reliability.md) for
-states, resolver rules, storage layout, and failure boundaries.
+and `google_drive_file_sync.py backfill` are dry plans unless `--apply` is
+present. Drive `enable` does not authenticate, select chats, backfill, or run an
+upload. Backup `verify` checks bytes visible at the configured filesystem target
+and deliberately makes no claim about provider-side upload. See the
+[source reliability guide](docs/source-reliability.md) for Drive folder/OAuth
+contracts, states, resolver rules, storage layout, and failure boundaries.
 
 ### Guarded exact relation Markdown cleanup
 
@@ -486,7 +519,7 @@ Real sends use a two-step confirmation flow. First call `prepare_send_message(te
 
 ```bash
 .venv/bin/python -m unittest discover -p 'test_*.py'
-.venv/bin/python -m py_compile app.py mcp_server.py core/launch_agent.py core/monitor.py core/knowledge.py core/config.py core/wechat_db.py core/daily_digest.py core/link_preview.py core/notification_target.py core/notification_identity.py core/review_queue.py core/mcp_send_confirmation.py core/mcp_send_policy.py scripts/health_check.py scripts/refresh_data_source.py scripts/daily_digest.py scripts/review_queue.py scripts/organize_obsidian.py scripts/autostart.py
+.venv/bin/python -m py_compile app.py mcp_server.py core/launch_agent.py core/monitor.py core/knowledge.py core/config.py core/wechat_db.py core/daily_digest.py core/link_preview.py core/notification_target.py core/notification_identity.py core/review_queue.py core/mcp_send_confirmation.py core/mcp_send_policy.py core/google_drive_auth.py core/google_drive_client.py core/google_drive_file_sync.py scripts/google_drive_file_sync.py scripts/health_check.py scripts/refresh_data_source.py scripts/daily_digest.py scripts/review_queue.py scripts/organize_obsidian.py scripts/autostart.py
 bash -n 启动.command
 bash -n 刷新数据源.command
 ```

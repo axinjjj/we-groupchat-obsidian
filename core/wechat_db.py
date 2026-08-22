@@ -696,7 +696,14 @@ class WeChatDB:
             resources.append(image)
         return resources
 
-    def get_messages(self, username, since_ts=0, limit=500, page_forward=False):
+    def get_messages(
+        self,
+        username,
+        since_ts=0,
+        limit=500,
+        page_forward=False,
+        since_inclusive=False,
+    ):
         """Get group/private chat messages.
 
         Args:
@@ -740,10 +747,11 @@ class WeChatDB:
                 select_sql = ", ".join(select_fields)
                 if since_ts > 0:
                     order = "ASC" if page_forward else "DESC"
+                    comparison = ">=" if since_inclusive else ">"
                     rows = conn.execute(f"""
                         SELECT {select_sql}
                         FROM [{table_name}]
-                        WHERE create_time > ?
+                        WHERE create_time {comparison} ?
                         ORDER BY create_time {order}
                         LIMIT ?
                     """, (since_ts, limit * 2)).fetchall()

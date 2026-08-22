@@ -57,6 +57,7 @@ if _HAS_APPKIT:
 
 from core.config import (
     active_monitor_chats,
+    selected_drive_sync_chats,
     load_config,
     save_config,
     merge_monitor_chat_preferences,
@@ -102,6 +103,9 @@ from core.knowledge import (
     safe_obsidian_subdir,
 )
 from core.attachment_archive import process_pending_from_config
+from core.google_drive_auth import GoogleDriveAuthError, GoogleDriveOAuth
+from core.google_drive_client import GoogleDriveClient
+from core.google_drive_file_sync import GoogleDriveFileSync
 from core.monitor import (
     HITS_DIR,
     MonitorConfigError,
@@ -283,6 +287,8 @@ class WeGroupchatObsidianApp(rumps.App):
         self._monitor_last_dispatch_ts = 0
         self._daily_digest_timer = None
         self._daily_digest_lock = threading.Lock()
+        self._drive_sync_timer = None
+        self._drive_sync_lock = threading.Lock()
 
         # Build menu
         self.menu = [
@@ -298,6 +304,7 @@ class WeGroupchatObsidianApp(rumps.App):
             rumps.separator,
             self._build_mcp_menu(),
             self._build_monitor_menu(),
+            self._build_drive_sync_menu(),
             self._build_settings_menu(),
             rumps.MenuItem("🔄 刷新数据源", callback=self.reextract_keys),
         ]
@@ -317,6 +324,7 @@ class WeGroupchatObsidianApp(rumps.App):
 
         self._configure_monitor_timer()
         self._configure_daily_digest_timer()
+        self._configure_drive_sync_timer()
 
         # Background initialization
         threading.Thread(target=self._init_background, daemon=True).start()
@@ -439,6 +447,344 @@ class WeGroupchatObsidianApp(rumps.App):
         if "🔔 关注推送" in self.menu:
             del self.menu["🔔 关注推送"]
         self.menu.insert_after("🔌 MCP 服务", self._build_monitor_menu())
+
+    # ── Selected-chat Google Drive file sync ─────────────────
+
+    def _drive_sync_service(self, *, remote=False, config=None):
+        config = dict(config or self.config)
+        oauth = GoogleDriveOAuth()
+        return GoogleDriveFileSync(
+            config,
+            source=self.db,
+            drive_client=GoogleDriveClient(oauth) if remote else None,
+            oauth=oauth,
+            notifier=lambda title, message: _notify(
+                "Google Drive 群文件备份", title, message
+            ),
+            control_state_func=load_config,
+        )
+
+    def _drive_sync_status(self):
+        try:
+            return GoogleDriveFileSync.inspect_status(
+                self.config,
+                oauth=GoogleDriveOAuth(),
+            )
+        except Exception as exc:
+            print(f"[drive-sync] local status unavailable: {type(exc).__name__}")
+            return {
+                "state": "unavailable",
+                "auth": "auth_required",
+                "selected_chat_count": len(selected_drive_sync_chats(self.config)),
+                "queue_counts": {},
+                "root_state": "unknown",
+            }
+
+    def _build_drive_sync_menu(self):
+        drive = rumps.MenuItem("☁️ Google Drive 群文件备份")
+        status = self._drive_sync_status()
+        state_labels = {
+            "disabled": "已关闭",
+            "paused": "已暂停",
+            "enabled": "已开启",
+            "unavailable": "本地状态不可用",
+        }
+        state = state_labels.get(status.get("state"), str(status.get("state") or "未知"))
+        auth = "已授权" if status.get("auth") == "connected" else "需要授权"
+        counts = status.get("queue_counts") or {}
+        pending = sum(
+            int(count or 0)
+            for item_state, count in counts.items()
+            if item_state != "complete"
+        )
+        drive.add(rumps.MenuItem(f"状态: {state} · {auth}"))
+        drive.add(rumps.MenuItem(
+            f"群聊: {int(status.get('selected_chat_count') or 0)} · 待处理: {pending}"
+        ))
+        drive.add(rumps.MenuItem(f"Root: {status.get('root_state') or 'unknown'}"))
+        drive.add(rumps.separator)
+
+        enabled = bool(self.config.get("google_drive_file_sync_enabled", False))
+        paused = bool(self.config.get("google_drive_file_sync_paused", False))
+        drive.add(rumps.MenuItem(
+            "⏹ 关闭同步" if enabled else "▶️ 开启同步",
+            callback=self._toggle_drive_sync,
+        ))
+        if enabled:
+            drive.add(rumps.MenuItem(
+                "▶️ 恢复同步" if paused else "⏸ 暂停同步",
+                callback=self._toggle_drive_sync_pause,
+            ))
+        else:
+            drive.add(rumps.MenuItem("⏸ 暂停（当前已关闭）"))
+        drive.add(rumps.MenuItem("🔄 立即同步一次", callback=self._sync_drive_now))
+        drive.add(rumps.MenuItem("🎯 选择群聊...", callback=self._select_drive_sync_chats))
+        drive.add(rumps.separator)
+        drive.add(rumps.MenuItem("📂 打开 Drive 根目录", callback=self._open_drive_sync_root))
+        drive.add(rumps.MenuItem("🔐 重新授权...", callback=self._reauthorize_drive_sync))
+        return drive
+
+    def _rebuild_drive_sync_menu(self):
+        if "☁️ Google Drive 群文件备份" in self.menu:
+            del self.menu["☁️ Google Drive 群文件备份"]
+        anchor = "🔔 关注推送" if "🔔 关注推送" in self.menu else "🔌 MCP 服务"
+        self.menu.insert_after(anchor, self._build_drive_sync_menu())
+
+    def _configure_drive_sync_timer(self):
+        if self._drive_sync_timer:
+            try:
+                self._drive_sync_timer.stop()
+            except Exception:
+                pass
+            self._drive_sync_timer = None
+        if not self.config.get("google_drive_file_sync_enabled", False):
+            return
+        if self.config.get("google_drive_file_sync_paused", False):
+            return
+        interval = max(
+            60,
+            int(self.config.get("google_drive_file_sync_interval_seconds", 300)),
+        )
+        self._drive_sync_timer = rumps.Timer(self._on_drive_sync_timer, interval)
+        self._drive_sync_timer.start()
+        print(f"[drive-sync] timer started: every {interval} seconds")
+
+    def _on_drive_sync_timer(self, _):
+        if not self.db:
+            return
+        self._start_drive_sync_consumer(manual=False)
+
+    def _toggle_drive_sync(self, _):
+        if self.config.get("google_drive_file_sync_enabled", False):
+            self.config["google_drive_file_sync_enabled"] = False
+            save_config(self.config)
+            self._configure_drive_sync_timer()
+            self._rebuild_drive_sync_menu()
+            _notify(
+                "Google Drive 群文件备份",
+                "已关闭",
+                "不会再开始新的扫描或上传；queue、local CAS 和远端文件均已保留。",
+            )
+            return
+
+        self.config["google_drive_file_sync_enabled"] = True
+        self.config["google_drive_file_sync_paused"] = False
+        save_config(self.config)
+        self._drive_sync_service().initialize_selected_chat_cursors()
+        self._configure_drive_sync_timer()
+        self._rebuild_drive_sync_menu()
+        _notify(
+            "Google Drive 群文件备份",
+            "已开启",
+            "从当前时间开始。授权、选择群聊和历史 backfill 仍是独立动作。",
+        )
+
+    def _toggle_drive_sync_pause(self, _):
+        if not self.config.get("google_drive_file_sync_enabled", False):
+            return
+        paused = not self.config.get("google_drive_file_sync_paused", False)
+        self.config["google_drive_file_sync_paused"] = paused
+        save_config(self.config)
+        self._configure_drive_sync_timer()
+        self._rebuild_drive_sync_menu()
+        _notify(
+            "Google Drive 群文件备份",
+            "已暂停" if paused else "已恢复",
+            "不会开始新的扫描或上传。" if paused else "durable queue 会在下一轮继续。",
+        )
+
+    def _sync_drive_now(self, _):
+        self._start_drive_sync_consumer(manual=True)
+
+    def _start_drive_sync_consumer(self, *, manual):
+        threading.Thread(
+            target=self._run_drive_sync_consumer,
+            kwargs={"manual": manual},
+            daemon=True,
+        ).start()
+
+    def _run_drive_sync_consumer(self, *, manual):
+        if not self._drive_sync_lock.acquire(blocking=False):
+            if manual:
+                _notify(
+                    "Google Drive 群文件备份", "正在同步", "当前 one-shot worker 尚未结束。"
+                )
+            return
+        try:
+            if not self.db:
+                result = {"state": "source_unavailable", "error_code": "source_unavailable"}
+            else:
+                config = load_config()
+                result = self._drive_sync_service(
+                    remote=True,
+                    config=config,
+                ).run()
+            print(
+                "[drive-sync] "
+                f"state={result.get('state')} scanned={result.get('scanned', 0)} "
+                f"queued={result.get('queued', 0)} uploaded={result.get('uploaded', 0)} "
+                f"shortcuts={result.get('shortcuts', 0)} error={result.get('error_code', '')}"
+            )
+            self._run_on_main(self._finish_drive_sync_run, result, manual)
+        except Exception as exc:
+            print(f"[drive-sync] worker failed: {type(exc).__name__}")
+            result = {"state": "failed", "error_code": type(exc).__name__}
+            self._run_on_main(self._finish_drive_sync_run, result, manual)
+        finally:
+            self._drive_sync_lock.release()
+
+    def _finish_drive_sync_run(self, result, manual):
+        self.config = load_config()
+        self._rebuild_drive_sync_menu()
+        if not manual:
+            return
+        state = result.get("state") or "unknown"
+        if state == "healthy":
+            _notify(
+                "Google Drive 群文件备份",
+                "同步完成",
+                f"上传 {int(result.get('uploaded', 0))} 个 object，"
+                f"创建 {int(result.get('shortcuts', 0))} 个 shortcut。",
+            )
+        else:
+            _notify(
+                "Google Drive 群文件备份",
+                "本轮未完成" if state not in {"disabled", "paused"} else "没有运行",
+                f"state={state} · error={result.get('error_code') or 'none'}",
+            )
+
+    def _select_drive_sync_chats(self, _):
+        self._delayed_run(self._show_drive_sync_chat_dialog)
+
+    def _show_drive_sync_chat_dialog(self):
+        self._bring_to_front()
+        try:
+            if not self.db:
+                _notify(
+                    "Google Drive 群文件备份",
+                    "还没初始化",
+                    "请等微信数据加载完成后再选择群聊。",
+                )
+                return
+            groups = self.db.get_recent_sessions(limit=200)
+            groups = [group for group in groups if group.get("is_group")]
+            if not groups:
+                groups = self.db.get_groups(include_unnamed=True)
+            if not groups:
+                _notify(
+                    "Google Drive 群文件备份",
+                    "没有找到群聊",
+                    "请确认微信已登录并有群聊记录。",
+                )
+                return
+            groups = groups[:80]
+            current = {
+                chat["username"]: chat.get("alias") or ""
+                for chat in selected_drive_sync_chats(self.config)
+            }
+            lines = [f"{index}. {group['name']}" for index, group in enumerate(groups, 1)]
+            clicked, text = self._input_dialog(
+                "选择 Google Drive 文件备份群聊",
+                "输入群聊编号；多个群用逗号分隔。留空会清除选择，但不会删除 queue、CAS 或远端文件。\n\n"
+                + "\n".join(lines),
+                default_text=",".join(
+                    str(index + 1)
+                    for index, group in enumerate(groups)
+                    if group["username"] in current
+                ),
+                ok="保存",
+                width=540,
+            )
+            if not clicked:
+                return
+            try:
+                selected = (
+                    self._parse_monitor_chat_selection(text, len(groups))
+                    if text.strip()
+                    else []
+                )
+            except ValueError:
+                _notify(
+                    "Google Drive 群文件备份",
+                    "输入错误",
+                    "请输入列表里的数字编号，多个编号用逗号分隔。",
+                )
+                return
+            selected_chats = []
+            for index in selected:
+                group = groups[index - 1]
+                alias = current.get(group["username"])
+                if not alias:
+                    candidate = str(group.get("name") or "").strip()
+                    alias = "" if candidate.endswith("@chatroom") else candidate
+                selected_chats.append({
+                    "username": group["username"],
+                    "alias": alias,
+                })
+            self.config["google_drive_file_sync_selected_chats"] = selected_chats
+            save_config(self.config)
+            if self.config.get("google_drive_file_sync_enabled", False):
+                self._drive_sync_service().initialize_selected_chat_cursors()
+            self._rebuild_drive_sync_menu()
+            _notify(
+                "Google Drive 群文件备份",
+                "群聊选择已保存",
+                f"当前选择 {len(selected_chats)} 个群；这一步没有启用同步或上传文件。",
+            )
+        finally:
+            self._release_front()
+
+    def _open_drive_sync_root(self, _):
+        link = str(self._drive_sync_status().get("root_web_view_link") or "")
+        if not link:
+            _notify(
+                "Google Drive 群文件备份",
+                "Root 尚未建立",
+                "完成授权并至少成功运行一次后才能打开。",
+            )
+            return
+        subprocess.run(["open", link])
+
+    def _reauthorize_drive_sync(self, _):
+        self._delayed_run(self._show_drive_sync_auth_dialog)
+
+    def _show_drive_sync_auth_dialog(self):
+        self._bring_to_front()
+        try:
+            clicked, path = self._input_dialog(
+                "Google Drive OAuth 授权",
+                "输入你自己的 Installed desktop app OAuth client JSON 路径。确认后会复制到 private runtime location，并打开 system browser；不会启用 sync 或选择群聊。",
+                default_text="",
+                ok="开始授权",
+                width=560,
+            )
+            if not clicked or not path.strip():
+                return
+            threading.Thread(
+                target=self._run_drive_sync_auth,
+                args=(path.strip(),),
+                daemon=True,
+            ).start()
+        finally:
+            self._release_front()
+
+    def _run_drive_sync_auth(self, client_path):
+        try:
+            status = GoogleDriveOAuth().authorize(client_path)
+            _notify(
+                "Google Drive 群文件备份",
+                "授权完成",
+                "refresh token 已存入 macOS Keychain；sync 和群聊选择没有被改变。",
+            )
+            print(f"[drive-sync] auth state={status.get('state')}")
+        except GoogleDriveAuthError as exc:
+            _notify(
+                "Google Drive 群文件备份",
+                "授权失败",
+                f"error={exc.code}",
+            )
+        finally:
+            self._run_on_main(self._rebuild_drive_sync_menu)
 
     # ── Topic monitor menu ────────────────────────────────────
 
@@ -1748,6 +2094,11 @@ class WeGroupchatObsidianApp(rumps.App):
         self.db = WeChatDB(self.config["db_dir"], keys)
         if self.config.get("attachment_archive_enabled", False):
             self._start_attachment_archive_consumer()
+        if (
+            self.config.get("google_drive_file_sync_enabled", False)
+            and not self.config.get("google_drive_file_sync_paused", False)
+        ):
+            self._start_drive_sync_consumer(manual=False)
 
         print("[init] 正在刷新群聊列表...")
         self._run_on_main(self._rebuild_chat_menu)
