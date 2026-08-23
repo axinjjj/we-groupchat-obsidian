@@ -19,7 +19,11 @@ import uuid
 from datetime import datetime
 
 from .attachment_archive import AttachmentArchive
-from .config import DATA_DIR, active_monitor_chats, selected_drive_sync_chats
+from .config import (
+    DATA_DIR,
+    active_monitor_chats,
+    selected_resource_backup_chats,
+)
 from .link_preview import URL_RE
 from .wechat_db import WeChatSourceDegraded
 
@@ -58,7 +62,7 @@ def _exact_links(text):
     links = []
     seen = set()
     for match in URL_RE.finditer(str(text or "")):
-        url = match.group(0).rstrip(".,;:!?，。；：！？、")
+        url = match.group(0)
         if url and url not in seen:
             seen.add(url)
             links.append(url)
@@ -97,7 +101,7 @@ def eligible_selected_chats(config):
     aliases = config.get("monitor_chat_aliases")
     aliases = aliases if isinstance(aliases, dict) else {}
     result = []
-    for selected in selected_drive_sync_chats(config):
+    for selected in selected_resource_backup_chats(config):
         username = str(selected.get("username") or "").strip()
         if username not in active:
             continue
@@ -108,6 +112,27 @@ def eligible_selected_chats(config):
             or username
         )
         result.append({"username": username, "alias": _safe_label(alias)})
+    return result
+
+
+def resource_backup_chat_candidates(config):
+    """Return active chats in stable config order with privacy-safe labels."""
+    config = config if isinstance(config, dict) else {}
+    aliases = config.get("monitor_chat_aliases")
+    aliases = aliases if isinstance(aliases, dict) else {}
+    result = []
+    for chat in active_monitor_chats(config):
+        username = str(chat.get("username") or "").strip()
+        if not username:
+            continue
+        fallback = f"未命名群聊 {len(result) + 1}"
+        alias = (
+            str(aliases.get(username) or "").strip()
+            or str(chat.get("name") or "").strip()
+        )
+        if not alias or alias.endswith("@chatroom"):
+            alias = fallback
+        result.append({"username": username, "alias": _safe_label(alias, fallback)})
     return result
 
 
@@ -530,7 +555,9 @@ class SelectedResourceCapture:
                 "error_code": "source_unavailable",
             }
         initialized = self.initialize_selected_chat_cursors()["new_chats"]
-        max_messages = max(1, int(self.config.get("google_drive_file_sync_max_messages_per_scan", 500)))
+        max_messages = max(1, int(
+            self.config.get("resource_backup_max_messages_per_scan", 500)
+        ))
         scanned = 0
         captured_links = 0
         captured_files = 0

@@ -1,19 +1,20 @@
 # Source reliability
 
-This guide covers four deliberately separate responsibilities:
+This guide covers five deliberately separate responsibilities:
 
 1. the optional WeChat source guard, which may request a normal macOS
    application launch;
 2. the attachment catalog and private local content-addressed archive;
-3. direct selected-chat file sync to the user's authorized Google Drive; and
-4. an optional provider-neutral filesystem snapshot target.
+3. the default no-OAuth selected-resource handoff to an existing mounted target;
+4. optional advanced direct selected-chat sync to the Drive API; and
+5. a provider-neutral filesystem snapshot target for the broader attachment archive.
 
 They do not form a single always-on daemon. `TopicMonitor` reads messages and
 owns checkpoints; it does not import or invoke the source guard. The Knowledge
 transaction owns attachment mentions; a post-commit worker owns byte copying.
-The selected-chat scanner owns an independent cursor and queue and may reuse the
-same local CAS without a Knowledge hit. The backup command reads immutable local
-archive objects and writes only to the configured filesystem target.
+Each selected-chat scanner owns an independent cursor/selection and may reuse
+the same local CAS without a Knowledge hit. Mounted backup reads immutable local
+archive objects and writes only to its configured filesystem target.
 
 ## 1. Optional WeChat source guard
 
@@ -219,9 +220,108 @@ historical catalog rows; `--run` then consumes pending rows.
 `--limit` is the worker batch size, not a total cap: an acquired worker keeps
 draining fresh and currently due rows before it exits.
 
-## 4. Direct selected-chat Google Drive file sync
+## 4. Default selected-resource mounted backup
 
-This is the ordinary automatic file-backup lane. It is independent of
+This is the default Google Drive path. It hands selected-chat links, selected
+file occurrences, and shared-CAS bytes to an existing mounted filesystem such
+as Google Drive for Desktop. It does not create a Google Cloud project, request
+OAuth credentials, call the Drive API, or automate a browser.
+
+```text
+active monitor chats
+  intersect resource_backup_selected_chats
+  -> per-chat x message-shard occurrence capture
+  -> exact URL metadata + shared local SHA-256 CAS
+  -> local Obsidian resource index
+  -> mounted target objects / catalog snapshots / views
+```
+
+The mounted lane and the optional direct API lane have separate disclosure
+selections. `resource_backup_selected_chats` controls only this lane;
+`google_drive_file_sync_selected_chats` controls only the optional API lane.
+Neither selection enables the other transport.
+
+### Private selection and local policy
+
+Mounted-backup defaults are private and opt-in:
+
+```json
+{
+  "resource_backup_selected_chats": [],
+  "resource_backup_interval_seconds": 300,
+  "resource_backup_max_messages_per_scan": 500,
+  "resource_backup_min_free_bytes": 1073741824
+}
+```
+
+List active monitor chats without printing raw `@chatroom` identifiers, then
+replace the mounted-backup selection with the chosen list indexes:
+
+```bash
+.venv/bin/python scripts/resource_backup.py list-chats
+.venv/bin/python scripts/resource_backup.py set-selected-chats 1
+.venv/bin/python scripts/resource_backup.py clear-selected-chats
+```
+
+The target and link-export policy live in the separate private
+`resource_backup.json` settings file. The chosen directory must already exist;
+the worker never recreates a missing mount path.
+
+```bash
+.venv/bin/python scripts/resource_backup.py set-target "<existing-mounted-directory>"
+.venv/bin/python scripts/resource_backup.py set-link-export-mode redacted
+.venv/bin/python scripts/resource_backup.py init
+.venv/bin/python scripts/resource_backup.py status
+.venv/bin/python scripts/resource_backup.py plan
+.venv/bin/python scripts/resource_backup.py run --resolve-limit 10
+.venv/bin/python scripts/resource_backup.py verify
+```
+
+`init` seeds from-now cursors only. `run` captures deterministic occurrences,
+resolves due files into the shared CAS, refreshes local Obsidian indexes even
+when the target is unavailable, and then attempts mounted handoff.
+
+The mounted subtree is:
+
+```text
+<target>/wgo-resource-backup/v3/
+  objects/sha256/...
+  snapshots/<snapshot-id>/{manifest.json,resources.jsonl,COMPLETE}
+  views/<chat>/...
+```
+
+Plan and run reject filesystem-root, same/nested/ancestor local-source targets,
+a symlink configured target, and a symlink or non-directory in the app-owned
+subtree. A successful first copy hashes while writing and immediately reads the
+target bytes back. Later scheduled runs trust the local delivery receipt plus
+regular-file type and logical size so they do not rehydrate streamed
+placeholders. Explicit `verify` performs the full target rehash.
+
+`sync_delegated` means the resolved file bytes were written and immediately
+verified on the mounted filesystem. It never means provider-side upload or
+remote checksum verification. If any eligible file remains unresolved, the
+catalog may still publish a hash-bound `COMPLETE` snapshot, but the run state is
+`pending_resources`, the manifest says `snapshot_completeness=catalog_complete`,
+and the CLI exits non-zero. `COMPLETE` binds the catalog; it does not fabricate
+missing bytes.
+
+After one manual canary is verified from another Drive surface, the optional
+short-lived scheduler can be installed explicitly:
+
+```bash
+.venv/bin/python scripts/resource_backup.py install-agent --interval-seconds 300
+.venv/bin/python scripts/resource_backup.py agent-status
+.venv/bin/python scripts/resource_backup.py uninstall-agent
+```
+
+The agent uses `RunAtLoad` plus `StartInterval`, `ProcessType=Background`, and
+`LowPriorityIO`, with no `KeepAlive`. Each wake runs one bounded process and
+exits. Installing it is an activation action; merging source does not install it.
+
+## 5. Optional advanced direct selected-chat Google Drive API sync
+
+This is an optional advanced transport retained for users who explicitly want
+Drive-native objects and shortcuts. It is independent of
 `TopicMonitor`, Knowledge selection, the source guard, and the filesystem
 snapshot backend:
 
@@ -393,7 +493,7 @@ CLI `auth-status` validates the refresh token. `auth_required`, `retry_wait`,
 non-zero exit status so operators and schedulers cannot mistake printed error
 JSON for success.
 
-## 5. Optional filesystem backup target
+## 6. Optional filesystem backup target
 
 The backup layer knows only filesystem paths. It has no Google Drive, Dropbox,
 iCloud, or other provider API; it stores no OAuth token or provider credential.
@@ -462,19 +562,32 @@ locally. It reads the snapshot catalog and scans the local CAS directly, so the
 plan still works when the local Knowledge database/catalog is absent. This
 tranche deliberately provides no automatic restore or deletion.
 
-## 6. Health and safe rollout
+## 7. Health and safe rollout
 
 The redacted health check reports source-guard effective state, last result,
 remaining restart budget, source freshness, attachment catalog counts/object
-count, optional backup snapshots, and privacy-safe direct Drive state: auth,
-enabled/paused, selected-chat count, queue counts, last scan/upload, next retry,
-root state, object/shortcut counts, and last error code:
+count, optional attachment snapshots, and privacy-safe optional direct-Drive
+state. Mounted resource backup currently has its own explicit status surface:
 
 ```bash
 .venv/bin/python scripts/health_check.py
+.venv/bin/python scripts/resource_backup.py status
 ```
 
-A safe first direct-Drive rollout is:
+A safe first mounted-backup rollout is:
+
+1. keep the optional direct API lane disabled;
+2. run `list-chats`, select one non-sensitive canary by index, and run `init`;
+3. choose one already existing directory inside the mounted provider root;
+4. run `plan`, then send one non-sensitive link and one small file after the
+   from-now cursor;
+5. run one explicit `run` and `verify`, checking the local occurrence/CAS,
+   Obsidian index, mounted object, and catalog snapshot;
+6. confirm provider-side arrival from another Drive surface because
+   `sync_delegated` is not remote verification; and
+7. only then install the 300-second short-lived resource-backup agent.
+
+The optional advanced direct-Drive API rollout remains separate:
 
 1. obtain your own Google Cloud Installed desktop app OAuth client JSON;
 2. run `auth`, then confirm `auth-status` without enabling sync;
@@ -485,13 +598,14 @@ A safe first direct-Drive rollout is:
 6. apply historical backfill only after reviewing its counts; and
 7. run the redacted health check after activation.
 
-The source guard and filesystem snapshot have their own rollouts: inspect their
-status/plan first and keep them disabled or unconfigured until separately
-reviewed.
+The source guard and broader attachment filesystem snapshot have their own
+rollouts: inspect their status/plan first and keep them disabled or unconfigured
+until separately reviewed.
 
-Installing/loading the source guard, authorizing Google, choosing chats,
-enabling direct sync, applying either historical backfill, writing a real
-filesystem target, pruning WeChat cache data, and deleting Drive files are all
-separate operational actions. Source availability, local preservation,
-filesystem target-byte verification, and verified Drive object/shortcut state
-are distinct facts.
+Installing/loading the source guard, selecting mounted-backup chats, writing a
+real mounted target, installing the resource agent, authorizing Google for the
+optional API lane, selecting API-lane chats, enabling direct sync, applying any
+historical backfill, pruning WeChat cache data, and deleting Drive files are all
+separate operational actions. Source availability, local preservation, mounted
+target-byte verification, File Provider upload state, and verified Drive API
+object/shortcut state are distinct facts.

@@ -112,7 +112,13 @@ Its most important boundaries are:
   content-addressed archive. An optional backup copies immutable objects to an
   ordinary filesystem target; verification proves the target bytes only, not a
   sync provider's cloud-upload state.
-- Direct Google Drive file sync is a separate, public-default-off path. It scans
+- The default selected-resource backup lane needs no OAuth: it intersects
+  actively monitored chats with an independent explicit selection, captures
+  exact link and file occurrences, resolves files into the shared CAS, and
+  delegates immutable objects plus privacy-bounded catalogs and Markdown views
+  to an existing mounted folder such as Google Drive for Desktop. A
+  `sync_delegated` receipt proves target bytes, not provider-side upload.
+- Direct Google Drive file sync is a separate, optional advanced path. It scans
   only user-selected chats with per-chat x message-shard cursors so a partial
   shard read cannot skip files. File messages need no Knowledge hit and enter
   the archive-owned provider-neutral CAS catalog. Each digest uploads once,
@@ -145,7 +151,8 @@ independently deployed microservices. Editable sources:
 - Opt-in attachment cataloging plus a private local content-addressed archive that deduplicates identical bytes; file and image kinds are selected explicitly.
 - Optional, separately installed WeChat source guard with grace, pause, restart budget, exponential backoff, content-free receipts, and no `KeepAlive` loop.
 - Provider-neutral filesystem snapshots for the attachment archive, including plan, run, verify, and read-only restore planning.
-- Opt-in selected-chat file sync directly to a user-authorized Google Drive, with a durable queue, global byte deduplication, chat/month shortcuts, retry/reconcile, and no automatic deletion.
+- Default no-OAuth selected-resource backup through an existing mounted filesystem such as Google Drive for Desktop, with exact link occurrences, shared-CAS files, Obsidian indexes, catalog snapshots, and honest `sync_delegated` receipts.
+- Optional advanced selected-chat file sync through the Google Drive API, with a separate selection/control plane, durable queue, chat/month shortcuts, retry/reconcile, and no automatic deletion.
 - Optional link preview context for public URLs; it is off by default and must be enabled explicitly.
 - CLI and `.command` maintenance entrypoints for users whose menu bar icon is hidden.
 - MCP server for read-only chat lookup, search, summaries, images, and optional UI-based sending.
@@ -295,7 +302,22 @@ Source reliability helpers:
 .venv/bin/python scripts/attachment_archive.py backfill
 .venv/bin/python scripts/attachment_archive.py backfill --apply
 
-# Direct selected-chat Google Drive files: auth, enable, selection, backfill, and upload are separate.
+# Default selected-resource mounted backup: no OAuth or Drive API.
+.venv/bin/python scripts/resource_backup.py list-chats
+.venv/bin/python scripts/resource_backup.py set-selected-chats 1
+.venv/bin/python scripts/resource_backup.py clear-selected-chats
+.venv/bin/python scripts/resource_backup.py set-target "<existing-mounted-directory>"
+.venv/bin/python scripts/resource_backup.py set-link-export-mode redacted
+.venv/bin/python scripts/resource_backup.py init
+.venv/bin/python scripts/resource_backup.py status
+.venv/bin/python scripts/resource_backup.py plan
+.venv/bin/python scripts/resource_backup.py run --resolve-limit 10
+.venv/bin/python scripts/resource_backup.py verify
+.venv/bin/python scripts/resource_backup.py install-agent --interval-seconds 300
+.venv/bin/python scripts/resource_backup.py agent-status
+.venv/bin/python scripts/resource_backup.py uninstall-agent
+
+# Optional advanced direct Google Drive API lane; OAuth and selection are separate from mounted backup.
 .venv/bin/python scripts/google_drive_file_sync.py auth --client-secrets "<installed-desktop-client.json>"
 .venv/bin/python scripts/google_drive_file_sync.py auth-status
 .venv/bin/python scripts/google_drive_file_sync.py status
@@ -319,14 +341,16 @@ Source reliability helpers:
 .venv/bin/python scripts/attachment_backup.py clear-target
 ```
 
-`install-agent` writes a one-shot `StartInterval` plist but does not load it;
-`--load-now` is the separate activation step. `attachment_archive.py backfill`
+`wechat_source_guard.py install-agent` writes a one-shot `StartInterval` plist
+but does not load it; `--load-now` is the separate activation step.
+`resource_backup.py install-agent` installs and loads its short-lived scheduled
+worker and therefore belongs only after the manual canary. `attachment_archive.py backfill`
 and `google_drive_file_sync.py backfill` are dry plans unless `--apply` is
 present. Drive `enable` does not authenticate, select chats, backfill, or run an
 upload. Backup `verify` checks bytes visible at the configured filesystem target
 and deliberately makes no claim about provider-side upload. See the
-[source reliability guide](docs/source-reliability.md) for Drive folder/OAuth
-contracts, states, resolver rules, storage layout, and failure boundaries.
+[source reliability guide](docs/source-reliability.md) for mounted handoff,
+optional Drive API, states, resolver rules, storage layout, and failure boundaries.
 
 ### Guarded exact relation Markdown cleanup
 

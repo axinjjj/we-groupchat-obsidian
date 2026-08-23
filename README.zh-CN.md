@@ -95,7 +95,11 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
 - 文件附件可以进入本机私有的 SHA-256 content-addressed archive，同一份 bytes 只保留一个 object。
   可选 backup 只把 immutable objects 复制到普通 filesystem target；验证的是目标目录 bytes，
   不是 sync provider 的云端上传状态。
-- Direct Google Drive 文件同步是另一条 public-default-off lane：只扫描用户选定群聊，以 per-chat ×
+- 默认 selected-resource backup lane 不需要 OAuth：它取 active monitor chats 与独立显式 selection 的交集，
+  捕获 exact link / file occurrences，把文件解析进共享 CAS，再把 immutable objects、privacy-bounded catalog
+  与 Markdown views 交给 Google Drive for Desktop 等现有 mounted folder。`sync_delegated` 只证明 target bytes，
+  不证明 provider-side upload。
+- Direct Google Drive 文件同步是另一条可选 advanced lane：只扫描用户选定群聊，以 per-chat ×
   message-shard cursor 防止 partial shard read 推进遗漏。File message 不需要 Knowledge hit 就会进入
   durable queue 和 archive-owned provider-neutral CAS catalog；每个 digest 只上传一次，>5 MiB upload 按
   server-confirmed offset resumable，再按群聊/月份创建可读 shortcut。Remote identity 由 Drive file ID
@@ -122,7 +126,8 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
 - 附件 catalog 与本地 content-addressed archive：archive 默认关闭；启用后相同 bytes 自动 dedup，图片仍需单独 opt-in。
 - 可选、单独安装的微信 source guard：grace、pause、restart budget、exponential backoff、content-free receipts，且没有 `KeepAlive` busy loop。
 - Provider-neutral filesystem snapshot：支持 attachment archive 的 plan、run、verify 和只读 restore plan。
-- 可选 selected-chat files 直传用户授权的 Google Drive：durable queue、全局 bytes 去重、群聊/月 shortcut、retry/reconcile，且不自动删除。
+- 默认 no-OAuth selected-resource mounted backup：把 exact links 与共享 CAS files 交给现有 Google Drive for Desktop 等挂载目录，同时生成 Obsidian index、catalog snapshot 和诚实的 `sync_delegated` receipt。
+- 可选 advanced Google Drive API lane：拥有独立 selection/control plane、durable queue、群聊/月 shortcut 与 retry/reconcile，不自动删除。
 - 链接和转发展开：可选择补充公开网页标题/摘要；远程链接预览默认关闭。本地微信 XML 里可见的转发聊天记录会尽量解析。
 - MCP Server：让 Claude Desktop、Claude Code、Cursor、OpenClaw 等 MCP 客户端只读查询群聊、搜索、总结、查看图片；发送消息默认关闭。
 - 运维命令：即使菜单栏图标被隐藏，也可以用 `.command` 文件配置关注推送、健康检查、刷新数据源、历史回填和安装自启动。
@@ -271,7 +276,22 @@ Source reliability 运维脚本：
 .venv/bin/python scripts/attachment_archive.py backfill
 .venv/bin/python scripts/attachment_archive.py backfill --apply
 
-# Direct selected-chat Google Drive files：auth、enable、选群、backfill、upload 各自独立。
+# 默认 selected-resource mounted backup：不需要 OAuth，也不调用 Drive API。
+.venv/bin/python scripts/resource_backup.py list-chats
+.venv/bin/python scripts/resource_backup.py set-selected-chats 1
+.venv/bin/python scripts/resource_backup.py clear-selected-chats
+.venv/bin/python scripts/resource_backup.py set-target "<已经存在的挂载目录>"
+.venv/bin/python scripts/resource_backup.py set-link-export-mode redacted
+.venv/bin/python scripts/resource_backup.py init
+.venv/bin/python scripts/resource_backup.py status
+.venv/bin/python scripts/resource_backup.py plan
+.venv/bin/python scripts/resource_backup.py run --resolve-limit 10
+.venv/bin/python scripts/resource_backup.py verify
+.venv/bin/python scripts/resource_backup.py install-agent --interval-seconds 300
+.venv/bin/python scripts/resource_backup.py agent-status
+.venv/bin/python scripts/resource_backup.py uninstall-agent
+
+# 可选 advanced Google Drive API lane；OAuth 与选群都和 mounted backup 独立。
 .venv/bin/python scripts/google_drive_file_sync.py auth --client-secrets "<installed-desktop-client.json>"
 .venv/bin/python scripts/google_drive_file_sync.py auth-status
 .venv/bin/python scripts/google_drive_file_sync.py status
@@ -295,11 +315,13 @@ Source reliability 运维脚本：
 .venv/bin/python scripts/attachment_backup.py clear-target
 ```
 
-`install-agent` 只写入 one-shot `StartInterval` plist，不会加载；`--load-now` 才是单独的 activation。
+`wechat_source_guard.py install-agent` 只写入 one-shot `StartInterval` plist，不会加载；`--load-now`
+才是单独的 activation。`resource_backup.py install-agent` 会安装并加载短命 scheduled worker，必须放在
+manual canary 通过之后。
 `attachment_archive.py backfill` 和 `google_drive_file_sync.py backfill` 默认都是 dry plan，只有显式
 `--apply` 才登记历史 item。Drive `enable` 不会顺手 auth、选群、backfill 或 upload。Backup `verify`
 只验证 configured filesystem target 上看得到的 bytes，绝不宣称 provider-side upload 已完成。Drive
-folder/OAuth contract、完整状态、resolver 规则、存储结构和失败边界见
+mounted handoff、可选 Drive API、完整状态、resolver 规则、存储结构和失败边界见
 [来源可靠性指南](docs/source-reliability.zh-CN.md)。
 
 菜单栏的 `关注推送 -> 后台通知：开/关` 是自动 banner 总开关。关闭后，

@@ -478,6 +478,13 @@ class MountedResourceBackup:
     def _target_boundary_error(self):
         if not self.target:
             return ""
+        if os.path.lexists(self.target):
+            try:
+                target_mode = os.lstat(self.target).st_mode
+            except OSError:
+                return "destination_unavailable"
+            if stat.S_ISLNK(target_mode):
+                return "target_is_symlink"
         target_forms = {
             os.path.abspath(self.target),
             os.path.realpath(self.target),
@@ -498,6 +505,23 @@ class MountedResourceBackup:
             for value in protected:
                 if _paths_overlap(target, value):
                     return "target_overlaps_local_source"
+        target_real = os.path.realpath(self.target)
+        current = os.path.abspath(self.target)
+        for part in ("wgo-resource-backup", "v3"):
+            current = os.path.join(current, part)
+            if not os.path.lexists(current):
+                continue
+            try:
+                mode = os.lstat(current).st_mode
+            except OSError:
+                return "target_directory_unavailable"
+            if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+                return "target_directory_conflict"
+            try:
+                if os.path.commonpath((os.path.realpath(current), target_real)) != target_real:
+                    return "target_directory_escape"
+            except ValueError:
+                return "target_directory_escape"
         return ""
 
     def _ensure_target_dir(self, path):
@@ -512,7 +536,13 @@ class MountedResourceBackup:
                 raise ResourceBackupError("target_outside_configured_root")
         except ValueError as exc:
             raise ResourceBackupError("target_outside_configured_root") from exc
-        if not os.path.isdir(target):
+        try:
+            target_mode = os.lstat(target).st_mode
+        except OSError as exc:
+            raise ResourceBackupError("destination_unavailable") from exc
+        if stat.S_ISLNK(target_mode):
+            raise ResourceBackupError("target_is_symlink")
+        if not stat.S_ISDIR(target_mode):
             raise ResourceBackupError("destination_unavailable")
 
         relative = os.path.relpath(path, target)
@@ -900,12 +930,21 @@ class MountedResourceBackup:
     def _write_snapshot(self, records, object_rows, delivery_map):
         resources_bytes = _canonical_jsonl_bytes(records)
         resources_sha256 = hashlib.sha256(resources_bytes).hexdigest()
+        unresolved_files = sum(
+            1 for row in records
+            if row["kind"] == "file" and row["capture_status"] != "ready_local"
+        )
+        handoff_semantics = (
+            "pending_resources" if unresolved_files else "sync_delegated"
+        )
         state = self._state_row()
         if state and state["catalog_sha256"] == resources_sha256:
             return {
                 "state": "unchanged",
                 "snapshot_id": str(state["snapshot_id"]),
                 "catalog_sha256": resources_sha256,
+                "handoff_semantics": handoff_semantics,
+                "unresolved_files": unresolved_files,
             }
 
         snapshot_id = self._snapshot_id()
@@ -919,13 +958,15 @@ class MountedResourceBackup:
             "created_at": datetime.fromtimestamp(
                 self.now_func(), tz=timezone.utc
             ).isoformat(),
-            "handoff_semantics": "sync_delegated",
+            "snapshot_completeness": "catalog_complete",
+            "handoff_semantics": handoff_semantics,
             "remote_verification": False,
             "link_export_mode": self.link_export_mode,
             "resource_count": len(records),
             "link_count": sum(1 for row in records if row["kind"] == "link"),
             "file_occurrence_count": sum(1 for row in records if row["kind"] == "file"),
             "object_count": len(object_rows),
+            "unresolved_file_count": unresolved_files,
             "objects": [
                 {
                     "sha256": str(row["object_sha256"]),
@@ -960,6 +1001,8 @@ class MountedResourceBackup:
             "state": "written",
             "snapshot_id": snapshot_id,
             "catalog_sha256": resources_sha256,
+            "handoff_semantics": handoff_semantics,
+            "unresolved_files": unresolved_files,
         }
 
     @staticmethod
@@ -1257,7 +1300,7 @@ class MountedResourceBackup:
     def _run_locked(self, *, obsidian=None):
         occurrences = self.capture.occurrences(selected_only=True)
         object_rows = self._object_rows(occurrences)
-        _ensure_dir(self.backup_root)
+        self._ensure_target_dir(self.backup_root)
         copied = 0
         reused = 0
         failed = 0
@@ -1287,8 +1330,15 @@ class MountedResourceBackup:
         records = self._catalog_records(occurrences, delivery_map)
         snapshot = self._write_snapshot(records, object_rows, delivery_map)
         target_indexes = self._render_target_indexes(occurrences)
+        unresolved_files = int(snapshot.get("unresolved_files") or 0)
+        if unresolved_files:
+            state = "pending_resources"
+        elif copied or snapshot["state"] == "written":
+            state = "sync_delegated"
+        else:
+            state = "idle"
         return {
-            "state": "sync_delegated" if copied or snapshot["state"] == "written" else "idle",
+            "state": state,
             "remote_verified": False,
             "copied": copied,
             "reused": reused,
@@ -1296,10 +1346,7 @@ class MountedResourceBackup:
             "snapshot": snapshot,
             "target_index_files_written": target_indexes,
             "obsidian": obsidian,
-            "unresolved_files": sum(
-                1 for row in occurrences
-                if row["kind"] == "file" and row["status"] != "ready_local"
-            ),
+            "unresolved_files": unresolved_files,
         }
 
     def _snapshot_dir(self, snapshot_id=""):

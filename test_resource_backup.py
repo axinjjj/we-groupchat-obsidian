@@ -1,15 +1,18 @@
 import fcntl
 import hashlib
+import io
 import json
 import os
 import re
 import sqlite3
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
+import scripts.resource_backup as resource_backup_cli
 from core.resource_backup import MountedResourceBackup
-from core.resource_capture import SelectedResourceCapture, _url_sha256
+from core.resource_capture import SelectedResourceCapture, _exact_links, _url_sha256
 from core.wechat_db import WeChatSourceDegraded
 
 
@@ -87,11 +90,11 @@ class ResourceBackupTests(unittest.TestCase):
                 self.selected: "猫猫研究群",
                 self.unselected: "不外发群",
             },
-            "google_drive_file_sync_selected_chats": [
+            "resource_backup_selected_chats": [
                 {"username": self.selected, "alias": "猫猫研究群"},
                 {"username": self.ghost, "alias": "stale selection"},
             ],
-            "google_drive_file_sync_max_messages_per_scan": 50,
+            "resource_backup_max_messages_per_scan": 50,
         }
 
     def tearDown(self):
@@ -221,6 +224,15 @@ class ResourceBackupTests(unittest.TestCase):
             {"wgmsg_selected_resource_fixture"},
         )
 
+    def test_exact_link_identity_preserves_terminal_url_characters(self):
+        urls = [
+            "https://example.com/report!",
+            "https://example.com/path?x=1;",
+            "https://example.com/a:b",
+        ]
+
+        self.assertEqual(_exact_links(" ".join(urls)), urls)
+
     def test_mounted_handoff_exports_only_selected_occurrences_and_redacts_tokens(self):
         capture = self._ready_capture()
         # Add an unrelated local CAS object. It exists locally but has no selected
@@ -345,6 +357,66 @@ class ResourceBackupTests(unittest.TestCase):
         self.assertEqual(count, 0)
         self.assertEqual(shard_count, 0)
 
+    def test_failed_shard_recovers_after_healthy_shard_advances_without_losing_file(self):
+        class TwoShardSource:
+            fail_a = True
+
+            @staticmethod
+            def get_message_shards(_username):
+                return ["shard-a", "shard-b"]
+
+            def get_messages_for_shard(self, _username, source_shard_id, **_kwargs):
+                if source_shard_id == "shard-a":
+                    if self.fail_a:
+                        raise WeChatSourceDegraded("source_shard_unavailable")
+                    return [{
+                        "timestamp": 100,
+                        "source_message_id": "message-a-file",
+                        "text": "",
+                        "resources": [{
+                            "kind": "file",
+                            "resource_index": 0,
+                            "original_name": "a.pdf",
+                        }],
+                    }]
+                return [{
+                    "timestamp": 200,
+                    "source_message_id": "message-b-link",
+                    "text": "https://example.com/b",
+                    "resources": [],
+                }]
+
+        source = TwoShardSource()
+        capture = SelectedResourceCapture(
+            self.config,
+            source=source,
+            now_func=lambda: 1_000,
+            archive_id_factory=lambda: "00000000-0000-0000-0000-000000000001",
+        )
+        capture.initialize_selected_chat_cursors(start_timestamp=0)
+
+        first = capture.scan()
+        source.fail_a = False
+        second = capture.scan()
+        third = capture.scan()
+
+        self.assertEqual(first["state"], "source_degraded")
+        self.assertEqual(second["state"], "healthy")
+        self.assertEqual(third["state"], "healthy")
+        rows = capture.occurrences()
+        self.assertEqual(
+            [(row["source_message_id"], row["kind"]) for row in rows],
+            [("message-a-file", "file"), ("message-b-link", "link")],
+        )
+        conn = sqlite3.connect(self.capture_db)
+        try:
+            cursors = dict(conn.execute(
+                "SELECT source_shard_id, cursor_timestamp FROM resource_shards"
+            ))
+        finally:
+            conn.close()
+        self.assertEqual(cursors, {"shard-a": 100, "shard-b": 200})
+
     def test_capture_run_reports_source_unavailable_instead_of_healthy(self):
         capture = SelectedResourceCapture(
             self.config,
@@ -405,6 +477,42 @@ class ResourceBackupTests(unittest.TestCase):
             "猫猫研究群",
         )
         self.assertTrue(os.path.isfile(os.path.join(chat_root, "00-资源索引.md")))
+
+    def test_unresolved_files_keep_catalog_snapshot_but_do_not_claim_sync_delegated(self):
+        capture = self._capture()
+        capture.initialize_selected_chat_cursors(start_timestamp=0)
+        capture.scan()
+        for filename in os.listdir(self.file_month):
+            os.unlink(os.path.join(self.file_month, filename))
+        resolved = capture.resolve_pending_files(limit=10)
+        self.assertEqual(resolved["ready_local"], 0)
+        self.assertEqual(resolved["failed"], 2)
+        backup = self._backup(capture)
+
+        result = backup.run()
+
+        self.assertEqual(result["state"], "pending_resources")
+        self.assertEqual(result["copied"], 0)
+        self.assertEqual(result["unresolved_files"], 2)
+        self.assertEqual(result["snapshot"]["state"], "written")
+        snapshot_dir = os.path.join(
+            backup.backup_root, "snapshots", result["snapshot"]["snapshot_id"]
+        )
+        with open(os.path.join(snapshot_dir, "manifest.json"), encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        self.assertEqual(manifest["snapshot_completeness"], "catalog_complete")
+        self.assertEqual(manifest["handoff_semantics"], "pending_resources")
+        self.assertEqual(manifest["unresolved_file_count"], 2)
+        self.assertTrue(os.path.isfile(os.path.join(snapshot_dir, "COMPLETE")))
+
+    def test_unresolved_and_unconfigured_runs_have_nonzero_cli_exit_status(self):
+        for state in (
+            "pending_resources",
+            "target_not_configured",
+            "no_selected_chats",
+        ):
+            with self.subTest(state=state):
+                self.assertEqual(resource_backup_cli._exit_code({"state": state}), 2)
 
     def test_unmanaged_obsidian_indexes_are_preserved_with_generated_fallbacks(self):
         capture = self._ready_capture()
@@ -489,7 +597,7 @@ class ResourceBackupTests(unittest.TestCase):
             {"username": self.selected, "name": "Same Alias"},
             {"username": other, "name": "Same Alias"},
         ]
-        config["google_drive_file_sync_selected_chats"] = [
+        config["resource_backup_selected_chats"] = [
             {"username": self.selected, "alias": "Same Alias"},
             {"username": other, "alias": "Same Alias"},
         ]
@@ -572,6 +680,97 @@ class ResourceBackupTests(unittest.TestCase):
         result = backup.run()
         self.assertEqual(result["state"], "invalid_target")
         self.assertEqual(result["error_code"], "target_overlaps_local_source")
+
+    def test_target_subtree_symlink_escape_is_rejected_before_external_write(self):
+        capture = self._ready_capture()
+        outside = os.path.join(self.root, "outside")
+        os.makedirs(outside)
+        os.symlink(outside, os.path.join(self.target, "wgo-resource-backup"))
+        backup = self._backup(capture)
+
+        plan = backup.plan()
+        result = backup.run()
+
+        self.assertEqual(plan["state"], "invalid_target")
+        self.assertEqual(plan["error_code"], "target_directory_conflict")
+        self.assertEqual(result["state"], "invalid_target")
+        self.assertEqual(result["error_code"], "target_directory_conflict")
+        self.assertFalse(os.path.exists(os.path.join(outside, "v3")))
+
+    def test_configured_target_symlink_is_rejected(self):
+        capture = self._ready_capture()
+        actual = os.path.join(self.root, "actual-target")
+        target_link = os.path.join(self.root, "target-link")
+        os.makedirs(actual)
+        os.symlink(actual, target_link)
+        config = dict(self.config)
+        config["resource_backup_target"] = target_link
+        backup = MountedResourceBackup(config, capture=capture)
+
+        plan = backup.plan()
+        result = backup.run()
+
+        self.assertEqual(plan["state"], "invalid_target")
+        self.assertEqual(plan["error_code"], "target_is_symlink")
+        self.assertEqual(result["state"], "invalid_target")
+        self.assertFalse(os.path.exists(os.path.join(actual, "wgo-resource-backup")))
+
+
+class ResourceBackupCliTests(unittest.TestCase):
+    def setUp(self):
+        self.config = {
+            "monitor_chats": [
+                {"username": "first@chatroom", "name": "First Group"},
+                {"username": "second@chatroom", "name": "Second Group"},
+            ],
+            "monitor_chat_aliases": {"second@chatroom": "猫猫研究群"},
+            "resource_backup_selected_chats": [
+                {"username": "second@chatroom", "alias": "猫猫研究群"},
+            ],
+            "google_drive_file_sync_selected_chats": [
+                {"username": "legacy@chatroom", "alias": "Legacy OAuth Group"},
+            ],
+        }
+
+    def test_list_chats_is_privacy_safe_and_marks_current_selection(self):
+        output = io.StringIO()
+        with (
+            patch.object(resource_backup_cli, "load_config", return_value=self.config),
+            redirect_stdout(output),
+        ):
+            result = resource_backup_cli.main(["list-chats"])
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            payload["chats"],
+            [
+                {"index": 1, "alias": "First Group", "selected": False},
+                {"index": 2, "alias": "猫猫研究群", "selected": True},
+            ],
+        )
+        self.assertNotIn("@chatroom", output.getvalue())
+
+    def test_set_selected_chats_uses_active_list_indexes_without_oauth_state(self):
+        output = io.StringIO()
+        with (
+            patch.object(resource_backup_cli, "load_config", return_value=self.config),
+            patch.object(resource_backup_cli, "save_config") as save_config,
+            redirect_stdout(output),
+        ):
+            result = resource_backup_cli.main(["set-selected-chats", "1"])
+
+        saved = save_config.call_args.args[0]
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            saved["resource_backup_selected_chats"],
+            [{"username": "first@chatroom", "alias": "First Group"}],
+        )
+        self.assertEqual(
+            saved["google_drive_file_sync_selected_chats"],
+            self.config.get("google_drive_file_sync_selected_chats"),
+        )
+        self.assertNotIn("@chatroom", output.getvalue())
 
 
 if __name__ == "__main__":

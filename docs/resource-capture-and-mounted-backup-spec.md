@@ -1,8 +1,8 @@
 # Resource Capture & Mounted Backup Specification
 
-Status: draft 0.2  
-Target release: resource backup v3  
-Applies to: selected-chat links, selected-chat file occurrences, shared local CAS objects, Obsidian resource indexes, and mounted-filesystem handoff
+- Status: draft 0.3
+- Target release: resource backup v3
+- Applies to: selected-chat links, selected-chat file occurrences, shared local CAS objects, Obsidian resource indexes, and mounted-filesystem handoff
 
 ## 1. Decision summary
 
@@ -121,6 +121,11 @@ Obsidian Markdown, mounted target views, manifests, and catalogs are regenerable
 
 Only the current intersection of active monitor chats and explicit backup selection is eligible for index or handoff output.
 
+Mounted resource backup owns the private `resource_backup_selected_chats`
+selection. It does not reuse `google_drive_file_sync_selected_chats`, so enabling
+or selecting the optional direct OAuth/API lane cannot silently change the
+mounted-backup disclosure scope, and vice versa.
+
 A shared object follows these rules:
 
 ```text
@@ -162,6 +167,7 @@ Links are extracted from deterministic cleaned source message text with the repo
 Within one source message:
 
 - source order is preserved;
+- the exact matcher span is stored without stripping terminal URL characters;
 - exact duplicate URL strings are collapsed;
 - case-distinct path or query strings remain distinct;
 - WeChat's deterministic `[链接] title URL` representation may provide a display title;
@@ -245,6 +251,8 @@ The lane must:
 
 - copy, never move, CAS bytes;
 - reject targets that overlap the local archive, resource DB, knowledge DB, Obsidian vault, or filesystem root;
+- reject a symlink configured target and any symlink/non-directory component in
+  the app-owned `wgo-resource-backup/v3` subtree during both plan and run;
 - reject symlink/non-regular destination conflicts;
 - compute SHA-256 while copying;
 - publish through a worker-owned temporary file and replace;
@@ -300,9 +308,14 @@ Mounted delivery states include:
 
 ```text
 pending
+pending_resources
 sync_delegated
 target_failed
 ```
+
+`pending_resources` means the catalog is current but at least one eligible file
+occurrence has not reached `ready_local`, so the worker must not claim that all
+intended bytes were handed off.
 
 `sync_delegated` means:
 
@@ -325,6 +338,13 @@ A snapshot contains only currently eligible occurrences. It must not include raw
 `manifest.json` records counts, object identities, link export mode, and the SHA-256 of `resources.jsonl`.
 
 `COMPLETE` is written last and binds the manifest and resource catalog hashes. An incomplete directory without a valid `COMPLETE` marker is not a complete snapshot.
+
+`COMPLETE` means `catalog_complete`: the exported occurrence catalog and its
+listed objects are internally bound and independently readable. It does not turn
+an unresolved file occurrence into a completed byte handoff. Such a manifest
+records `handoff_semantics=pending_resources` and a non-zero
+`unresolved_file_count`; the run remains non-successful until those bytes are
+resolved and delivered.
 
 A new snapshot is skipped when the canonical resource catalog hash is unchanged.
 
@@ -362,7 +382,9 @@ Keys such as token, access_token, secret, password, signature, auth, code, and s
 
 ## 15. Compatibility
 
-The direct Google Drive API implementation remains intact and optional. It may later consume the same provider-neutral occurrence ledger instead of maintaining its own source scanner.
+The direct Google Drive API implementation remains intact and optional. It owns
+its existing OAuth-specific selection and may later consume the same
+provider-neutral occurrence ledger instead of maintaining its own source scanner.
 
 Attachment backup v2 snapshots retain their existing interpretation. Resource backup v3 uses a new schema and subtree and does not mutate v2 artifacts in place.
 
@@ -388,6 +410,8 @@ The first live rollout is bounded:
 The intended operator sequence is:
 
 ```bash
+python scripts/resource_backup.py list-chats
+python scripts/resource_backup.py set-selected-chats 1
 python scripts/resource_backup.py set-target "/path/chosen/in/Finder"
 python scripts/resource_backup.py set-link-export-mode redacted
 python scripts/resource_backup.py init
@@ -407,6 +431,7 @@ cannot accidentally enable scheduled handoff.
 At minimum, automated tests must prove:
 
 - a chat must be both active and explicitly selected;
+- mounted selection remains independent from the direct OAuth/API selection;
 - an unselected chat never appears in the exported catalog or views;
 - a CAS object shared with an unselected occurrence exports only selected provenance;
 - case-distinct URLs remain distinct;
@@ -415,6 +440,8 @@ At minimum, automated tests must prove:
 - two same-name files with different bytes become two CAS objects;
 - source cursor and occurrence inserts commit atomically;
 - a degraded shard does not advance;
+- shard A may fail while shard B advances; after A recovers its unseen file is
+  captured exactly once;
 - mixed link/file occurrence groups do not create semantic edges;
 - ordinary reruns trust a valid local delivery receipt and do not rehash target placeholders;
 - explicit verify rehashes target objects and detects corruption;
@@ -424,7 +451,11 @@ At minimum, automated tests must prove:
 - a previously delivered path replaced by a symlink is never trusted;
 - insufficient target space preserves local state and publishes no complete snapshot;
 - target overlap and symlink conflicts fail closed;
+- a configured-target or app-subtree symlink is rejected in plan and run before
+  any path outside the configured target is created;
 - snapshots without a valid `COMPLETE` marker are rejected;
+- unresolved files may appear in a catalog-complete snapshot but never produce a
+  `sync_delegated` run state;
 - Obsidian indexes reference CAS files but do not duplicate bytes.
 - the LaunchAgent plist has interval scheduling, background/low-I/O hints, and
   no `KeepAlive`, and install/uninstall are idempotent under mocked `launchctl`.

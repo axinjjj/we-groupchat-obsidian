@@ -11,7 +11,12 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from core.config import load_config, normalize_path_value
+from core.config import (
+    load_config,
+    normalize_path_value,
+    save_config,
+    selected_resource_backup_chats,
+)
 from core.key_extractor import get_cached_keys
 from core.resource_backup import (
     MountedResourceBackup,
@@ -23,7 +28,7 @@ from core.resource_backup_launch_agent import (
     status as resource_backup_agent_status,
     uninstall as uninstall_resource_backup_agent,
 )
-from core.resource_capture import SelectedResourceCapture
+from core.resource_capture import SelectedResourceCapture, resource_backup_chat_candidates
 from core.wechat_db import WeChatDB
 
 
@@ -65,6 +70,9 @@ def _exit_code(result):
         "degraded",
         "source_unavailable",
         "destination_unavailable",
+        "target_not_configured",
+        "no_selected_chats",
+        "pending_resources",
         "worker_busy",
         "install_failed",
         "uninstall_failed",
@@ -91,6 +99,10 @@ def build_parser():
     )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status")
+    sub.add_parser("list-chats")
+    selected = sub.add_parser("set-selected-chats")
+    selected.add_argument("indexes", nargs="+", type=int)
+    sub.add_parser("clear-selected-chats")
     sub.add_parser("init")
     sub.add_parser("scan")
     resolve = sub.add_parser("resolve")
@@ -117,6 +129,46 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     config = load_config()
 
+    if args.command == "list-chats":
+        selected_usernames = {
+            chat["username"] for chat in selected_resource_backup_chats(config)
+        }
+        choices = resource_backup_chat_candidates(config)
+        _print({
+            "state": "ok",
+            "chats": [
+                {
+                    "index": index,
+                    "alias": chat["alias"],
+                    "selected": chat["username"] in selected_usernames,
+                }
+                for index, chat in enumerate(choices, 1)
+            ],
+        })
+        return 0
+    if args.command == "set-selected-chats":
+        choices = resource_backup_chat_candidates(config)
+        indexes = list(dict.fromkeys(args.indexes))
+        if not indexes or any(index < 1 or index > len(choices) for index in indexes):
+            _print({"state": "invalid_selection", "available_chats": len(choices)})
+            return 2
+        selected = [choices[index - 1] for index in indexes]
+        updated = dict(config)
+        updated["resource_backup_selected_chats"] = selected
+        save_config(updated)
+        _print({
+            "state": "configured",
+            "selected_chats": len(selected),
+            "aliases": [chat["alias"] for chat in selected],
+        })
+        return 0
+    if args.command == "clear-selected-chats":
+        updated = dict(config)
+        updated["resource_backup_selected_chats"] = []
+        save_config(updated)
+        _print({"state": "configured", "selected_chats": 0})
+        return 0
+
     if args.command == "set-target":
         target = normalize_path_value(args.path)
         if not target:
@@ -140,7 +192,7 @@ def main(argv=None):
         interval = (
             args.interval_seconds
             if args.interval_seconds is not None
-            else config.get("google_drive_file_sync_interval_seconds", 300)
+            else config.get("resource_backup_interval_seconds", 300)
         )
         result = install_resource_backup_agent(PROJECT_DIR, interval)
         _print(result)
@@ -202,6 +254,7 @@ def main(argv=None):
         if backup_state in {
             "invalid_target", "target_failed", "target_not_configured",
             "destination_unavailable", "no_selected_chats", "worker_busy",
+            "pending_resources",
         }:
             state = backup_state
         result = {

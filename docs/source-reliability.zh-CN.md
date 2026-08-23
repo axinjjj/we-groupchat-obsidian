@@ -1,17 +1,18 @@
-# 来源可靠性：source guard、本地 CAS、Google Drive 直传与 filesystem backup
+# 来源可靠性：source guard、本地 CAS、mounted backup、可选 Drive API 与 filesystem snapshot
 
-这一层故意拆成四项互不冒充的责任：
+这一层故意拆成五项互不冒充的责任：
 
 1. 可选 WeChat source guard：只负责在安全状态下请求 macOS 正常打开微信；
 2. Attachment catalog 与本机私有 content-addressed archive；
-3. Selected-chat files 直传用户授权的 Google Drive；
-4. 可选、provider-neutral 的 filesystem snapshot target。
+3. 默认 no-OAuth selected-resource mounted handoff；
+4. 可选 advanced selected-chat Drive API sync；
+5. 面向更广 attachment archive 的 provider-neutral filesystem snapshot target。
 
 它们不是一个永不退出的“大守护进程”。`TopicMonitor` 负责读消息与 checkpoint，
 不 import、也不调用 source guard。Knowledge transaction 负责登记 attachment mention；
-commit 之后的 worker 才负责找 bytes 和复制。Backup 命令只读本机 immutable archive object，
-并且只写 configured filesystem target。Selected-chat scanner 则拥有独立 cursor/queue；即使消息没有
-Knowledge hit，也可以复用同一个本地 CAS。
+commit 之后的 worker 才负责找 bytes 和复制。Mounted backup 只读本机 immutable archive object，
+并且只写自己的 configured filesystem target。两条 selected-chat scanner 各有独立 cursor/selection；
+即使消息没有 Knowledge hit，也可以复用同一个本地 CAS。
 
 ## 1. 可选 WeChat source guard
 
@@ -189,10 +190,95 @@ low-space failure 进入正常的 due-only retry schedule。
 `--limit` 是 batch size，不是本次总上限；worker 一旦获得 lock，会在退出前 drain 所有 fresh 与
 当前已 due 的 rows。
 
-## 4. Selected-chat files → Google Drive 直传
+## 4. 默认 selected-resource mounted backup
 
-这是日常自动文件备份主线。它独立于 `TopicMonitor`、Knowledge selection、source guard 与 filesystem
-snapshot：
+这是默认 Google Drive 路径：把 selected-chat links、selected file occurrences 与共享 CAS bytes
+交给已经存在的 mounted filesystem，例如 Google Drive for Desktop。它不创建 Google Cloud project、
+不索取 OAuth credentials、不调用 Drive API，也不做 browser automation。
+
+```text
+active monitor chats
+  intersect resource_backup_selected_chats
+  -> 每群 × message-shard occurrence capture
+  -> exact URL metadata + 共享本地 SHA-256 CAS
+  -> 本地 Obsidian resource index
+  -> mounted target objects / catalog snapshots / views
+```
+
+Mounted lane 与可选 direct API lane 的 disclosure selection 完全独立：
+`resource_backup_selected_chats` 只控制 mounted lane；
+`google_drive_file_sync_selected_chats` 只控制可选 API lane。选择一边不会启用另一边。
+
+### Private selection 与本地 policy
+
+Mounted-backup defaults 全部 private、opt-in：
+
+```json
+{
+  "resource_backup_selected_chats": [],
+  "resource_backup_interval_seconds": 300,
+  "resource_backup_max_messages_per_scan": 500,
+  "resource_backup_min_free_bytes": 1073741824
+}
+```
+
+先列出 active monitor chats；输出不会打印 raw `@chatroom` identifier。再用列表编号替换 mounted
+backup selection：
+
+```bash
+.venv/bin/python scripts/resource_backup.py list-chats
+.venv/bin/python scripts/resource_backup.py set-selected-chats 1
+.venv/bin/python scripts/resource_backup.py clear-selected-chats
+```
+
+Target 与 link-export policy 存在独立 private `resource_backup.json` 中。目标目录必须已经存在；
+worker 不会在 mount 缺失时把那个路径重新创建成普通本地目录。
+
+```bash
+.venv/bin/python scripts/resource_backup.py set-target "<已经存在的挂载目录>"
+.venv/bin/python scripts/resource_backup.py set-link-export-mode redacted
+.venv/bin/python scripts/resource_backup.py init
+.venv/bin/python scripts/resource_backup.py status
+.venv/bin/python scripts/resource_backup.py plan
+.venv/bin/python scripts/resource_backup.py run --resolve-limit 10
+.venv/bin/python scripts/resource_backup.py verify
+```
+
+`init` 只初始化 from-now cursors。`run` 捕获 deterministic occurrences、把 due files resolve 到共享
+CAS、即使 target 不可用也继续刷新本地 Obsidian index，然后才尝试 mounted handoff。
+
+```text
+<target>/wgo-resource-backup/v3/
+  objects/sha256/...
+  snapshots/<snapshot-id>/{manifest.json,resources.jsonl,COMPLETE}
+  views/<chat>/...
+```
+
+Plan 与 run 都拒绝 filesystem root、与本地 source 相同/嵌套/祖先关系的 target、configured-target
+symlink，以及 app-owned subtree 中的 symlink/non-directory component。第一次复制会边写边 hash，并立即
+readback target bytes。后续 scheduled run 只信任本地 delivery receipt、regular-file type 与 logical size，
+避免重新 hydrate streamed placeholder；显式 `verify` 才完整 rehash target。
+
+`sync_delegated` 只表示 resolved bytes 已写入 mounted filesystem 并立即验证；它绝不表示 provider-side
+upload 或 remote checksum verification。如果仍有 eligible file unresolved，系统可以发布 hash-bound
+`COMPLETE` catalog snapshot，但 run state 必须是 `pending_resources`，manifest 记录
+`snapshot_completeness=catalog_complete`，CLI 非零退出。`COMPLETE` 绑定 catalog，不会凭空补出缺失 bytes。
+
+一个 manual canary 从另一 Drive surface 验证以后，才显式安装短命 scheduler：
+
+```bash
+.venv/bin/python scripts/resource_backup.py install-agent --interval-seconds 300
+.venv/bin/python scripts/resource_backup.py agent-status
+.venv/bin/python scripts/resource_backup.py uninstall-agent
+```
+
+Agent 使用 `RunAtLoad + StartInterval`、`ProcessType=Background`、`LowPriorityIO`，没有 `KeepAlive`；
+每次 wake 只运行一个 bounded process 然后退出。安装是 activation action，merge source 不会自动安装。
+
+## 5. 可选 advanced selected-chat Google Drive API 直传
+
+这是为明确需要 Drive-native object/shortcut 的用户保留的可选 advanced transport。它独立于
+`TopicMonitor`、Knowledge selection、source guard 与 filesystem snapshot：
 
 ```text
 用户选定的微信群聊
@@ -325,7 +411,7 @@ backfill 或上传。菜单栏的 **Google Drive 群文件备份** submenu 提�
 CLI 的 `auth-status` 会验证 refresh token；`auth_required`、`retry_wait`、`remote_degraded`、
 `source_degraded` 和 failed one-shot result 返回非零 exit status，避免 shell 或 scheduler 把错误 JSON 当成功。
 
-## 5. 可选 filesystem backup target
+## 6. 可选 filesystem backup target
 
 Backup layer 只认识 filesystem path。它没有 Google Drive、Dropbox、iCloud 或其他 provider API，
 不保存 OAuth token/provider credential。Target 可以位于 provider desktop sync folder 内，
@@ -383,18 +469,27 @@ cloud-upload verification。`restore-plan` 是 read-only，只统计 target 上�
 的 object 数量与 bytes；它读取 snapshot catalog 并直接扫描本地 CAS，因此本地 Knowledge
 DB/catalog 缺失时仍能工作。这一 tranche 故意没有 automatic restore 或删除功能。
 
-## 6. Health 与安全 rollout
+## 7. Health 与安全 rollout
 
-Redacted health check 现在会报告 source guard effective state、last result、剩余 restart budget、
-source freshness、attachment catalog counts/object count，以及 optional backup target 是否存在
-complete snapshot；同时报告 privacy-safe Drive 状态：auth、enabled/paused、selected chat count、queue
-counts、last scan/upload、next retry、root state、object/shortcut count 与 last error code：
+Redacted health check 会报告 source guard、source freshness、attachment catalog、optional attachment
+snapshot 与 privacy-safe optional direct-Drive state。Mounted resource backup 当前有独立 status surface：
 
 ```bash
 .venv/bin/python scripts/health_check.py
+.venv/bin/python scripts/resource_backup.py status
 ```
 
-第一次安全启用 Direct Drive 建议按下面顺序：
+第一次安全启用 mounted backup 建议按下面顺序：
+
+1. 保持 optional direct API lane disabled；
+2. 用 `list-chats` 查看 active chats，按编号只选择一个无敏感 canary，再执行 `init`；
+3. 在 mounted provider root 下选择一个已经存在的目录；
+4. 先跑 `plan`，然后在 from-now cursor 之后发送一个无敏感 link 与一个 small file；
+5. 显式运行一次 `run` 与 `verify`，检查 occurrence/CAS、Obsidian index、mounted object 与 catalog snapshot；
+6. 从另一个 Drive surface 确认 provider-side arrival，因为 `sync_delegated` 不是 remote verification；
+7. 最后才安装 300 秒短命 resource-backup agent。
+
+可选 advanced Direct Drive API rollout 仍然独立：
 
 1. 准备自己的 Google Cloud Installed desktop app OAuth client JSON；
 2. 只执行 `auth`，用 `auth-status` 确认，不 enable；
@@ -404,10 +499,10 @@ counts、last scan/upload、next retry、root state、object/shortcut count 与 
 6. 审查 counts 后才决定是否运行历史 `--apply`；
 7. 激活后重新跑 redacted health check。
 
-Source guard 与 filesystem snapshot 各有自己的 rollout：先看 status/plan，未单独审查前保持 disabled 或
-unconfigured。
+Source guard 与更广 attachment filesystem snapshot 各有自己的 rollout：先看 status/plan，未单独审查前
+保持 disabled 或 unconfigured。
 
-安装/加载 source guard、Google auth、选群、enable direct sync、两类历史 backfill apply、写真实
-filesystem target、清理微信 cache 与删除 Drive 文件，始终是分开的 operational actions。Source
-availability、本机保存、filesystem target-byte verification 与已验证的 Drive object/shortcut state
-也是不同事实。
+安装/加载 source guard、选择 mounted-backup chats、写真实 mounted target、安装 resource agent、为可选
+API lane 做 Google auth/选群/enable、执行任何历史 backfill、清理微信 cache 与删除 Drive 文件，始终是
+分开的 operational actions。Source availability、本机保存、mounted target-byte verification、File
+Provider upload state 与已验证的 Drive API object/shortcut state 也是不同事实。

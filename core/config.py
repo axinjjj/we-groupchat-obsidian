@@ -78,6 +78,10 @@ DEFAULT_CONFIG = {
     "attachment_archive_retry_base_seconds": 300,
     "attachment_archive_retry_max_seconds": 6 * 60 * 60,
     "attachment_backup_target": "",
+    "resource_backup_selected_chats": [],
+    "resource_backup_interval_seconds": 300,
+    "resource_backup_max_messages_per_scan": 500,
+    "resource_backup_min_free_bytes": 1024 * 1024 * 1024,
     "google_drive_file_sync_enabled": False,
     "google_drive_file_sync_paused": False,
     "google_drive_file_sync_selected_chats": [],
@@ -218,6 +222,12 @@ def selected_drive_sync_chats(config: dict) -> list[dict]:
     return _sanitize_drive_chat_list(config.get("google_drive_file_sync_selected_chats"))
 
 
+def selected_resource_backup_chats(config: dict) -> list[dict]:
+    """Return the mounted-backup disclosure selection, independent of OAuth sync."""
+    config = config if isinstance(config, dict) else {}
+    return _sanitize_drive_chat_list(config.get("resource_backup_selected_chats"))
+
+
 def active_monitor_chats(config: dict) -> list[dict]:
     """Return sanitized active chats, preserving the supported v1 singleton form."""
     config = config if isinstance(config, dict) else {}
@@ -258,6 +268,12 @@ def _sanitize_config(saved):
     if isinstance(selected_drive_chats, list):
         cfg["google_drive_file_sync_selected_chats"] = _sanitize_drive_chat_list(
             selected_drive_chats
+        )
+
+    selected_resource_chats = saved.get("resource_backup_selected_chats")
+    if isinstance(selected_resource_chats, list):
+        cfg["resource_backup_selected_chats"] = _sanitize_drive_chat_list(
+            selected_resource_chats
         )
 
     cfg["monitor_chat_aliases"] = _sanitize_chat_map(saved.get("monitor_chat_aliases"))
@@ -318,6 +334,9 @@ def _sanitize_config(saved):
         "attachment_archive_min_free_bytes": (0, 1024 * 1024 * 1024 * 1024),
         "attachment_archive_retry_base_seconds": (1, 86400),
         "attachment_archive_retry_max_seconds": (1, 604800),
+        "resource_backup_interval_seconds": (60, 86400),
+        "resource_backup_max_messages_per_scan": (1, 5000),
+        "resource_backup_min_free_bytes": (0, 1024 * 1024 * 1024 * 1024),
         "google_drive_file_sync_interval_seconds": (60, 86400),
         "google_drive_file_sync_max_messages_per_scan": (1, 5000),
         "google_drive_file_sync_max_uploads_per_run": (1, 1000),
