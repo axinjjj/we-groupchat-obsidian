@@ -1,16 +1,17 @@
-import os
 import shlex
 import subprocess
 import unittest
+
+from tests.paths import repo_path
 
 
 class StartupHelperTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.helper = os.path.join(os.path.dirname(__file__), "scripts", "startup_helpers.sh")
+        cls.helper = repo_path("scripts", "startup_helpers.sh")
 
     def run_helper(self, command, stdin=""):
-        script = f"source {shlex.quote(self.helper)}; {command}"
+        script = f"source {shlex.quote(str(self.helper))}; {command}"
         return subprocess.run(
             ["bash", "-c", script],
             input=stdin,
@@ -61,7 +62,7 @@ class StartupHelperTests(unittest.TestCase):
                 )
 
     def test_launcher_confirms_before_environment_changes(self):
-        launcher = os.path.join(os.path.dirname(__file__), "启动.command")
+        launcher = repo_path("启动.command")
         with open(launcher, encoding="utf-8") as handle:
             contents = handle.read()
 

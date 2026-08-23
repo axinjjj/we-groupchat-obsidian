@@ -8,6 +8,7 @@ from core.config import (
     _sanitize_config,
     active_monitor_chats,
     merge_monitor_chat_preferences,
+    selected_resource_backup_chats,
     selected_drive_sync_chats,
 )
 from core.taxonomy_assignment import FREE_FORM_PROFILE
@@ -125,6 +126,13 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(DEFAULT_CONFIG["attachment_archive_max_object_bytes"], 512 * 1024 * 1024)
         self.assertEqual(DEFAULT_CONFIG["attachment_archive_min_free_bytes"], 1024 * 1024 * 1024)
         self.assertEqual(DEFAULT_CONFIG["attachment_backup_target"], "")
+        self.assertEqual(DEFAULT_CONFIG["resource_backup_selected_chats"], [])
+        self.assertEqual(DEFAULT_CONFIG["resource_backup_interval_seconds"], 300)
+        self.assertEqual(DEFAULT_CONFIG["resource_backup_max_messages_per_scan"], 500)
+        self.assertEqual(
+            DEFAULT_CONFIG["resource_backup_min_free_bytes"],
+            1024 * 1024 * 1024,
+        )
         self.assertFalse(DEFAULT_CONFIG["google_drive_file_sync_enabled"])
         self.assertFalse(DEFAULT_CONFIG["google_drive_file_sync_paused"])
         self.assertEqual(DEFAULT_CONFIG["google_drive_file_sync_selected_chats"], [])
@@ -216,6 +224,41 @@ class ConfigTests(unittest.TestCase):
             invalid["attachment_archive_min_free_bytes"],
             DEFAULT_CONFIG["attachment_archive_min_free_bytes"],
         )
+
+    def test_resource_backup_selection_is_private_and_independent_from_oauth_lane(self):
+        cfg = _sanitize_config({
+            "google_drive_file_sync_selected_chats": [
+                {"username": "oauth@chatroom", "alias": "OAuth lane"},
+            ],
+            "resource_backup_selected_chats": [
+                {
+                    "username": " mounted@chatroom ",
+                    "alias": " Mounted lane ",
+                    "selected_since": 123,
+                },
+                {"username": "mounted@chatroom", "alias": "duplicate"},
+                {"username": "wxid_person", "alias": "ignored"},
+            ],
+            "resource_backup_interval_seconds": 600,
+            "resource_backup_max_messages_per_scan": 750,
+            "resource_backup_min_free_bytes": 2 * 1024 * 1024,
+        })
+
+        self.assertEqual(
+            selected_drive_sync_chats(cfg),
+            [{"username": "oauth@chatroom", "alias": "OAuth lane"}],
+        )
+        self.assertEqual(
+            selected_resource_backup_chats(cfg),
+            [{
+                "username": "mounted@chatroom",
+                "alias": "Mounted lane",
+                "selected_since": 123,
+            }],
+        )
+        self.assertEqual(cfg["resource_backup_interval_seconds"], 600)
+        self.assertEqual(cfg["resource_backup_max_messages_per_scan"], 750)
+        self.assertEqual(cfg["resource_backup_min_free_bytes"], 2 * 1024 * 1024)
 
     def test_monitor_chat_aliases_are_sanitized(self):
         cfg = _sanitize_config({

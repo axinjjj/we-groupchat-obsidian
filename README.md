@@ -2,7 +2,11 @@
 
 Local-first WeChat group chat summaries, monitor review, and Obsidian knowledge output.
 
-Status: source-only developer preview. Review the data-flow and account-safety notes before using it on real chat data.
+Status: functional, source-distributed macOS application. It has a menu-bar app,
+MCP server, operator CLIs, durable local state, recovery/backup workers and a
+full regression suite; review the data-flow and account-safety notes before
+using it on real chat data. A bundled Python runtime or signed installer is not
+currently distributed.
 
 A local-first macOS tool for reading your own WeChat desktop database, summarizing group chats, searching messages, and turning high-value group-chat updates into an Obsidian-friendly Markdown knowledge base.
 
@@ -112,7 +116,13 @@ Its most important boundaries are:
   content-addressed archive. An optional backup copies immutable objects to an
   ordinary filesystem target; verification proves the target bytes only, not a
   sync provider's cloud-upload state.
-- Direct Google Drive file sync is a separate, public-default-off path. It scans
+- The default selected-resource backup lane needs no OAuth: it intersects
+  actively monitored chats with an independent explicit selection, captures
+  exact link and file occurrences, resolves files into the shared CAS, and
+  delegates immutable objects plus privacy-bounded catalogs and Markdown views
+  to an existing mounted folder such as Google Drive for Desktop. A
+  `sync_delegated` receipt proves target bytes, not provider-side upload.
+- Direct Google Drive file sync is a separate, optional advanced path. It scans
   only user-selected chats with per-chat x message-shard cursors so a partial
   shard read cannot skip files. File messages need no Knowledge hit and enter
   the archive-owned provider-neutral CAS catalog. Each digest uploads once,
@@ -145,7 +155,8 @@ independently deployed microservices. Editable sources:
 - Opt-in attachment cataloging plus a private local content-addressed archive that deduplicates identical bytes; file and image kinds are selected explicitly.
 - Optional, separately installed WeChat source guard with grace, pause, restart budget, exponential backoff, content-free receipts, and no `KeepAlive` loop.
 - Provider-neutral filesystem snapshots for the attachment archive, including plan, run, verify, and read-only restore planning.
-- Opt-in selected-chat file sync directly to a user-authorized Google Drive, with a durable queue, global byte deduplication, chat/month shortcuts, retry/reconcile, and no automatic deletion.
+- Default no-OAuth selected-resource backup through an existing mounted filesystem such as Google Drive for Desktop, with exact link occurrences, shared-CAS files, Obsidian indexes, catalog snapshots, and honest `sync_delegated` receipts.
+- Optional advanced selected-chat file sync through the Google Drive API, with a separate selection/control plane, durable queue, chat/month shortcuts, retry/reconcile, and no automatic deletion.
 - Optional link preview context for public URLs; it is off by default and must be enabled explicitly.
 - CLI and `.command` maintenance entrypoints for users whose menu bar icon is hidden.
 - MCP server for read-only chat lookup, search, summaries, images, and optional UI-based sending.
@@ -295,7 +306,24 @@ Source reliability helpers:
 .venv/bin/python scripts/attachment_archive.py backfill
 .venv/bin/python scripts/attachment_archive.py backfill --apply
 
-# Direct selected-chat Google Drive files: auth, enable, selection, backfill, and upload are separate.
+# Default selected-resource mounted backup: no OAuth or Drive API.
+.venv/bin/python scripts/resource_backup.py list-chats
+.venv/bin/python scripts/resource_backup.py set-selected-chats 1
+.venv/bin/python scripts/resource_backup.py clear-selected-chats
+.venv/bin/python scripts/resource_backup.py set-target "<existing-mounted-directory>"
+.venv/bin/python scripts/resource_backup.py set-link-export-mode redacted
+.venv/bin/python scripts/resource_backup.py init
+.venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD
+.venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply
+.venv/bin/python scripts/resource_backup.py status
+.venv/bin/python scripts/resource_backup.py plan
+.venv/bin/python scripts/resource_backup.py run --resolve-limit 10
+.venv/bin/python scripts/resource_backup.py verify
+.venv/bin/python scripts/resource_backup.py install-agent --interval-seconds 300
+.venv/bin/python scripts/resource_backup.py agent-status
+.venv/bin/python scripts/resource_backup.py uninstall-agent
+
+# Optional advanced direct Google Drive API lane; OAuth and selection are separate from mounted backup.
 .venv/bin/python scripts/google_drive_file_sync.py auth --client-secrets "<installed-desktop-client.json>"
 .venv/bin/python scripts/google_drive_file_sync.py auth-status
 .venv/bin/python scripts/google_drive_file_sync.py status
@@ -319,14 +347,16 @@ Source reliability helpers:
 .venv/bin/python scripts/attachment_backup.py clear-target
 ```
 
-`install-agent` writes a one-shot `StartInterval` plist but does not load it;
-`--load-now` is the separate activation step. `attachment_archive.py backfill`
-and `google_drive_file_sync.py backfill` are dry plans unless `--apply` is
-present. Drive `enable` does not authenticate, select chats, backfill, or run an
+`wechat_source_guard.py install-agent` writes a one-shot `StartInterval` plist
+but does not load it; `--load-now` is the separate activation step.
+`resource_backup.py install-agent` installs and loads its short-lived scheduled
+worker and therefore belongs only after the manual canary. Mounted-resource,
+attachment-archive, and direct-Drive backfills are dry plans unless `--apply`
+is present. Drive `enable` does not authenticate, select chats, backfill, or run an
 upload. Backup `verify` checks bytes visible at the configured filesystem target
 and deliberately makes no claim about provider-side upload. See the
-[source reliability guide](docs/source-reliability.md) for Drive folder/OAuth
-contracts, states, resolver rules, storage layout, and failure boundaries.
+[source reliability guide](docs/source-reliability.md) for mounted handoff,
+optional Drive API, states, resolver rules, storage layout, and failure boundaries.
 
 ### Guarded exact relation Markdown cleanup
 
@@ -517,11 +547,72 @@ The old `mcp_enable_send_message: true` setting is still read as a backward-comp
 
 Real sends use a two-step confirmation flow. First call `prepare_send_message(text, chat_name)` and show the returned nonce, target, text preview, and expiry to the user. Only after the user confirms, call `confirm_send_message(nonce, text, chat_name)` with the exact same target and text. The compatibility `send_message` tool now prepares a nonce in real-send modes instead of sending immediately.
 
+## Repository Layout
+
+```text
+app.py                   # macOS menu-bar application entrypoint
+mcp_server.py            # FastMCP server entrypoint
+setup.py                 # py2app packaging entrypoint
+ai/                      # replaceable AI provider adapters
+core/                    # domain logic, durable state, privacy and reliability contracts
+ui/                      # reusable UI components
+scripts/                 # thin operator and LaunchAgent one-shot entrypoints
+tests/                   # importable unittest package
+c_src/                   # macOS WeChat key scanner
+resources/               # app and menu-bar assets
+docs/                    # user, operator, architecture and formal-contract documentation
+*.command                # Finder-friendly macOS entrypoints
+```
+
+The three root-level Python files are deliberate application/build entrypoints,
+not loose domain modules. New reusable behavior belongs in `core/`, `ai/`, or
+`ui/`; operator orchestration belongs in `scripts/`; tests belong in `tests/`.
+This keeps the current import and py2app contract stable without maintaining a
+second compatibility package around the same implementation.
+
+```mermaid
+flowchart LR
+  subgraph Root["Stable repository surfaces"]
+    APP["app.py<br/>menu bar + py2app target"]
+    MCP["mcp_server.py<br/>FastMCP stdio"]
+    SETUP["setup.py<br/>alias-app build"]
+  end
+  subgraph Packages["Reusable implementation"]
+    AI["ai/<br/>providers"]
+    CORE["core/<br/>state + domain contracts"]
+    UI["ui/<br/>reusable UI"]
+  end
+  SCRIPTS["scripts/<br/>one-shot operators"]
+  TESTS["tests/<br/>unittest package"]
+  AGENTS["LaunchAgents<br/>absolute checkout paths"]
+  BUNDLE["Alias app bundle<br/>checkout + .venv"]
+  CLIENTS["MCP clients<br/>absolute mcp_server.py"]
+
+  APP --> AI
+  APP --> CORE
+  APP --> UI
+  MCP --> AI
+  MCP --> CORE
+  SCRIPTS --> CORE
+  SETUP --> BUNDLE
+  AGENTS --> BUNDLE
+  AGENTS --> SCRIPTS
+  CLIENTS --> MCP
+  TESTS -. "validates" .-> Root
+  TESTS -. "validates" .-> Packages
+```
+
+The source checkout is currently part of the deployment ABI: the alias bundle,
+MCP configuration and scheduled workers resolve absolute checkout paths. A
+future `src/we_groupchat_obsidian/` migration becomes worthwhile when these
+surfaces target installed executables and a standalone bundle instead.
+
 ## Development
 
 ```bash
-.venv/bin/python -m unittest discover -p 'test_*.py'
-.venv/bin/python -m py_compile app.py mcp_server.py core/launch_agent.py core/monitor.py core/knowledge.py core/config.py core/wechat_db.py core/daily_digest.py core/link_preview.py core/notification_target.py core/notification_identity.py core/review_queue.py core/mcp_send_confirmation.py core/mcp_send_policy.py core/google_drive_auth.py core/google_drive_client.py core/google_drive_file_sync.py scripts/google_drive_file_sync.py scripts/health_check.py scripts/refresh_data_source.py scripts/daily_digest.py scripts/review_queue.py scripts/organize_obsidian.py scripts/autostart.py
+.venv/bin/python -m unittest discover -s tests -t . -p 'test_*.py'
+.venv/bin/python -m unittest -v tests.test_resource_backup
+.venv/bin/python -m compileall -q app.py mcp_server.py setup.py ai core ui scripts tests
 bash -n 启动.command
 bash -n 刷新数据源.command
 ```
