@@ -92,14 +92,15 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
   Attachment mention 与 Knowledge event 在同一个 transaction 里提交；定位和复制 bytes 发生在 commit 之后，
   所以归档失败不会回滚 event，也不会倒退 monitor checkpoint。Markdown 主题笔记、日期索引与 Daily Digest
   都是可重建 projection，遵循“先提交 SQLite，再投影”。
-- 可选 source guard 是独立 control plane，不属于 `TopicMonitor`。它只会在 grace、restart budget 和 backoff
-  判定通过后，请求 macOS 正常后台打开微信；不会 kill / re-sign 微信，不操作 UI 或登录，也不会把
-  `process lookup unknown` 当成“微信不存在”。
+- 可选 source guard 是独立 control plane，不属于 `TopicMonitor`。它的 timer 位于长驻菜单栏 app 内，
+  让受保护的微信访问维持同一个 process identity，而不是被短命 wake 反复索要授权。它只会在 grace、
+  restart budget 和 backoff 判定通过后，请求 macOS 正常后台打开微信；不会 kill / re-sign 微信，
+  不操作 UI 或登录，也不会把 `process lookup unknown` 当成“微信不存在”。
 - 文件附件可以进入本机私有的 SHA-256 content-addressed archive，同一份 bytes 只保留一个 object。
   可选 backup 只把 immutable objects 复制到普通 filesystem target；验证的是目标目录 bytes，
   不是 sync provider 的云端上传状态。
 - 默认 selected-resource backup lane 不需要 OAuth：它取 active monitor chats 与独立显式 selection 的交集，
-  捕获 exact link / file occurrences，把文件解析进共享 CAS，再把 immutable objects、privacy-bounded catalog
+  捕获 exact link / file metadata occurrences；只有显式开启时才把文件解析进共享 CAS，再把 immutable objects、privacy-bounded catalog
   与 Markdown views 交给 Google Drive for Desktop 等现有 mounted folder。`sync_delegated` 只证明 target bytes，
   不证明 provider-side upload。
 - Direct Google Drive 文件同步是另一条可选 advanced lane：只扫描用户选定群聊，以 per-chat ×
@@ -127,7 +128,7 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
 - 按日期浏览：全局和每个群聊各有一份 link-only `00-按日期.md`，串起完整笔记历史而不复制正文。
 - Resource Lead：识别“可以私发 / 晚点发 / repo 还没公开 / 求一份”这类资源还没出现但值得追问的窗口。
 - 附件 catalog 与本地 content-addressed archive：archive 默认关闭；启用后相同 bytes 自动 dedup，图片仍需单独 opt-in。
-- 可选、单独安装的微信 source guard：grace、pause、restart budget、exponential backoff、content-free receipts，且没有 `KeepAlive` busy loop。
+- 可选、运行在长驻菜单栏 runtime 内的微信 source guard：grace、pause、restart budget、exponential backoff 与 content-free receipts。
 - Provider-neutral filesystem snapshot：支持 attachment archive 的 plan、run、verify 和只读 restore plan。
 - 默认 no-OAuth selected-resource mounted backup：把 exact links 与共享 CAS files 交给现有 Google Drive for Desktop 等挂载目录，同时生成轻量 Obsidian index、catalog snapshot 和诚实的 `sync_delegated` receipt。
 - 可选 advanced Google Drive API lane：拥有独立 selection/control plane、durable queue、群聊/月 shortcut 与 retry/reconcile，不自动删除。
@@ -141,6 +142,8 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
 
 - 程序读取本机微信数据库副本，不修改微信聊天数据库。
 - 首次提取数据库 key，或微信更新后重新提取 key，可能需要对 `WeChat.app` 做 ad-hoc re-sign。脚本不会在普通双击启动时偷偷执行这一步，必须显式运行带 `--allow-wechat-resign` 的命令。
+- macOS 可能在每次菜单 app 进程启动时询问一次 WeChat App Data 权限。项目不会再调度短命 source/resource
+  worker 反复消耗这个 process-lifetime consent；附件 bytes 解析另有显式开关，links-only backfill 不读取附件 cache。
 - 聊天内容会发送给你自己配置的 AI provider。使用 Ollama 本地模型时，内容可以完全不离开本机；使用云端 provider 时，请按对应服务的隐私规则自行判断。
 - API Key 存储在 macOS Keychain，不写入 repo。
 - 本地配置、书签、monitor state、数据库 key、日志、SQLite DB 和 Markdown 导出默认在 `~/.we-groupchat-obsidian/` 或你的 Obsidian vault 中，不应该提交到 git。旧 `~/.wechat-summary/` 只作为本机 migration/compatibility 路径保留。
@@ -264,15 +267,14 @@ source install 与 LaunchAgent 继续使用。
 Source reliability 运维脚本：
 
 ```bash
-# Source guard 默认关闭；enable 与安装/加载 LaunchAgent 是三件分开的事。
+# Source guard 默认关闭；长驻菜单 app 负责 timer。
 .venv/bin/python scripts/wechat_source_guard.py status
 .venv/bin/python scripts/wechat_source_guard.py enable
 .venv/bin/python scripts/wechat_source_guard.py pause --hours 8
 .venv/bin/python scripts/wechat_source_guard.py pause --indefinite
 .venv/bin/python scripts/wechat_source_guard.py resume
 .venv/bin/python scripts/wechat_source_guard.py check
-.venv/bin/python scripts/wechat_source_guard.py install-agent
-.venv/bin/python scripts/wechat_source_guard.py install-agent --load-now
+# 仅用于移除旧版本留下的短命 agent。
 .venv/bin/python scripts/wechat_source_guard.py uninstall-agent
 
 # Attachment archive 默认关闭；历史 backfill 没有 --apply 时只输出 plan。
@@ -289,15 +291,24 @@ Source reliability 运维脚本：
 .venv/bin/python scripts/resource_backup.py set-target "<已经存在的挂载目录>"
 .venv/bin/python scripts/resource_backup.py set-link-export-mode redacted
 .venv/bin/python scripts/resource_backup.py init
+.venv/bin/python scripts/resource_backup.py enable
+.venv/bin/python scripts/resource_backup.py disable
+.venv/bin/python scripts/resource_backup.py backfill-links --all
+.venv/bin/python scripts/resource_backup.py backfill-links --all --apply
+.venv/bin/python scripts/resource_backup.py backfill-links --from YYYY-MM-DD
+.venv/bin/python scripts/resource_backup.py backfill-links --from YYYY-MM-DD --apply
 .venv/bin/python scripts/resource_backup.py backfill --all
 .venv/bin/python scripts/resource_backup.py backfill --all --apply
 .venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD
 .venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply
 .venv/bin/python scripts/resource_backup.py status
 .venv/bin/python scripts/resource_backup.py plan
-.venv/bin/python scripts/resource_backup.py run --resolve-limit 10
+.venv/bin/python scripts/resource_backup.py run
+.venv/bin/python scripts/resource_backup.py run --resolve-files --resolve-limit 10
+.venv/bin/python scripts/resource_backup.py enable-file-resolution
+.venv/bin/python scripts/resource_backup.py disable-file-resolution
 .venv/bin/python scripts/resource_backup.py verify
-.venv/bin/python scripts/resource_backup.py install-agent --interval-seconds 300
+# 以下两个命令只负责检查/移除旧 agent；不会再安装新 agent。
 .venv/bin/python scripts/resource_backup.py agent-status
 .venv/bin/python scripts/resource_backup.py uninstall-agent
 
@@ -325,13 +336,13 @@ Source reliability 运维脚本：
 .venv/bin/python scripts/attachment_backup.py clear-target
 ```
 
-`wechat_source_guard.py install-agent` 只写入 one-shot `StartInterval` plist，不会加载；`--load-now`
-才是单独的 activation。`resource_backup.py install-agent` 会安装并加载短命 scheduled worker，必须放在
-manual canary 通过之后。
+Source guard 与 mounted-resource scheduling 都位于长驻菜单 app。旧 `install-agent` 命令会拒绝创建新的
+短命 job；`uninstall-agent` 只为升级用户清理旧 plist。`backfill-links` 是 links-only plan/apply 入口：
+不读附件 bytes；任一 known shard 不完整时写入数必须为 0；完整扫描后才单事务提交。
 Mounted-resource、attachment-archive 与 direct-Drive backfill 默认都是 dry plan，只有显式
 `--apply` 才登记历史 item。Mounted-resource `backfill --all` 会扫描被选群聊在本地 WeChat shards
-里仍然可读的全部历史；它保持 idempotent，且不移动 live cursor。Drive `enable` 不会顺手 auth、
-选群、backfill 或 upload。Backup `verify`
+里仍然可读的全部历史；它保持 idempotent，且不移动 live cursor。普通 resource `run` 同样默认不解析
+附件，只有 `--resolve-files` 才显式开启。Drive `enable` 不会顺手 auth、选群、backfill 或 upload。Backup `verify`
 只验证 configured filesystem target 上看得到的 bytes，绝不宣称 provider-side upload 已完成。Drive
 mounted handoff、可选 Drive API、完整状态、resolver 规则、存储结构和失败边界见
 [来源可靠性指南](docs/source-reliability.zh-CN.md)。
@@ -368,10 +379,9 @@ identity，并使用仓库里的 `resources/app_icon.icns`，避免通知中心�
 ```
 
 这里的 `--alias` app 依赖当前源码目录和 `.venv`，适合本机 LaunchAgent /
-系统通知 identity，不是 standalone distributable build。只要这个 app bundle 存在，可选的
-source-guard 与 mounted-resource LaunchAgent 也会调用同一个 app executable 的短命 one-shot
-mode，让定时文件访问归在项目 app identity 下，而不是每 300 秒出现一只新的裸 `Python`。
-纯 source 安装没有 bundle 时，仍保留显式 `.venv/bin/python` fallback。
+系统通知 identity，不是 standalone distributable build。Source-guard 与 mounted-resource timer
+都运行在同一个长驻菜单 app 内。旧短命 mode 现在只返回 `long_lived_app_required`，不会触碰 protected
+data；对应 uninstall 命令负责移除历史 scheduled plist。
 
 ## Runtime Data Migration
 
@@ -619,11 +629,11 @@ flowchart LR
     CORE["core/<br/>状态 + domain contract"]
     UI["ui/<br/>可复用 UI"]
   end
-  SCRIPTS["scripts/<br/>one-shot operator"]
+  SCRIPTS["scripts/<br/>operator CLI"]
   LAUNCHERS["launchers/<br/>Finder entrypoints"]
   ROOTSTART["启动.command<br/>compatibility stub"]
   TESTS["tests/<br/>unittest package"]
-  AGENTS["LaunchAgents<br/>优先 app identity<br/>source Python fallback"]
+  AGENTS["Autostart LaunchAgent<br/>单一长驻菜单 app"]
   BUNDLE["Alias app bundle<br/>checkout + .venv"]
   CLIENTS["MCP clients<br/>绝对 mcp_server.py path"]
 
@@ -638,14 +648,13 @@ flowchart LR
   LAUNCHERS --> SCRIPTS
   SETUP --> BUNDLE
   AGENTS --> BUNDLE
-  AGENTS -. "source-only fallback" .-> SCRIPTS
   CLIENTS --> MCP
   TESTS -. "验证" .-> Root
   TESTS -. "验证" .-> Packages
 ```
 
-当前 source checkout 本身就是 deployment ABI 的一部分：alias bundle、MCP config 与 scheduled
-worker 都使用绝对 checkout path。只有当这些表面改为 installed executable，并且 app 可以成为
+当前 source checkout 本身就是 deployment ABI 的一部分：alias bundle、MCP config 与 autostart
+runtime 都使用绝对 checkout path。只有当这些表面改为 installed executable，并且 app 可以成为
 不依赖 source tree 的 standalone bundle 时，全面迁移到 `src/we_groupchat_obsidian/` 才真正值得。
 
 ## 开发与测试

@@ -109,16 +109,19 @@ Its most important boundaries are:
   monitor checkpoint. Markdown notes, date indexes, and Daily Digests are
   rebuildable projections: commit first, project second.
 - The optional source guard is a separate control-plane component, not part of
-  `TopicMonitor`. It can request a normal background WeChat launch after grace,
-  budget, and backoff checks, but it never kills or re-signs WeChat, drives its
-  UI, performs login, or treats an unknown process lookup as absence.
+  `TopicMonitor`. Its timer runs inside the long-lived menu-bar app so protected
+  WeChat access keeps one process identity instead of repeatedly prompting on
+  short-lived wakes. It can request a normal background WeChat launch after
+  grace, budget, and backoff checks, but never kills or re-signs WeChat, drives
+  its UI, performs login, or treats an unknown process lookup as absence.
 - File attachment bytes can be preserved in a private local SHA-256
   content-addressed archive. An optional backup copies immutable objects to an
   ordinary filesystem target; verification proves the target bytes only, not a
   sync provider's cloud-upload state.
 - The default selected-resource backup lane needs no OAuth: it intersects
   actively monitored chats with an independent explicit selection, captures
-  exact link and file occurrences, resolves files into the shared CAS, and
+  exact link and file metadata occurrences, optionally resolves explicitly
+  enabled files into the shared CAS, and
   delegates immutable objects plus privacy-bounded catalogs and Markdown views
   to an existing mounted folder such as Google Drive for Desktop. A
   `sync_delegated` receipt proves target bytes, not provider-side upload.
@@ -153,7 +156,7 @@ independently deployed microservices. Editable sources:
 - Global and per-chat link-only `00-按日期.md` maps for browsing the complete note history without duplicating note bodies.
 - Resource-lead detection for "can share privately / will share later / not public yet" situations where the artifact is not attached yet.
 - Opt-in attachment cataloging plus a private local content-addressed archive that deduplicates identical bytes; file and image kinds are selected explicitly.
-- Optional, separately installed WeChat source guard with grace, pause, restart budget, exponential backoff, content-free receipts, and no `KeepAlive` loop.
+- Optional WeChat source guard inside the long-lived menu-bar runtime, with grace, pause, restart budget, exponential backoff, and content-free receipts.
 - Provider-neutral filesystem snapshots for the attachment archive, including plan, run, verify, and read-only restore planning.
 - Default no-OAuth selected-resource backup through an existing mounted filesystem such as Google Drive for Desktop, with exact link occurrences, shared-CAS files, lightweight Obsidian indexes, catalog snapshots, and honest `sync_delegated` receipts.
 - Optional advanced selected-chat file sync through the Google Drive API, with a separate selection/control plane, durable queue, chat/month shortcuts, retry/reconcile, and no automatic deletion.
@@ -184,6 +187,10 @@ independently deployed microservices. Editable sources:
   metadata. The project does not delete Drive files, WeChat cache, or local CAS
   objects.
 - Extracting database keys may require ad-hoc re-signing `WeChat.app`. The regular double-click flow does not silently do this; commands that perform it are explicit.
+- macOS may ask once per menu-app process for access to WeChat App Data. The
+  project does not schedule short-lived source/resource workers that would make
+  that process-lifetime consent recur; attachment-byte resolution is a separate
+  explicit opt-in and link-only backfill never reads the attachment cache.
 - Cloud AI providers receive the text you ask them to summarize. Use Ollama if you want the AI step to stay local.
 - Remote link previews are disabled by default. If you set `monitor_fetch_links: true`, the app fetches public URLs found in monitored messages, and those remote sites may receive your request metadata. Link preview has a conservative SSRF guard, but it is still a best-effort public URL preview, not a hardened crawler.
 - MCP read tools expose local chat-derived data to the MCP client. Some management tools can mutate local metadata such as groups or config-derived state.
@@ -291,15 +298,14 @@ Monitor maintenance helpers:
 Source reliability helpers:
 
 ```bash
-# Optional source guard: disabled by default; enable and installation are separate.
+# Optional source guard: disabled by default; the long-lived menu app owns its timer.
 .venv/bin/python scripts/wechat_source_guard.py status
 .venv/bin/python scripts/wechat_source_guard.py enable
 .venv/bin/python scripts/wechat_source_guard.py pause --hours 8
 .venv/bin/python scripts/wechat_source_guard.py pause --indefinite
 .venv/bin/python scripts/wechat_source_guard.py resume
 .venv/bin/python scripts/wechat_source_guard.py check
-.venv/bin/python scripts/wechat_source_guard.py install-agent
-.venv/bin/python scripts/wechat_source_guard.py install-agent --load-now
+# Removes an obsolete short-lived agent if upgrading an older installation.
 .venv/bin/python scripts/wechat_source_guard.py uninstall-agent
 
 # Attachment archive: disabled by default; historical backfill is read-only unless --apply is explicit.
@@ -316,15 +322,24 @@ Source reliability helpers:
 .venv/bin/python scripts/resource_backup.py set-target "<existing-mounted-directory>"
 .venv/bin/python scripts/resource_backup.py set-link-export-mode redacted
 .venv/bin/python scripts/resource_backup.py init
+.venv/bin/python scripts/resource_backup.py enable
+.venv/bin/python scripts/resource_backup.py disable
+.venv/bin/python scripts/resource_backup.py backfill-links --all
+.venv/bin/python scripts/resource_backup.py backfill-links --all --apply
+.venv/bin/python scripts/resource_backup.py backfill-links --from YYYY-MM-DD
+.venv/bin/python scripts/resource_backup.py backfill-links --from YYYY-MM-DD --apply
 .venv/bin/python scripts/resource_backup.py backfill --all
 .venv/bin/python scripts/resource_backup.py backfill --all --apply
 .venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD
 .venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply
 .venv/bin/python scripts/resource_backup.py status
 .venv/bin/python scripts/resource_backup.py plan
-.venv/bin/python scripts/resource_backup.py run --resolve-limit 10
+.venv/bin/python scripts/resource_backup.py run
+.venv/bin/python scripts/resource_backup.py run --resolve-files --resolve-limit 10
+.venv/bin/python scripts/resource_backup.py enable-file-resolution
+.venv/bin/python scripts/resource_backup.py disable-file-resolution
 .venv/bin/python scripts/resource_backup.py verify
-.venv/bin/python scripts/resource_backup.py install-agent --interval-seconds 300
+# Legacy-agent inspection/removal only; new installation is refused.
 .venv/bin/python scripts/resource_backup.py agent-status
 .venv/bin/python scripts/resource_backup.py uninstall-agent
 
@@ -352,15 +367,17 @@ Source reliability helpers:
 .venv/bin/python scripts/attachment_backup.py clear-target
 ```
 
-`wechat_source_guard.py install-agent` writes a one-shot `StartInterval` plist
-but does not load it; `--load-now` is the separate activation step.
-`resource_backup.py install-agent` installs and loads its short-lived scheduled
-worker and therefore belongs only after the manual canary. Mounted-resource,
-attachment-archive, and direct-Drive backfills are dry plans unless `--apply`
-is present. Mounted-resource `backfill --all` scans all history still available
-in the selected chats' local WeChat shards; it remains idempotent and does not
-move live cursors. Drive `enable` does not authenticate, select chats, backfill,
-or run an upload. Backup `verify` checks bytes visible at the configured filesystem target
+Source-guard and mounted-resource scheduling live inside the long-running menu
+app. Their old `install-agent` commands reject new short-lived jobs; the
+`uninstall-agent` commands remain for upgrading users. `backfill-links` is a
+links-only plan/apply entry: it never reads attachment bytes, writes nothing if
+any known source shard is incomplete, and commits the completed scan in one
+transaction. Mounted-resource, attachment-archive, and direct-Drive backfills
+are dry plans unless `--apply` is present. Mounted-resource `backfill --all`
+scans all history still available in the selected chats' local WeChat shards;
+it remains idempotent and does not move live cursors. Ordinary resource `run`
+also skips attachment-byte resolution; `--resolve-files` is explicit. Drive
+`enable` does not authenticate, select chats, backfill, or run an upload. Backup `verify` checks bytes visible at the configured filesystem target
 and deliberately makes no claim about provider-side upload. See the
 [source reliability guide](docs/source-reliability.md) for mounted handoff,
 optional Drive API, states, resolver rules, storage layout, and failure boundaries.
@@ -445,11 +462,10 @@ For a local app-bundle LaunchAgent identity:
 
 The `--alias` app points back to this source checkout and its `.venv`; it is
 useful for local autostart notification identity, not as a standalone
-distributable build. When that app bundle exists, the optional source-guard and
-mounted-resource LaunchAgents also invoke short-lived modes of the same app
-executable. This keeps scheduled folder access under the project app identity
-instead of presenting a new bare `Python` process every interval. A source-only
-install without the bundle retains the explicit `.venv/bin/python` fallback.
+distributable build. Source-guard and mounted-resource timers run in that same
+long-lived menu app. The former short-lived modes now return
+`long_lived_app_required` without touching protected data, and their uninstall
+commands remove old scheduled plists.
 
 ## Runtime Data Migration
 
@@ -577,7 +593,7 @@ setup.py                 # py2app packaging entrypoint
 ai/                      # replaceable AI provider adapters
 core/                    # domain logic, durable state, privacy and reliability contracts
 ui/                      # reusable UI components
-scripts/                 # thin operator and LaunchAgent one-shot entrypoints
+scripts/                 # thin operator entrypoints and legacy-agent cleanup
 launchers/               # canonical Finder-friendly .command entrypoints
 tests/                   # importable unittest package
 c_src/                   # macOS WeChat key scanner
@@ -605,11 +621,11 @@ flowchart LR
     CORE["core/<br/>state + domain contracts"]
     UI["ui/<br/>reusable UI"]
   end
-  SCRIPTS["scripts/<br/>one-shot operators"]
+  SCRIPTS["scripts/<br/>operator CLIs"]
   LAUNCHERS["launchers/<br/>Finder entrypoints"]
   ROOTSTART["启动.command<br/>compatibility stub"]
   TESTS["tests/<br/>unittest package"]
-  AGENTS["LaunchAgents<br/>app identity preferred<br/>source Python fallback"]
+  AGENTS["Autostart LaunchAgent<br/>one long-lived menu app"]
   BUNDLE["Alias app bundle<br/>checkout + .venv"]
   CLIENTS["MCP clients<br/>absolute mcp_server.py"]
 
@@ -624,14 +640,13 @@ flowchart LR
   LAUNCHERS --> SCRIPTS
   SETUP --> BUNDLE
   AGENTS --> BUNDLE
-  AGENTS -. "source-only fallback" .-> SCRIPTS
   CLIENTS --> MCP
   TESTS -. "validates" .-> Root
   TESTS -. "validates" .-> Packages
 ```
 
 The source checkout is currently part of the deployment ABI: the alias bundle,
-MCP configuration and scheduled workers resolve absolute checkout paths. A
+MCP configuration and autostart runtime resolve absolute checkout paths. A
 future `src/we_groupchat_obsidian/` migration becomes worthwhile when these
 surfaces target installed executables and a standalone bundle instead.
 

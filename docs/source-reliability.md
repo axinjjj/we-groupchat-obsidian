@@ -9,8 +9,9 @@ This guide covers five deliberately separate responsibilities:
 4. optional advanced direct selected-chat sync to the Drive API; and
 5. a provider-neutral filesystem snapshot target for the broader attachment archive.
 
-They do not form a single always-on daemon. `TopicMonitor` reads messages and
-owns checkpoints; it does not import or invoke the source guard. The Knowledge
+They remain separate domain responsibilities even though protected-data timers
+share one long-lived menu-app process. `TopicMonitor` reads messages and owns
+checkpoints; it does not import or invoke the source guard. The Knowledge
 transaction owns attachment mentions; a post-commit worker owns byte copying.
 Each selected-chat scanner owns an independent cursor/selection and may reuse
 the same local CAS without a Knowledge hit. Mounted backup reads immutable local
@@ -18,32 +19,28 @@ archive objects and writes only to its configured filesystem target.
 
 ## 1. Optional WeChat source guard
 
-The source guard is disabled by default. Enabling its policy, installing its
-LaunchAgent plist, and loading that LaunchAgent are separate actions:
+The source guard is disabled by default. Its timer runs inside the long-lived
+menu-bar app; enabling the policy is the only activation step:
 
 ```bash
 .venv/bin/python scripts/wechat_source_guard.py status
 .venv/bin/python scripts/wechat_source_guard.py enable
-.venv/bin/python scripts/wechat_source_guard.py install-agent
-.venv/bin/python scripts/wechat_source_guard.py install-agent --load-now
+.venv/bin/python scripts/wechat_source_guard.py uninstall-agent  # legacy cleanup
 ```
 
-`install-agent` writes a separate one-shot `StartInterval` job. The plist has no
-`KeepAlive` key. Without `--load-now`, it is not bootstrapped. Each invocation
-runs one check, takes a non-blocking lock, persists a small private state file,
-and exits. If `WE_GROUPCHAT_OBSIDIAN_DATA_DIR` is set when the plist is built,
-the LaunchAgent preserves that override explicitly.
-
-When `dist/WeGroupchatObsidian.app` exists, the plist invokes its
-`--source-guard-run` one-shot mode so macOS attributes protected-folder access
-to the stable project app identity. Source-only installations retain the
-`.venv/bin/python scripts/wechat_source_guard_agent.py` fallback.
+Earlier versions scheduled a separate one-shot `StartInterval` job. macOS App
+Data consent is process-lifetime access: after that helper exited, its next wake
+could prompt again. New installs therefore refuse `install-agent`; the legacy
+`--source-guard-run` mode returns `long_lived_app_required` before reading
+protected data, while `uninstall-agent` remains idempotent cleanup. The ordinary
+autostart LaunchAgent owns one long-lived menu app, and the source guard uses an
+in-process timer plus a non-blocking lock.
 
 Process-list availability is proven by inspecting the guard process itself; it
 does not depend on whether a normal user session can see the system `launchd`.
 Source freshness uses exact stats for cached known `message/` shard paths and
 their WAL/SHM siblings. It never recursively walks the DB root or WeChat
-hardlink/cache trees, so the one-shot remains bounded in a LaunchAgent context.
+hardlink/cache trees, so each in-process check remains bounded.
 
 When process lookup confirms that WeChat is absent, the guard first enters a
 grace period. After grace, and only while restart budget and exponential
@@ -276,13 +273,18 @@ the worker never recreates a missing mount path.
 .venv/bin/python scripts/resource_backup.py set-target "<existing-mounted-directory>"
 .venv/bin/python scripts/resource_backup.py set-link-export-mode redacted
 .venv/bin/python scripts/resource_backup.py init
+.venv/bin/python scripts/resource_backup.py backfill-links --all
+.venv/bin/python scripts/resource_backup.py backfill-links --all --apply
+.venv/bin/python scripts/resource_backup.py backfill-links --from YYYY-MM-DD
+.venv/bin/python scripts/resource_backup.py backfill-links --from YYYY-MM-DD --apply
 .venv/bin/python scripts/resource_backup.py backfill --all
 .venv/bin/python scripts/resource_backup.py backfill --all --apply
 .venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD
 .venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply
 .venv/bin/python scripts/resource_backup.py status
 .venv/bin/python scripts/resource_backup.py plan
-.venv/bin/python scripts/resource_backup.py run --resolve-limit 10
+.venv/bin/python scripts/resource_backup.py run
+.venv/bin/python scripts/resource_backup.py run --resolve-files --resolve-limit 10
 .venv/bin/python scripts/resource_backup.py verify
 ```
 
@@ -291,9 +293,12 @@ private selection epoch and skips the unselected gap. Historical backfill is a
 separate dry-plan/apply command and does not move live cursors. `backfill --all`
 starts at timestamp zero and therefore means all history still available in the
 known local WeChat message shards, not an assurance about provider-retained
-remote history. `run` captures deterministic occurrences,
-resolves due files into the shared CAS, refreshes local Obsidian indexes even
-when the target is unavailable, and then attempts mounted handoff.
+remote history. `backfill-links` is the safe link-only entry: it scans
+shard-complete pages, never reads attachment bytes, writes zero rows when any
+known shard is degraded, and commits a complete apply in one SQLite transaction.
+Ordinary `run` captures deterministic metadata occurrences, skips file-byte
+resolution, refreshes local Obsidian indexes even when the target is
+unavailable, and then attempts mounted handoff. `--resolve-files` is explicit.
 
 The mounted subtree is:
 
@@ -323,24 +328,23 @@ missing bytes.
 Ordinary status reports `sync_delegated` only when the current catalog, target
 objects, valid latest `COMPLETE`, link mode, and manifest all agree. A missing
 snapshot or pending object reports `pending`; unresolved files report
-`pending_resources`. If WeChat source is unavailable, the one-shot CLI still
-resolves and hands off existing ledger/CAS state, emits structured JSON, and
-returns non-zero for the source outage.
+`pending_resources`. If WeChat source is unavailable, an explicit CLI run can
+still project and hand off existing ledger/CAS state, emits structured JSON,
+and returns non-zero for the source outage.
 
-After one manual canary is verified from another Drive surface, the optional
-short-lived scheduler can be installed explicitly:
+Background capture and projection are enabled in the long-lived menu app:
 
 ```bash
-.venv/bin/python scripts/resource_backup.py install-agent --interval-seconds 300
+.venv/bin/python scripts/resource_backup.py enable
+.venv/bin/python scripts/resource_backup.py disable
 .venv/bin/python scripts/resource_backup.py agent-status
-.venv/bin/python scripts/resource_backup.py uninstall-agent
+.venv/bin/python scripts/resource_backup.py uninstall-agent  # legacy cleanup
 ```
 
-The agent uses `RunAtLoad` plus `StartInterval`, `ProcessType=Background`, and
-`LowPriorityIO`, with no `KeepAlive`. Each wake runs one bounded process and
-exits. When the local app bundle exists it invokes `--resource-backup-run`
-through that executable; source-only installs retain the Python CLI fallback.
-Installing it is an activation action; merging source does not install it.
+File-byte resolution remains off by default and requires the menu confirmation
+or an explicit `enable-file-resolution` / `--resolve-files` action. Old resource
+LaunchAgent installs are detected and removable, but new installation is
+refused for the same process-lifetime consent reason.
 
 ## 5. Optional advanced direct selected-chat Google Drive API sync
 
@@ -409,7 +413,7 @@ Raw chat bodies are not stored in this database or its run receipts.
 positions live in `drive_scan_shards`. The other principal tables are
 `drive_sync_items`, `drive_objects`, `drive_placements`, `drive_folders`, and
 content-free `drive_sync_runs`. A non-blocking process lock makes menu timer, CLI, and app
-startup recovery safe callers of the same one-shot worker; there is no new
+startup recovery safe callers of the same bounded worker; there is no new
 infinite loop. Disabling or pausing prevents a new scan/upload. If the setting
 changes during one file, that file finishes safely and the worker stops before
 taking the next item.
@@ -609,7 +613,8 @@ A safe first mounted-backup rollout is:
    Obsidian index, mounted object, and catalog snapshot;
 6. confirm provider-side arrival from another Drive surface because
    `sync_delegated` is not remote verification; and
-7. only then install the 300-second short-lived resource-backup agent.
+7. only then enable the long-lived resource timer; leave file resolution off
+   unless attachment bytes are deliberately wanted.
 
 The optional advanced direct-Drive API rollout remains separate:
 
@@ -626,8 +631,9 @@ The source guard and broader attachment filesystem snapshot have their own
 rollouts: inspect their status/plan first and keep them disabled or unconfigured
 until separately reviewed.
 
-Installing/loading the source guard, selecting mounted-backup chats, writing a
-real mounted target, installing the resource agent, authorizing Google for the
+Enabling the source guard, selecting mounted-backup chats, writing a real
+mounted target, enabling the resource timer or attachment-byte resolution,
+authorizing Google for the
 optional API lane, selecting API-lane chats, enabling direct sync, applying any
 historical backfill, pruning WeChat cache data, and deleting Drive files are all
 separate operational actions. Source availability, local preservation, mounted

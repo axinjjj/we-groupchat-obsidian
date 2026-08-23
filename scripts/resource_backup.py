@@ -84,6 +84,7 @@ def _exit_code(result):
         "install_failed",
         "uninstall_failed",
         "script_missing",
+        "long_lived_app_required",
     }:
         return 2
     return 0
@@ -110,6 +111,10 @@ def build_parser():
     selected = sub.add_parser("set-selected-chats")
     selected.add_argument("indexes", nargs="+", type=int)
     sub.add_parser("clear-selected-chats")
+    sub.add_parser("enable")
+    sub.add_parser("disable")
+    sub.add_parser("enable-file-resolution")
+    sub.add_parser("disable-file-resolution")
     sub.add_parser("init")
     sub.add_parser("scan")
     backfill = sub.add_parser("backfill")
@@ -121,12 +126,29 @@ def build_parser():
         help="Scan all locally available history for the selected chats.",
     )
     backfill.add_argument("--apply", action="store_true")
+    backfill_links = sub.add_parser(
+        "backfill-links",
+        help="Plan/apply exact historical links without resolving attachment files.",
+    )
+    backfill_links_scope = backfill_links.add_mutually_exclusive_group(required=True)
+    backfill_links_scope.add_argument("--from", dest="from_date")
+    backfill_links_scope.add_argument(
+        "--all",
+        action="store_true",
+        help="Scan all locally available history for exact links.",
+    )
+    backfill_links.add_argument("--apply", action="store_true")
     resolve = sub.add_parser("resolve")
     resolve.add_argument("--limit", type=int, default=50)
     sub.add_parser("index")
     sub.add_parser("plan")
     run = sub.add_parser("run")
     run.add_argument("--resolve-limit", type=int, default=50)
+    run.add_argument(
+        "--resolve-files",
+        action="store_true",
+        help="Explicitly allow this run to read selected WeChat attachment files.",
+    )
     verify = sub.add_parser("verify")
     verify.add_argument("--snapshot-id", default="")
     target = sub.add_parser("set-target")
@@ -193,6 +215,29 @@ def main(argv=None):
         save_config(updated)
         _print({"state": "configured", "selected_chats": 0})
         return 0
+    if args.command in {
+        "enable",
+        "disable",
+        "enable-file-resolution",
+        "disable-file-resolution",
+    }:
+        updated = dict(config)
+        if args.command in {"enable", "disable"}:
+            updated["resource_backup_enabled"] = args.command == "enable"
+        else:
+            updated["resource_backup_file_resolution_enabled"] = (
+                args.command == "enable-file-resolution"
+            )
+        save_config(updated)
+        _print({
+            "state": "configured",
+            "background_enabled": bool(updated.get("resource_backup_enabled", False)),
+            "file_resolution_enabled": bool(
+                updated.get("resource_backup_file_resolution_enabled", False)
+            ),
+            "runtime": "long_lived_app",
+        })
+        return 0
 
     if args.command == "set-target":
         target = normalize_path_value(args.path)
@@ -240,6 +285,11 @@ def main(argv=None):
             0 if args.all else _from_timestamp(args.from_date),
             apply=args.apply,
         )
+    elif args.command == "backfill-links":
+        result = _capture(config, source=True).backfill_links(
+            0 if args.all else _from_timestamp(args.from_date),
+            apply=args.apply,
+        )
     elif args.command == "resolve":
         result = _capture(config).resolve_pending_files(limit=max(1, args.limit))
     elif args.command == "index":
@@ -259,6 +309,11 @@ def main(argv=None):
             "settings": {
                 "target": "configured" if load_resource_backup_settings()["target"] else "not configured",
                 "link_export_mode": load_resource_backup_settings()["link_export_mode"],
+                "background_enabled": bool(config.get("resource_backup_enabled", False)),
+                "file_resolution_enabled": bool(
+                    config.get("resource_backup_file_resolution_enabled", False)
+                ),
+                "runtime": "long_lived_app",
             },
             "capture": capture.status(),
             "backup": _backup(
@@ -270,7 +325,10 @@ def main(argv=None):
         }
     elif args.command == "run":
         capture = _capture(config, source=True)
-        capture_result = capture.run(resolve_limit=max(1, args.resolve_limit))
+        capture_result = capture.run(
+            resolve_limit=max(1, args.resolve_limit),
+            resolve_files=bool(args.resolve_files),
+        )
         backup_result = _backup(
             config,
             capture=capture,

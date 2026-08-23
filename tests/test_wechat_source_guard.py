@@ -15,7 +15,7 @@ from core.wechat_source_guard import (
     load_state,
     source_guard_status,
 )
-from scripts.wechat_source_guard import build_agent_plist
+from scripts.wechat_source_guard import agent_plist_path, install_agent, uninstall_agent
 
 
 class Clock:
@@ -266,57 +266,26 @@ class WeChatSourceGuardTests(unittest.TestCase):
 
 
 class SourceGuardLaunchAgentTests(unittest.TestCase):
-    def test_plist_is_one_shot_start_interval_without_keepalive(self):
+    def test_install_refuses_short_lived_worker_without_writing_plist(self):
         with tempfile.TemporaryDirectory() as tmp:
-            project = Path(tmp)
-            executable = (
-                project
-                / "dist"
-                / "WeGroupchatObsidian.app"
-                / "Contents"
-                / "MacOS"
-                / "WeGroupchatObsidian"
-            )
-            executable.parent.mkdir(parents=True)
-            executable.write_text("#!/bin/sh\n", encoding="utf-8")
-            executable.chmod(0o755)
-            payload = build_agent_plist(
-                {"wechat_source_guard_interval_seconds": 420},
-                project_dir=project,
-            )
-        self.assertEqual(payload["StartInterval"], 420)
-        self.assertNotIn("KeepAlive", payload)
-        self.assertEqual(
-            payload["ProgramArguments"],
-            [str(executable.resolve()), "--source-guard-run"],
-        )
+            path = Path(tmp) / "source-guard.plist"
+            result = install_agent({}, path=path)
+        self.assertEqual(result, 2)
+        self.assertFalse(path.exists())
 
-    def test_plist_falls_back_to_source_python_without_app_bundle(self):
+    def test_uninstall_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
-            project = Path(tmp)
-            payload = build_agent_plist({}, project_dir=project)
-
-        self.assertTrue(payload["ProgramArguments"][0].endswith("/.venv/bin/python"))
-        self.assertTrue(
-            payload["ProgramArguments"][1].endswith(
-                "/scripts/wechat_source_guard_agent.py"
-            )
-        )
-
-    def test_plist_preserves_explicit_data_dir_override(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project = Path(tmp)
-            data_dir = str(project / "private-data")
-            with patch.dict(
-                os.environ,
-                {"WE_GROUPCHAT_OBSIDIAN_DATA_DIR": data_dir},
-                clear=False,
+            home = Path(tmp)
+            path = home / "Library" / "LaunchAgents" / "guard.plist"
+            path.parent.mkdir(parents=True)
+            path.write_text("legacy", encoding="utf-8")
+            with (
+                patch("scripts.wechat_source_guard.agent_plist_path", return_value=path),
+                patch("scripts.wechat_source_guard._run", return_value=subprocess.CompletedProcess([], 0)),
             ):
-                payload = build_agent_plist({}, project_dir=project)
-        self.assertEqual(
-            payload["EnvironmentVariables"],
-            {"WE_GROUPCHAT_OBSIDIAN_DATA_DIR": data_dir},
-        )
+                self.assertEqual(uninstall_agent(), 0)
+                self.assertEqual(uninstall_agent(), 0)
+        self.assertFalse(path.exists())
 
 
 if __name__ == "__main__":

@@ -31,6 +31,10 @@ class SetupPy2AppTests(unittest.TestCase):
         self.assertEqual(plist["CFBundleName"], "WeGroupchatObsidian")
         self.assertIn("CFBundleDisplayName", plist)
         self.assertEqual(plist["CFBundleDisplayName"], "微信总结")
+        self.assertIn("NSAppDataUsageDescription", plist)
+        self.assertIn("显式开启文件解析", plist["NSAppDataUsageDescription"])
+        self.assertIn("NSDocumentsFolderUsageDescription", plist)
+        self.assertIn("NSFileProviderDomainUsageDescription", plist)
         self.assertTrue(plist["LSUIElement"])
 
     def test_py2app_uses_project_notification_icon(self):
@@ -42,7 +46,7 @@ class SetupPy2AppTests(unittest.TestCase):
     def test_py2app_does_not_package_repository_tests(self):
         self.assertNotIn("tests", self._setup_options()["packages"])
 
-    def test_py2app_packages_background_cli_dispatch_targets(self):
+    def test_py2app_packages_operator_cli_modules(self):
         self.assertIn("scripts", self._setup_options()["packages"])
 
     def test_setup_py_keeps_dependencies_in_requirements_file(self):

@@ -580,6 +580,124 @@ class ResourceBackupTests(unittest.TestCase):
             conn.close()
         self.assertEqual(cursor, 200)
 
+    def test_backfill_uses_cursor_complete_pages_across_filtered_rows(self):
+        messages = []
+        for timestamp in range(1, 121):
+            text = ""
+            if timestamp in {10, 60, 110}:
+                text = f"https://example.com/history/{timestamp}"
+            messages.append({
+                "timestamp": timestamp,
+                "source_message_id": f"source-{timestamp}",
+                "text": text,
+                "resources": [],
+            })
+
+        class CursorCompleteSource(FakeSource):
+            def get_messages_for_shard(self, *args, **kwargs):
+                return [
+                    row
+                    for row in super().get_messages_for_shard(*args, **kwargs)
+                    if row.get("text")
+                ]
+
+            def get_cursor_messages_for_shard(self, *args, **kwargs):
+                return super().get_messages_for_shard(*args, **kwargs)
+
+        capture = SelectedResourceCapture(
+            self.config,
+            source=CursorCompleteSource({self.selected: messages}),
+            now_func=lambda: 200,
+            archive_id_factory=lambda: "00000000-0000-0000-0000-000000000001",
+        )
+
+        planned = capture.backfill(0, apply=False)
+
+        self.assertEqual(planned["state"], "planned")
+        self.assertEqual(planned["scanned"], 120)
+        self.assertEqual(planned["discovered_links"], 3)
+
+    def test_links_only_backfill_never_queues_attachment_files(self):
+        source = FakeSource({
+            self.selected: [{
+                "timestamp": 100,
+                "source_message_id": "historical-resource",
+                "text": "https://example.com/history",
+                "resources": [{
+                    "kind": "file",
+                    "resource_index": 0,
+                    "original_name": "history.pdf",
+                }],
+            }],
+        })
+        capture = SelectedResourceCapture(
+            self.config,
+            source=source,
+            now_func=lambda: 200,
+            archive_id_factory=lambda: "00000000-0000-0000-0000-000000000001",
+        )
+
+        result = capture.backfill_links(0, apply=True)
+
+        self.assertEqual(result["state"], "applied")
+        self.assertEqual(result["mode"], "links_only")
+        self.assertTrue(result["source_complete"])
+        self.assertEqual(result["discovered_links"], 1)
+        self.assertEqual(result["discovered_files"], 0)
+        self.assertEqual(result["inserted_links"], 1)
+        self.assertEqual(result["inserted_files"], 0)
+        self.assertEqual(
+            [(row["kind"], row["observed_url"]) for row in capture.occurrences()],
+            [("link", "https://example.com/history")],
+        )
+
+    def test_links_only_backfill_writes_nothing_when_a_later_shard_degrades(self):
+        class PartialSource(FakeSource):
+            def get_message_shards(self, _username):
+                return ["healthy", "failed"]
+
+            def get_messages_for_shard(
+                self,
+                username,
+                source_shard_id,
+                since_ts=0,
+                limit=500,
+                page_forward=False,
+                since_inclusive=False,
+            ):
+                if source_shard_id == "failed":
+                    raise WeChatSourceDegraded("source_shard_unavailable")
+                return super().get_messages_for_shard(
+                    username,
+                    source_shard_id,
+                    since_ts=since_ts,
+                    limit=limit,
+                    page_forward=page_forward,
+                    since_inclusive=since_inclusive,
+                )
+
+        capture = SelectedResourceCapture(
+            self.config,
+            source=PartialSource({
+                self.selected: [{
+                    "timestamp": 100,
+                    "source_message_id": "visible-link",
+                    "text": "https://example.com/must-not-partially-commit",
+                    "resources": [],
+                }],
+            }),
+            now_func=lambda: 200,
+            archive_id_factory=lambda: "00000000-0000-0000-0000-000000000001",
+        )
+
+        result = capture.backfill_links(0, apply=True)
+
+        self.assertEqual(result["state"], "source_degraded")
+        self.assertFalse(result["source_complete"])
+        self.assertEqual(result["discovered_links"], 1)
+        self.assertEqual(result["inserted_links"], 0)
+        self.assertEqual(capture.occurrences(), [])
+
     def test_capture_run_reports_source_unavailable_instead_of_healthy(self):
         capture = SelectedResourceCapture(
             self.config,
@@ -593,6 +711,20 @@ class ResourceBackupTests(unittest.TestCase):
 
         self.assertEqual(result["state"], "source_unavailable")
         self.assertEqual(result["scan"]["state"], "source_unavailable")
+
+    def test_capture_run_can_skip_attachment_cache_without_resolver_access(self):
+        capture = self._capture()
+        capture.initialize_selected_chat_cursors(start_timestamp=0)
+
+        with patch.object(
+            capture,
+            "resolve_pending_files",
+            side_effect=AssertionError("must not touch attachment cache"),
+        ):
+            result = capture.run(resolve_files=False)
+
+        self.assertEqual(result["resolve"]["state"], "skipped")
+        self.assertEqual(result["resolve"]["reason"], "file_resolution_disabled")
 
     def test_occurrence_insert_and_cursor_advance_are_one_transaction(self):
         capture = self._capture()
@@ -1310,10 +1442,51 @@ class ResourceBackupCliTests(unittest.TestCase):
         capture.backfill.assert_called_once_with(0, apply=False)
         self.assertEqual(json.loads(output.getvalue())["state"], "planned")
 
+    def test_cli_backfill_links_is_an_explicit_links_only_plan(self):
+        output = io.StringIO()
+        capture = unittest.mock.Mock()
+        capture.backfill_links.return_value = {
+            "state": "planned",
+            "mode": "links_only",
+            "source_complete": True,
+            "discovered_links": 3,
+            "inserted_links": 0,
+        }
+        with (
+            patch.object(resource_backup_cli, "load_config", return_value=self.config),
+            patch.object(resource_backup_cli, "_capture", return_value=capture),
+            redirect_stdout(output),
+        ):
+            result = resource_backup_cli.main(["backfill-links", "--all"])
+
+        self.assertEqual(result, 0)
+        capture.backfill_links.assert_called_once_with(0, apply=False)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["mode"], "links_only")
+        self.assertTrue(payload["source_complete"])
+
+    def test_cli_enables_long_lived_updates_without_enabling_file_access(self):
+        output = io.StringIO()
+        config = dict(self.config)
+        config["resource_backup_enabled"] = False
+        config["resource_backup_file_resolution_enabled"] = False
+        with (
+            patch.object(resource_backup_cli, "load_config", return_value=config),
+            patch.object(resource_backup_cli, "save_config") as save,
+            redirect_stdout(output),
+        ):
+            result = resource_backup_cli.main(["enable"])
+
+        self.assertEqual(result, 0)
+        saved = save.call_args.args[0]
+        self.assertTrue(saved["resource_backup_enabled"])
+        self.assertFalse(saved["resource_backup_file_resolution_enabled"])
+        self.assertEqual(json.loads(output.getvalue())["runtime"], "long_lived_app")
+
     def test_cli_run_with_source_unavailable_still_handoffs(self):
         output = io.StringIO()
         capture = type("Capture", (), {})()
-        capture.run = lambda resolve_limit=50: {
+        capture.run = lambda resolve_limit=50, resolve_files=True: {
             "state": "source_unavailable",
             "scan": {"state": "source_unavailable"},
             "resolve": {"state": "healthy", "ready_local": 1},
@@ -1334,6 +1507,27 @@ class ResourceBackupCliTests(unittest.TestCase):
         self.assertEqual(payload["state"], "source_unavailable")
         self.assertEqual(payload["backup"]["state"], "sync_delegated")
         backup_factory.assert_called_once()
+
+    def test_cli_run_skips_file_resolution_unless_explicitly_requested(self):
+        output = io.StringIO()
+        capture = unittest.mock.Mock()
+        capture.run.return_value = {
+            "state": "healthy",
+            "scan": {"state": "healthy"},
+            "resolve": {"state": "skipped"},
+        }
+        backup = unittest.mock.Mock()
+        backup.run.return_value = {"state": "idle"}
+        with (
+            patch.object(resource_backup_cli, "load_config", return_value=self.config),
+            patch.object(resource_backup_cli, "_capture", return_value=capture),
+            patch.object(resource_backup_cli, "_backup", return_value=backup),
+            redirect_stdout(output),
+        ):
+            result = resource_backup_cli.main(["run"])
+
+        self.assertEqual(result, 0)
+        capture.run.assert_called_once_with(resolve_limit=50, resolve_files=False)
 
 
 if __name__ == "__main__":

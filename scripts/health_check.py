@@ -322,10 +322,11 @@ def main(argv: list[str] | None = None) -> int:
         f"backoff={guard.get('backoff_until') or '-'}; "
         f"freshness={guard.get('source_freshness') or 'unknown'}"
     )
-    guard_agent_ok = not guard_enabled or (guard_plist.exists() and guard_agent_status.loaded)
+    guard_agent_ok = not guard_plist.exists() and not guard_agent_status.loaded
     print(
-        f"[{ok(guard_agent_ok)}] Source guard LaunchAgent: "
-        f"installed={guard_plist.exists()}; loaded={guard_agent_status.loaded}"
+        f"[{ok(guard_agent_ok)}] Source guard runtime: long_lived_app; "
+        f"legacy_agent_installed={guard_plist.exists()}; "
+        f"legacy_agent_loaded={guard_agent_status.loaded}"
     )
     archive_enabled = bool(config.get("attachment_archive_enabled", False))
     archive_counts = attachment_archive.get("counts") or {}

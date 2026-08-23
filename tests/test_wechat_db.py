@@ -5,6 +5,7 @@ import sqlite3
 import struct
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from Crypto.Cipher import AES
 
@@ -59,6 +60,62 @@ class WeChatDBCacheRefreshTests(unittest.TestCase):
         self.assertEqual(after_table, self.table_name)
         self.assertTrue(os.path.exists(self.cache_path))
 
+    def test_decrypted_cache_publish_is_atomic_and_snapshot_is_pinned(self):
+        rel_path = "message/message_1.db"
+        encrypted_path = os.path.join(self.tmp.name, rel_path)
+        os.makedirs(os.path.dirname(encrypted_path), exist_ok=True)
+        with open(encrypted_path, "wb") as handle:
+            handle.write(b"encrypted fixture")
+        db = WeChatDB(self.tmp.name, keys={
+            rel_path: {"enc_key": "00" * 32},
+        })
+
+        def fake_decrypt(_source, output, _key):
+            conn = sqlite3.connect(output)
+            try:
+                conn.execute("CREATE TABLE snapshot_value(value TEXT)")
+                conn.execute("INSERT INTO snapshot_value VALUES ('original')")
+                conn.commit()
+            finally:
+                conn.close()
+            return 1
+
+        with (
+            patch.object(db, "_is_plain_sqlite", return_value=False),
+            patch("core.wechat_db.decrypt_database", side_effect=fake_decrypt),
+        ):
+            with db.source_snapshot():
+                pinned = db._get_decrypted_db(rel_path)
+                published = os.path.join(
+                    WeChatDB.CACHE_DIR,
+                    f"{hashlib.md5(rel_path.encode()).hexdigest()[:12]}.db",
+                )
+                self.assertNotEqual(pinned, published)
+                self.assertTrue(os.path.isfile(published))
+                replacement = os.path.join(self.tmp.name, "replacement.db")
+                conn = sqlite3.connect(replacement)
+                try:
+                    conn.execute("CREATE TABLE snapshot_value(value TEXT)")
+                    conn.execute("INSERT INTO snapshot_value VALUES ('replacement')")
+                    conn.commit()
+                finally:
+                    conn.close()
+                os.replace(replacement, published)
+
+                self.assertEqual(db._get_decrypted_db(rel_path), pinned)
+                conn = sqlite3.connect(pinned)
+                try:
+                    value = conn.execute("SELECT value FROM snapshot_value").fetchone()[0]
+                finally:
+                    conn.close()
+                self.assertEqual(value, "original")
+
+            self.assertFalse(os.path.exists(pinned))
+            self.assertFalse(any(
+                name.startswith(".partial-")
+                for name in os.listdir(WeChatDB.CACHE_DIR)
+            ))
+
 
 class WeChatDBPagingTests(unittest.TestCase):
     def setUp(self):
@@ -109,6 +166,77 @@ class WeChatDBPagingTests(unittest.TestCase):
 
         self.assertEqual([m["timestamp"] for m in first], [101, 102, 103])
         self.assertEqual([m["timestamp"] for m in second], [104, 105, 106])
+
+    def test_get_messages_page_forward_from_zero_returns_oldest_page(self):
+        messages = self.db.get_messages(
+            "room@chatroom",
+            since_ts=0,
+            limit=3,
+            page_forward=True,
+            since_inclusive=True,
+        )
+
+        self.assertEqual([m["timestamp"] for m in messages], [101, 102, 103])
+
+    def test_cursor_page_retains_filtered_envelopes_instead_of_false_eof(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "UPDATE Chat_test SET message_content = ? WHERE create_time = 102",
+                ("sender:\n<sysmsg type='fixture'></sysmsg>",),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        visible = self.db.get_messages(
+            "room@chatroom", since_ts=0, limit=3, page_forward=True
+        )
+        cursor_page = self.db._get_messages_from_paths(
+            "room@chatroom",
+            [self.db_path],
+            "Chat_test",
+            since_ts=0,
+            limit=3,
+            page_forward=True,
+            include_filtered=True,
+        )
+
+        self.assertEqual([m["timestamp"] for m in visible], [101, 103])
+        self.assertEqual([m["timestamp"] for m in cursor_page], [101, 102, 103])
+        self.assertEqual(cursor_page[1]["text"], "")
+
+    def test_cursor_message_identity_does_not_depend_on_snapshot_filename(self):
+        first = self.db._get_messages_from_paths(
+            "room@chatroom",
+            [self.db_path],
+            "Chat_test",
+            since_ts=100,
+            limit=1,
+            page_forward=True,
+            include_filtered=True,
+            db_shard_id="canonical-shard",
+        )[0]
+        copied_path = os.path.join(self.tmp.name, "random-snapshot-name.db")
+        source = sqlite3.connect(self.db_path)
+        target = sqlite3.connect(copied_path)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
+        second = self.db._get_messages_from_paths(
+            "room@chatroom",
+            [copied_path],
+            "Chat_test",
+            since_ts=100,
+            limit=1,
+            page_forward=True,
+            include_filtered=True,
+            db_shard_id="canonical-shard",
+        )[0]
+
+        self.assertEqual(first["source_message_id"], second["source_message_id"])
 
     def test_get_messages_can_include_cursor_timestamp_for_identity_dedup(self):
         messages = self.db.get_messages(

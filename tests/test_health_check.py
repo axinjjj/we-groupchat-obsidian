@@ -119,6 +119,11 @@ class HealthCheckTests(unittest.TestCase):
         )
         self.assertNotIn("Monitor chats: 未选择", text)
         self.assertIn("WeChat source guard: disabled / disabled", text)
+        self.assertIn(
+            "Source guard runtime: long_lived_app; "
+            "legacy_agent_installed=False; legacy_agent_loaded=False",
+            text,
+        )
         self.assertIn("Attachment archive: enabled / healthy; objects=1; pending=2", text)
         self.assertIn("Attachment backup target: not configured (optional)", text)
         self.assertIn(
