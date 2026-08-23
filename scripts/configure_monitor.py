@@ -17,7 +17,7 @@ from core.config import (
     load_config,
     merge_monitor_chat_preferences,
     normalize_path_value,
-    save_config,
+    update_config,
 )
 from core.key_extractor import get_cached_keys
 from core.keychain import load_key, save_key
@@ -192,6 +192,7 @@ def list_groups(db: WeChatDB, search: str = "") -> list[dict]:
 
 def configure(args: argparse.Namespace) -> int:
     config = load_config()
+    original_config = dict(config)
     keys = get_cached_keys()
     if not keys:
         print("没有找到可用的数据库 key cache。先运行一次 ./启动.command 完成微信授权和 key 提取。")
@@ -318,7 +319,12 @@ def configure(args: argparse.Namespace) -> int:
     config["monitor_obsidian_root"] = root
     config["monitor_obsidian_subdir"] = subdir
     config["monitor_enabled"] = True
-    save_config(config)
+    changed = {
+        key: value
+        for key, value in config.items()
+        if key != "config_revision" and original_config.get(key) != value
+    }
+    update_config(patch=changed)
 
     for group in selected_groups:
         reset_state_to_now(state_file_for_chat(group["username"]))

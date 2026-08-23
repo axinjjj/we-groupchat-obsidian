@@ -25,14 +25,22 @@ class AppGoogleDriveSyncTests(unittest.TestCase):
         app._drive_sync_service = Mock(return_value=service)
         app._configure_drive_sync_timer = Mock()
         app._rebuild_drive_sync_menu = Mock()
+        app._update_config = Mock(
+            side_effect=lambda *, patch=None, mutator=None: (
+                app.config.update(patch or {}) or app.config
+            )
+        )
 
-        with patch("app.save_config") as save, patch("app._notify"):
+        with patch("app._notify"):
             app._toggle_drive_sync(None)
 
         self.assertTrue(app.config["google_drive_file_sync_enabled"])
         service.initialize_selected_chat_cursors.assert_called_once_with()
         service.run.assert_not_called()
-        save.assert_called_once_with(app.config)
+        app._update_config.assert_called_once_with(patch={
+            "google_drive_file_sync_enabled": True,
+            "google_drive_file_sync_paused": False,
+        })
 
     def test_timer_exists_only_while_enabled_and_unpaused(self):
         app = self.app()

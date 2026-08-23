@@ -12,7 +12,7 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from core.config import load_config, save_config
+from core.config import load_config, update_config
 from core.google_drive_auth import GoogleDriveAuthError, GoogleDriveOAuth
 from core.google_drive_client import GoogleDriveClient
 from core.google_drive_file_sync import GoogleDriveFileSync
@@ -68,10 +68,7 @@ def _service(config, *, source=False, remote=False):
 
 
 def _set_config(**values):
-    config = load_config()
-    config.update(values)
-    save_config(config)
-    return load_config()
+    return update_config(patch=values)
 
 
 def _from_timestamp(value):

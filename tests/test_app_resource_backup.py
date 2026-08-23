@@ -1,8 +1,11 @@
+import os
+import tempfile
 import threading
 import unittest
 from unittest.mock import Mock, patch
 
 from app import WeGroupchatObsidianApp
+from core.app_runtime import AppAlreadyRunning, AppInstanceLock
 
 
 class AppResourceBackupTests(unittest.TestCase):
@@ -10,8 +13,8 @@ class AppResourceBackupTests(unittest.TestCase):
         app = WeGroupchatObsidianApp.__new__(WeGroupchatObsidianApp)
         app.config = {
             "resource_backup_enabled": True,
-            "resource_backup_file_resolution_enabled": resolve_files,
         }
+        app._resource_file_resolution_session_enabled = resolve_files
         app.db = object()
         app._resource_backup_lock = threading.Lock()
         app._source_guard_lock = threading.Lock()
@@ -40,7 +43,7 @@ class AppResourceBackupTests(unittest.TestCase):
         backup.run.assert_called_once_with()
         self.assertFalse(app._resource_backup_lock.locked())
 
-    def test_file_resolution_requires_explicit_config_opt_in(self):
+    def test_file_resolution_requires_explicit_session_opt_in(self):
         app = self.make_app(resolve_files=True)
         capture = Mock()
         capture.run.return_value = {
@@ -59,6 +62,40 @@ class AppResourceBackupTests(unittest.TestCase):
             app._run_resource_backup_consumer(manual=False)
 
         capture.run.assert_called_once_with(resolve_limit=50, resolve_files=True)
+
+    def test_restart_resets_file_resolution_session_grant(self):
+        restarted = self.make_app(resolve_files=False)
+
+        self.assertFalse(restarted._resource_file_resolution_session_enabled)
+
+    def test_disabled_background_worker_does_not_touch_source_or_backup(self):
+        app = self.make_app()
+        app._resource_capture_service = Mock(
+            side_effect=AssertionError("disabled worker touched source")
+        )
+
+        with (
+            patch("app.load_config", return_value={"resource_backup_enabled": False}),
+            patch(
+                "app.MountedResourceBackup.from_config",
+                side_effect=AssertionError("disabled worker touched backup"),
+            ),
+        ):
+            app._run_resource_backup_consumer(manual=False)
+
+        self.assertFalse(app._resource_backup_lock.locked())
+
+    def test_app_singleton_lock_rejects_second_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "menu-app.lock")
+            first = AppInstanceLock(path).acquire()
+            try:
+                with self.assertRaisesRegex(
+                    AppAlreadyRunning, "menu_app_already_running"
+                ):
+                    AppInstanceLock(path).acquire()
+            finally:
+                first.release()
 
     def test_link_backfill_apply_never_calls_file_resolver(self):
         app = self.make_app(resolve_files=False)
@@ -80,9 +117,16 @@ class AppResourceBackupTests(unittest.TestCase):
             patch("app.load_config", return_value=app.config),
             patch("app.MountedResourceBackup.from_config", return_value=backup),
         ):
-            app._apply_link_backfill(0)
+            app._apply_link_backfill(
+                0,
+                "00000000-0000-0000-0000-000000000099",
+            )
 
-        capture.backfill_links.assert_called_once_with(0, apply=True)
+        capture.backfill_links.assert_called_once_with(
+            0,
+            apply=True,
+            run_id="00000000-0000-0000-0000-000000000099",
+        )
         capture.resolve_pending_files.assert_not_called()
         backup.run.assert_called_once_with()
 
@@ -111,6 +155,81 @@ class AppResourceBackupTests(unittest.TestCase):
             "all",
             {"state": "busy", "source_complete": False},
         )
+
+    def test_config_revision_watcher_reconciles_cli_runtime_toggle(self):
+        app = self.make_app()
+        app.config = {
+            "config_revision": 1,
+            "resource_backup_enabled": False,
+            "resource_backup_interval_seconds": 300,
+        }
+        current = {
+            "config_revision": 2,
+            "resource_backup_enabled": True,
+            "resource_backup_interval_seconds": 300,
+        }
+        for name in (
+            "_configure_monitor_timer", "_configure_daily_digest_timer",
+            "_configure_resource_backup_timer", "_configure_drive_sync_timer",
+            "_configure_source_guard_timer", "_rebuild_settings_menu",
+            "_rebuild_monitor_menu", "_rebuild_resource_backup_menu",
+            "_rebuild_drive_sync_menu",
+        ):
+            setattr(app, name, Mock())
+
+        with patch("app.load_config", return_value=current):
+            app._on_config_reconcile_timer(None)
+
+        self.assertEqual(app.config, current)
+        app._configure_resource_backup_timer.assert_called_once_with()
+
+    def test_manual_notification_requires_capture_projection_and_handoff_success(self):
+        app = self.make_app()
+        app._rebuild_resource_backup_menu = Mock()
+        with (
+            patch("app.load_config", return_value=app.config),
+            patch("app._notify") as notify,
+        ):
+            app._finish_resource_backup_run({
+                "capture": {
+                    "state": "degraded",
+                    "scan": {"state": "source_degraded"},
+                    "resolve": {"state": "skipped"},
+                },
+                "backup": {
+                    "state": "target_failed",
+                    "obsidian": {"state": "written"},
+                },
+            }, True)
+
+        self.assertEqual(notify.call_args.args[1], "本轮未完成")
+        self.assertIn("capture=degraded", notify.call_args.args[2])
+        self.assertIn("handoff=target_failed", notify.call_args.args[2])
+
+        with patch("app._notify") as notify:
+            app._finish_resource_backup_run({
+                "capture": {
+                    "state": "healthy",
+                    "scan": {"state": "healthy"},
+                    "resolve": {"state": "skipped"},
+                },
+                "backup": {"state": "idle", "obsidian": {}},
+            }, True)
+        self.assertEqual(notify.call_args.args[1], "本轮未完成")
+
+        with patch("app._notify") as notify:
+            app._finish_resource_backup_run({
+                "capture": {
+                    "state": "healthy",
+                    "scan": {"state": "healthy"},
+                    "resolve": {"state": "skipped"},
+                },
+                "backup": {
+                    "state": "sync_delegated",
+                    "obsidian": {"state": "written"},
+                },
+            }, True)
+        self.assertEqual(notify.call_args.args[1], "更新完成")
 
 
 if __name__ == "__main__":

@@ -2,19 +2,31 @@ import fcntl
 import hashlib
 import io
 import json
+import multiprocessing
 import os
 import re
 import shutil
 import sqlite3
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
 import scripts.resource_backup as resource_backup_cli
-from core.resource_backup import MountedResourceBackup, _redact_url
+from core.resource_backup import (
+    MountedResourceBackup,
+    _redact_url,
+    load_resource_backup_settings,
+    save_resource_backup_settings,
+)
 from core.resource_capture import SelectedResourceCapture, _exact_links, _url_sha256
 from core.wechat_db import WeChatSourceDegraded
+
+
+def _settings_patch_worker(path, patch_value, start_event):
+    start_event.wait(5)
+    save_resource_backup_settings(patch_value, path=path)
 
 
 class FakeSource:
@@ -322,7 +334,11 @@ class ResourceBackupTests(unittest.TestCase):
             for dirpath, _dirs, filenames in os.walk(self.obsidian_root)
             for filename in filenames
         ]
-        self.assertTrue(all(path.endswith(".md") for path in vault_files))
+        self.assertTrue(all(
+            path.endswith(".md")
+            or os.path.basename(path) == ".resource-index-manifest.json"
+            for path in vault_files
+        ))
 
     def test_resource_index_prefers_observed_title_and_uses_exact_url_as_fallback(self):
         capture = self._ready_capture()
@@ -540,6 +556,43 @@ class ResourceBackupTests(unittest.TestCase):
         self.assertEqual(chat, (200, 2))
         self.assertEqual(cursor, 250)
 
+    def test_selection_uuid_changes_epoch_with_same_selected_timestamp(self):
+        config = dict(self.config)
+        config["resource_backup_selected_chats"] = [{
+            "username": self.selected,
+            "alias": "猫猫研究群",
+            "selected_since": 100,
+            "selection_id": "00000000-0000-0000-0000-000000000001",
+        }]
+        first = SelectedResourceCapture(
+            config,
+            source=FakeSource({self.selected: []}),
+            now_func=lambda: 200,
+            archive_id_factory=lambda: "00000000-0000-0000-0000-000000000099",
+        )
+        first.initialize_selected_chat_cursors()
+
+        config["resource_backup_selected_chats"][0]["selection_id"] = (
+            "00000000-0000-0000-0000-000000000002"
+        )
+        second = SelectedResourceCapture(
+            config,
+            source=FakeSource({self.selected: []}),
+            now_func=lambda: 200,
+        )
+        result = second.initialize_selected_chat_cursors()
+
+        self.assertEqual(result["reselected_chats"], 1)
+        conn = sqlite3.connect(self.capture_db)
+        try:
+            row = conn.execute(
+                "SELECT selection_id, selection_epoch FROM resource_chats"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row[0], "00000000-0000-0000-0000-000000000002")
+        self.assertEqual(row[1], 2)
+
     def test_explicit_backfill_applies_history_without_moving_live_cursor(self):
         source = FakeSource({
             self.selected: [{
@@ -563,12 +616,19 @@ class ResourceBackupTests(unittest.TestCase):
         capture.scan()
 
         planned = capture.backfill(0, apply=False)
-        applied = capture.backfill(0, apply=True)
+        applied = capture.backfill(
+            0, apply=True, run_id=planned["run_id"]
+        )
 
         self.assertEqual(planned["state"], "planned")
         self.assertEqual(planned["discovered_links"], 1)
         self.assertEqual(planned["discovered_files"], 1)
-        self.assertEqual(capture.backfill(0, apply=True)["inserted_links"], 0)
+        self.assertEqual(
+            capture.backfill(
+                0, apply=True, run_id=planned["run_id"]
+            )["inserted_links"],
+            1,
+        )
         self.assertEqual(applied["inserted_links"], 1)
         self.assertEqual(applied["inserted_files"], 1)
         conn = sqlite3.connect(self.capture_db)
@@ -582,9 +642,9 @@ class ResourceBackupTests(unittest.TestCase):
 
     def test_backfill_uses_cursor_complete_pages_across_filtered_rows(self):
         messages = []
-        for timestamp in range(1, 121):
+        for timestamp in range(1, 1201):
             text = ""
-            if timestamp in {10, 60, 110}:
+            if timestamp in {10, 600, 1100}:
                 text = f"https://example.com/history/{timestamp}"
             messages.append({
                 "timestamp": timestamp,
@@ -614,8 +674,31 @@ class ResourceBackupTests(unittest.TestCase):
         planned = capture.backfill(0, apply=False)
 
         self.assertEqual(planned["state"], "planned")
-        self.assertEqual(planned["scanned"], 120)
+        self.assertEqual(planned["scanned"], 1200)
         self.assertEqual(planned["discovered_links"], 3)
+
+    def test_backfill_plan_does_not_mutate_live_chat_or_cursor_state(self):
+        capture = self._capture()
+
+        planned = capture.backfill_links(0, apply=False)
+
+        self.assertEqual(planned["state"], "planned")
+        conn = sqlite3.connect(self.capture_db)
+        try:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM resource_chats").fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM resource_shards").fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM resource_occurrences").fetchone()[0],
+                0,
+            )
+        finally:
+            conn.close()
 
     def test_links_only_backfill_never_queues_attachment_files(self):
         source = FakeSource({
@@ -637,7 +720,10 @@ class ResourceBackupTests(unittest.TestCase):
             archive_id_factory=lambda: "00000000-0000-0000-0000-000000000001",
         )
 
-        result = capture.backfill_links(0, apply=True)
+        planned = capture.backfill_links(0, apply=False)
+        result = capture.backfill_links(
+            0, apply=True, run_id=planned["run_id"]
+        )
 
         self.assertEqual(result["state"], "applied")
         self.assertEqual(result["mode"], "links_only")
@@ -690,13 +776,156 @@ class ResourceBackupTests(unittest.TestCase):
             archive_id_factory=lambda: "00000000-0000-0000-0000-000000000001",
         )
 
-        result = capture.backfill_links(0, apply=True)
+        result = capture.backfill_links(0, apply=False)
 
         self.assertEqual(result["state"], "source_degraded")
         self.assertFalse(result["source_complete"])
         self.assertEqual(result["discovered_links"], 1)
         self.assertEqual(result["inserted_links"], 0)
         self.assertEqual(capture.occurrences(), [])
+
+    def test_backfill_apply_consumes_staged_rows_without_rescanning_new_source(self):
+        source = FakeSource({
+            self.selected: [{
+                "timestamp": 100,
+                "source_message_id": "planned-link",
+                "text": "https://example.com/planned",
+                "resources": [],
+            }],
+        })
+        capture = SelectedResourceCapture(
+            self.config,
+            source=source,
+            now_func=lambda: 200,
+            archive_id_factory=lambda: "00000000-0000-0000-0000-000000000001",
+        )
+        planned = capture.backfill_links(0)
+        source.messages_by_chat[self.selected].append({
+            "timestamp": 101,
+            "source_message_id": "later-link",
+            "text": "https://example.com/later",
+            "resources": [],
+        })
+        capture.source = None
+
+        applied = capture.backfill_links(
+            0, apply=True, run_id=planned["run_id"]
+        )
+
+        self.assertEqual(applied["state"], "applied")
+        self.assertEqual(
+            [row["source_message_id"] for row in capture.occurrences()],
+            ["planned-link"],
+        )
+
+    def test_backfill_apply_fails_closed_after_selection_change(self):
+        capture = self._capture()
+        planned = capture.backfill_links(0)
+        capture.config["resource_backup_selected_chats"] = []
+
+        applied = capture.backfill_links(
+            0, apply=True, run_id=planned["run_id"]
+        )
+
+        self.assertEqual(applied["state"], "selection_changed")
+        self.assertFalse(applied["source_complete"])
+        self.assertEqual(capture.occurrences(selected_only=False), [])
+
+    def test_backfill_candidate_digest_tamper_fails_closed(self):
+        capture = self._capture()
+        planned = capture.backfill_links(0)
+        conn = sqlite3.connect(self.capture_db)
+        try:
+            conn.execute(
+                """
+                UPDATE resource_backfill_staged_occurrences
+                SET observed_url = 'https://example.com/tampered'
+                WHERE run_id = ?
+                """,
+                (planned["run_id"],),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        applied = capture.backfill_links(
+            0, apply=True, run_id=planned["run_id"]
+        )
+
+        self.assertEqual(applied["state"], "candidate_mismatch")
+        self.assertEqual(capture.occurrences(selected_only=False), [])
+
+    def test_expired_incomplete_backfill_run_is_cleaned_with_staging(self):
+        capture = self._capture()
+        planned = capture.backfill_links(0)
+        conn = sqlite3.connect(self.capture_db)
+        try:
+            conn.execute(
+                "UPDATE resource_backfill_runs SET expires_at = 0 WHERE run_id = ?",
+                (planned["run_id"],),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        self.assertEqual(capture.cleanup_backfill_runs(), 1)
+        conn = sqlite3.connect(self.capture_db)
+        try:
+            staged = conn.execute(
+                "SELECT COUNT(*) FROM resource_backfill_staged_occurrences"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(staged, 0)
+
+    def test_archive_id_first_writer_is_compare_and_set(self):
+        barrier = threading.Barrier(2)
+        results = []
+        errors = []
+        candidates = iter([
+            "00000000-0000-0000-0000-000000000011",
+            "00000000-0000-0000-0000-000000000022",
+        ])
+        candidates_lock = threading.Lock()
+
+        def factory():
+            with candidates_lock:
+                value = next(candidates)
+            barrier.wait(5)
+            return value
+
+        def construct():
+            try:
+                results.append(SelectedResourceCapture(
+                    self.config,
+                    source=None,
+                    archive_id_factory=factory,
+                ).archive_id)
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=construct) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+        self.assertEqual(len(set(results)), 1)
+
+    def test_missing_archive_id_with_identity_bound_rows_fails_closed(self):
+        capture = self._capture()
+        capture.initialize_selected_chat_cursors(start_timestamp=0)
+        conn = sqlite3.connect(self.capture_db)
+        try:
+            conn.execute("DELETE FROM resource_meta WHERE key = 'archive_id'")
+            conn.commit()
+        finally:
+            conn.close()
+
+        with self.assertRaisesRegex(Exception, "archive_identity_missing"):
+            self._capture()
 
     def test_capture_run_reports_source_unavailable_instead_of_healthy(self):
         capture = SelectedResourceCapture(
@@ -725,6 +954,19 @@ class ResourceBackupTests(unittest.TestCase):
 
         self.assertEqual(result["resolve"]["state"], "skipped")
         self.assertEqual(result["resolve"]["reason"], "file_resolution_disabled")
+
+    def test_capture_run_without_arguments_fails_closed_for_attachment_bytes(self):
+        capture = self._capture()
+        capture.initialize_selected_chat_cursors(start_timestamp=0)
+
+        with patch.object(
+            capture,
+            "resolve_pending_files",
+            side_effect=AssertionError("default run must not read attachment cache"),
+        ):
+            result = capture.run()
+
+        self.assertEqual(result["resolve"]["state"], "skipped")
 
     def test_occurrence_insert_and_cursor_advance_are_one_transaction(self):
         capture = self._capture()
@@ -1002,6 +1244,79 @@ class ResourceBackupTests(unittest.TestCase):
             scope_text,
         )
 
+    def test_deselecting_last_chat_writes_empty_root_and_collects_only_managed_indexes(self):
+        capture = self._ready_capture()
+        backup = self._backup(capture)
+        first = backup.render_obsidian_indexes()
+        self.assertGreater(first["occurrences"], 0)
+        chat_root = os.path.join(
+            self.obsidian_root,
+            "微信群聊",
+            "关注推送",
+            "猫猫研究群",
+        )
+        user_file = os.path.join(chat_root, "我的笔记.md")
+        with open(user_file, "w", encoding="utf-8") as handle:
+            handle.write("user-owned\n")
+
+        capture.config["resource_backup_selected_chats"] = []
+        second = backup.render_obsidian_indexes()
+        scope_root = os.path.join(
+            self.obsidian_root,
+            "微信群聊",
+            "关注推送",
+            "00-资源索引.md",
+        )
+
+        self.assertEqual(second["occurrences"], 0)
+        with open(scope_root, encoding="utf-8") as handle:
+            self.assertIn("当前没有已选群聊资源", handle.read())
+        self.assertTrue(os.path.isfile(user_file))
+        self.assertFalse(os.path.exists(os.path.join(chat_root, "00-资源索引.md")))
+        self.assertFalse(os.path.exists(os.path.join(chat_root, "资源索引")))
+
+    def test_utf8_component_budget_preserves_extension_and_stable_hash_suffix(self):
+        capture = self._capture()
+        backup = self._backup(capture)
+        long_name = "猫" * 200 + ".pdf"
+        relative = backup._target_relpath({
+            "object_sha256": "a" * 64,
+            "original_name": long_name,
+        })
+        component = os.path.basename(relative)
+
+        self.assertLessEqual(len(component.encode("utf-8")), 255)
+        self.assertTrue(component.endswith(".pdf"))
+        self.assertRegex(component, r"--[0-9a-f]{8}\.pdf$")
+
+    def test_resource_settings_preserve_concurrent_disjoint_process_updates(self):
+        path = os.path.join(self.root, "resource_backup.json")
+        save_resource_backup_settings(
+            {"target": "", "link_export_mode": "redacted"},
+            path=path,
+        )
+        context = multiprocessing.get_context("spawn")
+        start = context.Event()
+        target = context.Process(
+            target=_settings_patch_worker,
+            args=(path, {"target": self.target}, start),
+        )
+        mode = context.Process(
+            target=_settings_patch_worker,
+            args=(path, {"link_export_mode": "full"}, start),
+        )
+        target.start()
+        mode.start()
+        start.set()
+        target.join(10)
+        mode.join(10)
+
+        self.assertEqual(target.exitcode, 0)
+        self.assertEqual(mode.exitcode, 0)
+        settings = load_resource_backup_settings(path)
+        self.assertEqual(settings["target"], self.target)
+        self.assertEqual(settings["link_export_mode"], "full")
+
     def test_delivery_receipt_does_not_trust_a_symlink_replacement(self):
         capture = self._ready_capture()
         backup = self._backup(capture)
@@ -1096,7 +1411,12 @@ class ResourceBackupTests(unittest.TestCase):
         lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            result = backup.run()
+            with patch.object(
+                backup,
+                "_render_obsidian_indexes_safely",
+                side_effect=AssertionError("projection escaped operation lock"),
+            ):
+                result = backup.run()
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
@@ -1378,15 +1698,26 @@ class ResourceBackupCliTests(unittest.TestCase):
 
     def test_set_selected_chats_uses_active_list_indexes_without_oauth_state(self):
         output = io.StringIO()
+        updated = dict(self.config)
+        updated["resource_backup_selected_chats"] = [{
+            "username": "first@chatroom",
+            "alias": "First Group",
+            "selected_since": 1_787_500_000,
+        }]
         with (
             patch.object(resource_backup_cli, "load_config", return_value=self.config),
-            patch.object(resource_backup_cli, "save_config") as save_config,
+            patch.object(resource_backup_cli, "update_config", return_value=updated) as update,
             patch.object(resource_backup_cli.time, "time", return_value=1_787_500_000),
+            patch.object(
+                resource_backup_cli.uuid,
+                "uuid4",
+                return_value="00000000-0000-0000-0000-000000000123",
+            ),
             redirect_stdout(output),
         ):
             result = resource_backup_cli.main(["set-selected-chats", "1"])
 
-        saved = save_config.call_args.args[0]
+        saved = update.call_args.kwargs["patch"]
         self.assertEqual(result, 0)
         self.assertEqual(
             saved["resource_backup_selected_chats"],
@@ -1394,12 +1725,10 @@ class ResourceBackupCliTests(unittest.TestCase):
                 "username": "first@chatroom",
                 "alias": "First Group",
                 "selected_since": 1_787_500_000,
+                "selection_id": "00000000-0000-0000-0000-000000000123",
             }],
         )
-        self.assertEqual(
-            saved["google_drive_file_sync_selected_chats"],
-            self.config.get("google_drive_file_sync_selected_chats"),
-        )
+        self.assertNotIn("google_drive_file_sync_selected_chats", saved)
         self.assertNotIn("@chatroom", output.getvalue())
 
     def test_cli_scan_source_unavailable_returns_structured_json(self):
@@ -1439,7 +1768,7 @@ class ResourceBackupCliTests(unittest.TestCase):
             result = resource_backup_cli.main(["backfill", "--all"])
 
         self.assertEqual(result, 0)
-        capture.backfill.assert_called_once_with(0, apply=False)
+        capture.backfill.assert_called_once_with(0, apply=False, run_id="")
         self.assertEqual(json.loads(output.getvalue())["state"], "planned")
 
     def test_cli_backfill_links_is_an_explicit_links_only_plan(self):
@@ -1460,7 +1789,7 @@ class ResourceBackupCliTests(unittest.TestCase):
             result = resource_backup_cli.main(["backfill-links", "--all"])
 
         self.assertEqual(result, 0)
-        capture.backfill_links.assert_called_once_with(0, apply=False)
+        capture.backfill_links.assert_called_once_with(0, apply=False, run_id="")
         payload = json.loads(output.getvalue())
         self.assertEqual(payload["mode"], "links_only")
         self.assertTrue(payload["source_complete"])
@@ -1469,19 +1798,53 @@ class ResourceBackupCliTests(unittest.TestCase):
         output = io.StringIO()
         config = dict(self.config)
         config["resource_backup_enabled"] = False
-        config["resource_backup_file_resolution_enabled"] = False
+        updated = dict(config, resource_backup_enabled=True)
         with (
             patch.object(resource_backup_cli, "load_config", return_value=config),
-            patch.object(resource_backup_cli, "save_config") as save,
+            patch.object(resource_backup_cli, "update_config", return_value=updated) as update,
             redirect_stdout(output),
         ):
             result = resource_backup_cli.main(["enable"])
 
         self.assertEqual(result, 0)
-        saved = save.call_args.args[0]
-        self.assertTrue(saved["resource_backup_enabled"])
-        self.assertFalse(saved["resource_backup_file_resolution_enabled"])
-        self.assertEqual(json.loads(output.getvalue())["runtime"], "long_lived_app")
+        self.assertEqual(update.call_args.kwargs["patch"], {
+            "resource_backup_enabled": True,
+        })
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["runtime"], "long_lived_app")
+        self.assertEqual(
+            payload["file_resolution_policy"],
+            "explicit_per_run_or_app_session",
+        )
+
+    def test_cli_backfill_apply_requires_exact_plan_run_id(self):
+        with self.assertRaisesRegex(SystemExit, "--apply requires"):
+            resource_backup_cli.main(["backfill-links", "--all", "--apply"])
+
+    def test_cli_backfill_apply_consumes_staging_without_source(self):
+        output = io.StringIO()
+        capture = unittest.mock.Mock()
+        capture.backfill_links.return_value = {
+            "state": "applied",
+            "source_complete": True,
+        }
+        with (
+            patch.object(resource_backup_cli, "load_config", return_value=self.config),
+            patch.object(resource_backup_cli, "_capture", return_value=capture) as factory,
+            redirect_stdout(output),
+        ):
+            result = resource_backup_cli.main([
+                "backfill-links", "--all", "--apply", "--run-id",
+                "00000000-0000-0000-0000-000000000099",
+            ])
+
+        self.assertEqual(result, 0)
+        factory.assert_called_once_with(self.config, source=False)
+        capture.backfill_links.assert_called_once_with(
+            0,
+            apply=True,
+            run_id="00000000-0000-0000-0000-000000000099",
+        )
 
     def test_cli_run_with_source_unavailable_still_handoffs(self):
         output = io.StringIO()

@@ -31,7 +31,10 @@ from .resource_capture import SelectedResourceCapture
 
 BACKUP_SCHEMA = "we-groupchat-obsidian.resource-backup.v3"
 INDEX_MARKER = "<!-- we-groupchat-obsidian:resource-index v1 -->"
+INDEX_MANIFEST_NAME = ".resource-index-manifest.json"
+INDEX_MANIFEST_SCHEMA = "we-groupchat-obsidian.resource-index-manifest.v1"
 SETTINGS_FILE = os.path.join(DATA_DIR, "resource_backup.json")
+SETTINGS_LOCK_SUFFIX = ".lock"
 OCCURRENCE_ID_DOMAIN = b"we-groupchat-resource-occurrence-v1\0"
 SENSITIVE_QUERY_KEYS = {
     "access_token",
@@ -179,7 +182,38 @@ def _paths_overlap(left, right):
     return common in {left, right}
 
 
-def _safe_part(value, fallback="未命名", max_len=100):
+def _utf8_prefix(value, max_bytes):
+    result = []
+    used = 0
+    for char in str(value or ""):
+        encoded = char.encode("utf-8")
+        if used + len(encoded) > max(0, int(max_bytes)):
+            break
+        result.append(char)
+        used += len(encoded)
+    return "".join(result)
+
+
+def _truncate_component(value, fallback, max_bytes, *, preserve_extension=False):
+    text = str(value or "") or fallback
+    if len(text.encode("utf-8")) <= max_bytes:
+        return text
+    digest_suffix = "--" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
+    extension = ""
+    stem = text
+    if preserve_extension:
+        stem, extension = os.path.splitext(text)
+        if len(extension.encode("utf-8")) > 32:
+            extension = _utf8_prefix(extension, 32)
+    suffix = digest_suffix + extension
+    stem_budget = max_bytes - len(suffix.encode("utf-8"))
+    truncated = _utf8_prefix(stem, stem_budget).rstrip(" ._")
+    if not truncated:
+        truncated = _utf8_prefix(fallback, stem_budget).rstrip(" ._")
+    return (truncated + suffix) if truncated else _utf8_prefix(digest_suffix, max_bytes)
+
+
+def _safe_part(value, fallback="未命名", max_len=180):
     text = str(value or "").strip()
     chars = []
     for char in text:
@@ -194,7 +228,8 @@ def _safe_part(value, fallback="未命名", max_len=100):
         else:
             chars.append(" ")
     cleaned = re.sub(r"\s+", " ", "".join(chars)).strip(" .")
-    return (cleaned[:max_len].rstrip(" .") or fallback)
+    cleaned = cleaned or fallback
+    return _truncate_component(cleaned, fallback, max_len).rstrip(" .")
 
 
 def _path_collision_key(value):
@@ -214,7 +249,12 @@ def _safe_object_name(value):
     name = os.path.basename(str(value or "").strip())
     name = re.sub(r"[\x00-\x1f/:\\]+", "_", name).strip(" ._")
     name = re.sub(r"\s+", " ", name)
-    return (name or "attachment")[:160]
+    return _truncate_component(
+        name or "attachment",
+        "attachment",
+        189,
+        preserve_extension=True,
+    )
 
 
 def _single_line(value, fallback="", limit=240):
@@ -324,7 +364,7 @@ def _canonical_jsonl_bytes(rows):
     return b"".join(_canonical_json_bytes(row) for row in rows)
 
 
-def load_resource_backup_settings(path=SETTINGS_FILE):
+def _read_resource_backup_settings_unlocked(path):
     try:
         with open(path, encoding="utf-8") as handle:
             value = json.load(handle)
@@ -341,19 +381,42 @@ def load_resource_backup_settings(path=SETTINGS_FILE):
     }
 
 
+@contextmanager
+def _resource_backup_settings_lock(path, *, exclusive):
+    lock_path = os.path.abspath(os.path.expanduser(path)) + SETTINGS_LOCK_SUFFIX
+    _ensure_dir(os.path.dirname(lock_path))
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def load_resource_backup_settings(path=SETTINGS_FILE):
+    with _resource_backup_settings_lock(path, exclusive=False):
+        return _read_resource_backup_settings_unlocked(path)
+
+
 def save_resource_backup_settings(settings, path=SETTINGS_FILE):
-    current = load_resource_backup_settings(path)
-    current.update(settings if isinstance(settings, dict) else {})
-    target = str(current.get("target") or "").strip()
-    mode = str(current.get("link_export_mode") or "redacted").strip().lower()
-    if mode not in {"full", "redacted", "off"}:
-        raise ValueError("link_export_mode must be full, redacted, or off")
-    payload = {
-        "target": os.path.abspath(os.path.expanduser(target)) if target else "",
-        "link_export_mode": mode,
-    }
-    _atomic_bytes(path, _canonical_json_bytes(payload))
-    return payload
+    with _resource_backup_settings_lock(path, exclusive=True):
+        current = _read_resource_backup_settings_unlocked(path)
+        current.update(settings if isinstance(settings, dict) else {})
+        target = str(current.get("target") or "").strip()
+        mode = str(current.get("link_export_mode") or "redacted").strip().lower()
+        if mode not in {"full", "redacted", "off"}:
+            raise ValueError("link_export_mode must be full, redacted, or off")
+        payload = {
+            "target": os.path.abspath(os.path.expanduser(target)) if target else "",
+            "link_export_mode": mode,
+        }
+        _atomic_bytes(path, _canonical_json_bytes(payload))
+        return payload
 
 
 class MountedResourceBackup:
@@ -693,6 +756,112 @@ class MountedResourceBackup:
             changed = _atomic_text_if_changed(actual_path, text)
         return actual_path, changed
 
+    def _managed_projection_paths(self, base_root, *, target_view):
+        manifest_path = os.path.join(base_root, INDEX_MANIFEST_NAME)
+        try:
+            data = (
+                self._read_regular_bytes(manifest_path)
+                if target_view
+                else MountedResourceBackup._read_regular_bytes(
+                    manifest_path, error_code="projection_manifest_invalid"
+                )
+            )
+            payload = json.loads(data.decode("utf-8"))
+            if (
+                not isinstance(payload, dict)
+                or payload.get("schema") != INDEX_MANIFEST_SCHEMA
+                or not isinstance(payload.get("paths"), list)
+            ):
+                raise ValueError("invalid manifest")
+            result = set()
+            for value in payload["paths"]:
+                relative = str(value or "")
+                candidate = os.path.abspath(os.path.join(base_root, relative))
+                if (
+                    relative
+                    and not os.path.isabs(relative)
+                    and _within(candidate, base_root)
+                ):
+                    result.add(relative.replace("\\", "/"))
+            return result
+        except (OSError, ResourceBackupError, UnicodeError, ValueError, json.JSONDecodeError):
+            result = set()
+            for root, dirs, files in os.walk(base_root, followlinks=False):
+                dirs[:] = [
+                    name
+                    for name in dirs
+                    if not os.path.islink(os.path.join(root, name))
+                ]
+                for name in files:
+                    path = os.path.join(root, name)
+                    try:
+                        data = (
+                            self._read_regular_bytes(path)
+                            if target_view
+                            else MountedResourceBackup._read_regular_bytes(
+                                path, error_code="projection_file_conflict"
+                            )
+                        )
+                    except ResourceBackupError:
+                        continue
+                    if INDEX_MARKER.encode("utf-8") in data:
+                        result.add(
+                            os.path.relpath(path, base_root).replace(os.sep, "/")
+                        )
+            return result
+
+    def _reconcile_managed_projection(
+        self,
+        base_root,
+        current_paths,
+        *,
+        target_view,
+    ):
+        current = {
+            os.path.relpath(path, base_root).replace(os.sep, "/")
+            for path in current_paths
+        }
+        previous = self._managed_projection_paths(
+            base_root, target_view=target_view
+        )
+        for relative in sorted(previous - current, reverse=True):
+            path = os.path.abspath(os.path.join(base_root, relative))
+            if not _within(path, base_root):
+                continue
+            try:
+                data = (
+                    self._read_regular_bytes(path)
+                    if target_view
+                    else MountedResourceBackup._read_regular_bytes(
+                        path, error_code="projection_file_conflict"
+                    )
+                )
+            except ResourceBackupError:
+                continue
+            if INDEX_MARKER.encode("utf-8") not in data:
+                continue
+            try:
+                os.unlink(path)
+            except OSError:
+                continue
+            parent = os.path.dirname(path)
+            while parent != base_root and _within(parent, base_root):
+                try:
+                    os.rmdir(parent)
+                except OSError:
+                    break
+                parent = os.path.dirname(parent)
+        payload = _canonical_json_bytes({
+            "schema": INDEX_MANIFEST_SCHEMA,
+            "archive_id": self.capture.archive_id,
+            "paths": sorted(current),
+        })
+        manifest_path = os.path.join(base_root, INDEX_MANIFEST_NAME)
+        if target_view:
+            self._target_atomic_bytes(manifest_path, payload)
+        else:
+            _atomic_bytes(manifest_path, payload)
+
     def _delivery_row(self, digest):
         conn = self._connect()
         try:
@@ -988,6 +1157,7 @@ class MountedResourceBackup:
             manifest = existing["manifest"] if existing else {}
             if (
                 manifest.get("resources_sha256") == resources_sha256
+                and manifest.get("archive_id") == self.capture.archive_id
                 and manifest.get("link_export_mode") == self.link_export_mode
                 and manifest.get("handoff_semantics") == handoff_semantics
             ):
@@ -1006,6 +1176,7 @@ class MountedResourceBackup:
         self._target_atomic_bytes(resources_path, resources_bytes)
         manifest = {
             "schema": BACKUP_SCHEMA,
+            "archive_id": self.capture.archive_id,
             "snapshot_id": snapshot_id,
             "created_at": datetime.fromtimestamp(
                 self.now_func(), tz=timezone.utc
@@ -1181,6 +1352,7 @@ class MountedResourceBackup:
         chat_parts = self._chat_path_parts(occurrences)
         delivery_map = self._delivery_map()
         written = 0
+        managed_paths = []
         chat_summaries = []
         for (chat_key, chat_alias), months in grouped.items():
             chat_part = chat_parts[(chat_key, chat_alias)]
@@ -1237,6 +1409,7 @@ class MountedResourceBackup:
                 )
                 if month_changed:
                     written += 1
+                managed_paths.append(_actual_month_path)
             _actual_index_path, index_changed = self._write_managed_text(
                 os.path.join(chat_root, "00-资源索引.md"),
                 "\n".join(index_lines),
@@ -1244,6 +1417,7 @@ class MountedResourceBackup:
             )
             if index_changed:
                 written += 1
+            managed_paths.append(_actual_index_path)
             chat_summaries.append({
                 "alias": _single_line(chat_alias, "未命名群聊", 120),
                 "path": os.path.relpath(_actual_index_path, base_root).replace(
@@ -1263,14 +1437,14 @@ class MountedResourceBackup:
                     if row.get("kind") == "file"
                 ),
             })
+        scope_lines = [
+            INDEX_MARKER,
+            "# 资源索引",
+            "",
+            "> 按群聊进入链接与文件清单。",
+            "",
+        ]
         if chat_summaries:
-            scope_lines = [
-                INDEX_MARKER,
-                "# 资源索引",
-                "",
-                "> 按群聊进入链接与文件清单。",
-                "",
-            ]
             for summary in sorted(
                 chat_summaries,
                 key=lambda item: (item["alias"].casefold(), item["path"]),
@@ -1286,13 +1460,21 @@ class MountedResourceBackup:
                     f"- {link} · {summary['links']} 个链接 · "
                     f"{summary['files']} 个文件 · {summary['months']} 个月份"
                 )
-            _, scope_changed = self._write_managed_text(
-                os.path.join(base_root, "00-资源索引.md"),
-                "\n".join(scope_lines),
-                target_view=target_view,
-            )
-            if scope_changed:
-                written += 1
+        else:
+            scope_lines.append("当前没有已选群聊资源。")
+        scope_path, scope_changed = self._write_managed_text(
+            os.path.join(base_root, "00-资源索引.md"),
+            "\n".join(scope_lines),
+            target_view=target_view,
+        )
+        if scope_changed:
+            written += 1
+        managed_paths.append(scope_path)
+        self._reconcile_managed_projection(
+            base_root,
+            managed_paths,
+            target_view=target_view,
+        )
         return written
 
     def render_obsidian_indexes(self):
@@ -1378,6 +1560,34 @@ class MountedResourceBackup:
         }
 
     def run(self):
+        obsidian = {
+            "state": "not_run_worker_busy",
+            "files_written": 0,
+            "occurrences": 0,
+        }
+        try:
+            with self._worker_lock():
+                return self._run_owned()
+        except (ResourceBackupError, ArchiveError, OSError) as exc:
+            if str(getattr(exc, "code", "")) == "worker_busy":
+                return {
+                    "state": "worker_busy",
+                    "copied": 0,
+                    "failed": 0,
+                    "obsidian": obsidian,
+                }
+            code = str(getattr(exc, "code", "") or type(exc).__name__)
+            return {
+                "state": "target_failed",
+                "copied": 0,
+                "reused": 0,
+                "failed": 1,
+                "error_codes": [code],
+                "obsidian": obsidian,
+            }
+
+    def _run_owned(self):
+        """Render and hand off while holding the cross-process operation lock."""
         obsidian = self._render_obsidian_indexes_safely()
         if not self.target:
             return {
@@ -1417,30 +1627,11 @@ class MountedResourceBackup:
                 "failed": 0,
                 "obsidian": obsidian,
             }
-        try:
-            with self._worker_lock():
-                return self._run_locked(
-                    obsidian=obsidian,
-                    occurrences=occurrences,
-                    object_rows=object_rows,
-                )
-        except (ResourceBackupError, ArchiveError, OSError) as exc:
-            if str(getattr(exc, "code", "")) == "worker_busy":
-                return {
-                    "state": "worker_busy",
-                    "copied": 0,
-                    "failed": 0,
-                    "obsidian": obsidian,
-                }
-            code = str(getattr(exc, "code", "") or type(exc).__name__)
-            return {
-                "state": "target_failed",
-                "copied": 0,
-                "reused": 0,
-                "failed": 1,
-                "error_codes": [code],
-                "obsidian": obsidian,
-            }
+        return self._run_locked(
+            obsidian=obsidian,
+            occurrences=occurrences,
+            object_rows=object_rows,
+        )
 
     def _run_locked(self, *, obsidian=None, occurrences=None, object_rows=None):
         occurrences = (
@@ -1463,7 +1654,8 @@ class MountedResourceBackup:
             except (ResourceBackupError, ArchiveError, OSError) as exc:
                 failed += 1
                 error_codes.append(str(getattr(exc, "code", "") or type(exc).__name__))
-        obsidian = self._render_obsidian_indexes_safely()
+        if obsidian is None:
+            obsidian = self._render_obsidian_indexes_safely()
         if failed:
             return {
                 "state": "target_failed",

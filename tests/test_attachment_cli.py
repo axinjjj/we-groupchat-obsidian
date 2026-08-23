@@ -108,8 +108,8 @@ class AttachmentCliTests(unittest.TestCase):
         config = dict(self.config)
         with patch.object(backup_cli, "load_config", return_value=config), patch.object(
             backup_cli,
-            "save_config",
-        ) as save:
+            "update_config",
+        ) as update:
             code, result = self.output_json(
                 lambda: backup_cli.main(["set-target", self.target])
             )
@@ -117,8 +117,9 @@ class AttachmentCliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(result, {"state": "configured", "target": "configured"})
         self.assertNotIn(self.target, json.dumps(result))
-        save.assert_called_once()
-        self.assertEqual(save.call_args.args[0]["attachment_backup_target"], self.target)
+        update.assert_called_once_with(
+            patch={"attachment_backup_target": self.target}
+        )
 
 
 if __name__ == "__main__":

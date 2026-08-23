@@ -274,13 +274,13 @@ the worker never recreates a missing mount path.
 .venv/bin/python scripts/resource_backup.py set-link-export-mode redacted
 .venv/bin/python scripts/resource_backup.py init
 .venv/bin/python scripts/resource_backup.py backfill-links --all
-.venv/bin/python scripts/resource_backup.py backfill-links --all --apply
+.venv/bin/python scripts/resource_backup.py backfill-links --all --apply --run-id <run-id-from-plan>
 .venv/bin/python scripts/resource_backup.py backfill-links --from YYYY-MM-DD
-.venv/bin/python scripts/resource_backup.py backfill-links --from YYYY-MM-DD --apply
+.venv/bin/python scripts/resource_backup.py backfill-links --from YYYY-MM-DD --apply --run-id <run-id-from-plan>
 .venv/bin/python scripts/resource_backup.py backfill --all
-.venv/bin/python scripts/resource_backup.py backfill --all --apply
+.venv/bin/python scripts/resource_backup.py backfill --all --apply --run-id <run-id-from-plan>
 .venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD
-.venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply
+.venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply --run-id <run-id-from-plan>
 .venv/bin/python scripts/resource_backup.py status
 .venv/bin/python scripts/resource_backup.py plan
 .venv/bin/python scripts/resource_backup.py run
@@ -288,14 +288,16 @@ the worker never recreates a missing mount path.
 .venv/bin/python scripts/resource_backup.py verify
 ```
 
-`init` seeds from-now cursors only. Re-selecting a removed chat creates a new
-private selection epoch and skips the unselected gap. Historical backfill is a
-separate dry-plan/apply command and does not move live cursors. `backfill --all`
-starts at timestamp zero and therefore means all history still available in the
-known local WeChat message shards, not an assurance about provider-retained
-remote history. `backfill-links` is the safe link-only entry: it scans
-shard-complete pages, never reads attachment bytes, writes zero rows when any
-known shard is degraded, and commits a complete apply in one SQLite transaction.
+`init` seeds from-now cursors only. Each selection has a UUID epoch, so a rapid
+deselect/reselect cannot reuse a one-second timestamp identity or consume the
+unselected gap. Historical backfill is an identity-bound staged plan/apply and
+does not move live cursors. Planning freezes the selection/source manifest and
+writes bounded 500-2,000-row keyset pages; it does not mutate canonical chat,
+cursor, or occurrence rows. Apply requires the exact unexpired `run_id`, checks
+the staged candidate and current selection digests, and never rescans source.
+`backfill --all` means history still locally readable from known shards.
+`backfill-links` never reads attachment bytes and leaves canonical occurrence
+count unchanged if any known shard is degraded.
 Ordinary `run` captures deterministic metadata occurrences, skips file-byte
 resolution, refreshes local Obsidian indexes even when the target is
 unavailable, and then attempts mounted handoff. `--resolve-files` is explicit.
@@ -341,10 +343,23 @@ Background capture and projection are enabled in the long-lived menu app:
 .venv/bin/python scripts/resource_backup.py uninstall-agent  # legacy cleanup
 ```
 
+The menu app acquires a process-lifetime singleton before source
+initialization. Main config writers patch the latest locked revision and publish
+by same-directory atomic replace; the app watches revisions and reconciles
+timers without restart. Explicit operator CLI source runs remain available but
+share a cross-process capture lock with the app. Projection rendering, managed
+GC, and mounted handoff share a second operation lock.
+
 File-byte resolution remains off by default and requires the menu confirmation
-or an explicit `enable-file-resolution` / `--resolve-files` action. Old resource
+or `--resolve-files` on the current explicit CLI run. Menu consent exists only
+in memory, is never persisted, and resets when the app process exits. Old resource
 LaunchAgent installs are detected and removable, but new installation is
 refused for the same process-lifetime consent reason.
+
+Manual “update complete” notifications require healthy capture, healthy or
+explicitly skipped resolution, successful local projection, and an `idle` or
+`sync_delegated` handoff. Any degraded source, resolution, projection, or target
+phase is reported as incomplete rather than flattened into success.
 
 ## 5. Optional advanced direct selected-chat Google Drive API sync
 

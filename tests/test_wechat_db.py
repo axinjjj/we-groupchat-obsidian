@@ -21,11 +21,8 @@ class WeChatDBCacheRefreshTests(unittest.TestCase):
         self.username = "fallback@chatroom"
         self.table_name = f"Msg_{hashlib.md5(self.username.encode()).hexdigest()}"
         rel_path = "message/message_0.db"
-        self.cache_path = os.path.join(
-            WeChatDB.CACHE_DIR,
-            f"{hashlib.md5(rel_path.encode()).hexdigest()[:12]}.db",
-        )
-        os.makedirs(WeChatDB.CACHE_DIR, exist_ok=True)
+        self.db = WeChatDB(self.tmp.name, keys={})
+        self.cache_path = self.db._cache_path(rel_path)
         conn = sqlite3.connect(self.cache_path)
         try:
             conn.execute(
@@ -42,7 +39,6 @@ class WeChatDBCacheRefreshTests(unittest.TestCase):
             conn.commit()
         finally:
             conn.close()
-        self.db = WeChatDB(self.tmp.name, keys={})
 
     def tearDown(self):
         WeChatDB.CACHE_DIR = self.old_cache_dir
@@ -86,10 +82,7 @@ class WeChatDBCacheRefreshTests(unittest.TestCase):
         ):
             with db.source_snapshot():
                 pinned = db._get_decrypted_db(rel_path)
-                published = os.path.join(
-                    WeChatDB.CACHE_DIR,
-                    f"{hashlib.md5(rel_path.encode()).hexdigest()[:12]}.db",
-                )
+                published = db._cache_path(rel_path)
                 self.assertNotEqual(pinned, published)
                 self.assertTrue(os.path.isfile(published))
                 replacement = os.path.join(self.tmp.name, "replacement.db")
@@ -113,8 +106,83 @@ class WeChatDBCacheRefreshTests(unittest.TestCase):
             self.assertFalse(os.path.exists(pinned))
             self.assertFalse(any(
                 name.startswith(".partial-")
-                for name in os.listdir(WeChatDB.CACHE_DIR)
+                for name in os.listdir(db.cache_dir)
             ))
+
+    def test_cache_namespace_and_key_fingerprint_isolate_source_roots(self):
+        rel_path = "message/message_2.db"
+        first_root = os.path.join(self.tmp.name, "first")
+        second_root = os.path.join(self.tmp.name, "second")
+        for root in (first_root, second_root):
+            source_path = os.path.join(root, rel_path)
+            os.makedirs(os.path.dirname(source_path), exist_ok=True)
+            with open(source_path, "wb") as handle:
+                handle.write(root.encode("utf-8"))
+        first = WeChatDB(first_root, {rel_path: {"enc_key": "11" * 32}})
+        second = WeChatDB(second_root, {rel_path: {"enc_key": "22" * 32}})
+
+        def fake_decrypt(source, output, _key):
+            conn = sqlite3.connect(output)
+            try:
+                conn.execute("CREATE TABLE source_value(value TEXT)")
+                conn.execute("INSERT INTO source_value VALUES (?)", (source,))
+                conn.commit()
+            finally:
+                conn.close()
+            return 1
+
+        with (
+            patch.object(WeChatDB, "_is_plain_sqlite", return_value=False),
+            patch("core.wechat_db.decrypt_database", side_effect=fake_decrypt),
+        ):
+            first_path = first._get_decrypted_db(rel_path)
+            second_path = second._get_decrypted_db(rel_path)
+            first_again = first._get_decrypted_db(rel_path)
+
+        self.assertNotEqual(first.cache_namespace, second.cache_namespace)
+        self.assertNotEqual(first_path, second_path)
+        self.assertEqual(first_path, first_again)
+        conn = sqlite3.connect(first_again)
+        try:
+            value = conn.execute("SELECT value FROM source_value").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(value, os.path.join(first_root, rel_path))
+
+    def test_plaintext_snapshot_uses_online_backup_and_includes_wal(self):
+        rel_path = "message/message_3.db"
+        source_path = os.path.join(self.tmp.name, rel_path)
+        os.makedirs(os.path.dirname(source_path), exist_ok=True)
+        source = sqlite3.connect(source_path)
+        try:
+            source.execute("PRAGMA journal_mode=WAL")
+            source.execute("PRAGMA wal_autocheckpoint=0")
+            source.execute("CREATE TABLE snapshot_value(value TEXT)")
+            source.execute("INSERT INTO snapshot_value VALUES ('from-wal')")
+            source.commit()
+            self.assertTrue(os.path.exists(source_path + "-wal"))
+            db = WeChatDB(self.tmp.name, keys={})
+
+            with db.source_snapshot():
+                pinned = db._get_decrypted_db(rel_path)
+                self.assertFalse(os.path.samefile(source_path, pinned))
+                source.execute("INSERT INTO snapshot_value VALUES ('later')")
+                source.commit()
+                conn = sqlite3.connect(pinned)
+                try:
+                    values = [
+                        row[0]
+                        for row in conn.execute(
+                            "SELECT value FROM snapshot_value ORDER BY rowid"
+                        )
+                    ]
+                finally:
+                    conn.close()
+
+            self.assertEqual(values, ["from-wal"])
+            self.assertFalse(os.path.exists(pinned))
+        finally:
+            source.close()
 
 
 class WeChatDBPagingTests(unittest.TestCase):
@@ -389,6 +457,84 @@ class WeChatSourceEnvelopeTests(unittest.TestCase):
         self.assertNotIn("wgmsg_", formatted)
         self.assertNotIn("server_id", formatted)
         self.assertNotIn("message_7.db", formatted)
+
+    def test_keyset_cursor_bounds_large_same_second_bucket_and_namespaces_ids(self):
+        username = "same-second@chatroom"
+        table_name = f"Msg_{hashlib.md5(username.encode()).hexdigest()}"
+
+        def build_root(name):
+            root = os.path.join(self.tmp.name, name)
+            message_dir = os.path.join(root, "message")
+            os.makedirs(message_dir)
+            path = os.path.join(message_dir, "message_0.db")
+            conn = sqlite3.connect(path)
+            try:
+                conn.execute(f"""
+                    CREATE TABLE [{table_name}] (
+                        local_id INTEGER,
+                        server_id INTEGER,
+                        sort_seq INTEGER,
+                        local_type INTEGER,
+                        create_time INTEGER,
+                        message_content TEXT,
+                        WCDB_CT_message_content INTEGER,
+                        status INTEGER,
+                        packed_info_data BLOB
+                    )
+                """)
+                conn.executemany(
+                    f"INSERT INTO [{table_name}] VALUES (?, ?, ?, 1, 100, ?, NULL, 0, NULL)",
+                    [
+                        (index, 10_000 + index, index, f"sender:\nrow-{index}")
+                        for index in range(1, 1_206)
+                    ],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            return root
+
+        first = WeChatDB(build_root("root-a"), {})
+        second = WeChatDB(build_root("root-b"), {})
+        for source in (first, second):
+            source._contacts = {"sender": "成员"}
+            source._contacts_full = []
+            source._nick_to_remark = {}
+            source._load_contacts = lambda: None
+
+        first_shard = first.get_message_shards(username)[0]
+        second_shard = second.get_message_shards(username)[0]
+        self.assertNotEqual(first_shard, second_shard)
+
+        token = ""
+        pages = []
+        identities = []
+        while True:
+            result = first.get_cursor_page_for_shard(
+                username,
+                first_shard,
+                cursor_token=token,
+                since_ts=0,
+                limit=500,
+            )
+            pages.append(len(result["messages"]))
+            identities.extend(
+                message["source_message_id"] for message in result["messages"]
+            )
+            token = result["next_cursor"]
+            if result["exhausted"]:
+                break
+
+        self.assertEqual(pages, [500, 500, 205])
+        self.assertEqual(len(identities), 1_205)
+        self.assertEqual(len(set(identities)), 1_205)
+        other = second.get_cursor_page_for_shard(
+            username,
+            second_shard,
+            since_ts=0,
+            limit=1,
+        )["messages"][0]
+        self.assertNotEqual(identities[0], other["source_message_id"])
 
 
 class WeChatImageDecoderTests(unittest.TestCase):

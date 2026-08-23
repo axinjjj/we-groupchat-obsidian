@@ -7,12 +7,12 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import sqlite3
 import tempfile
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from datetime import datetime
+from urllib.parse import quote
 
 import zstandard as zstd
 
@@ -320,20 +320,71 @@ class WeChatDB:
             db_dir: WeChat db_storage directory path.
             keys: {rel_path: {"enc_key": hex}, ...} encryption key dictionary.
         """
-        self.db_dir = db_dir
+        self.db_dir = os.path.abspath(os.path.expanduser(db_dir))
         self.keys = keys
-        self._db_cache = {}  # rel_key -> (db_mtime, wal_mtime, cache_path)
+        self._db_cache = {}
         self._contacts = None  # {username: display_name}
         self._contacts_full = None  # [{username, nick_name, remark}]
         self._nick_to_remark = {}  # {nick_name: remark} reverse mapping for nickname→alias lookup
         self._emoticon_map = None  # {md5: {cdn_url, aes_key, thumb_url}}
         self._source_snapshot_depth = 0
         self._source_snapshot_paths = {}
-        os.makedirs(self.CACHE_DIR, exist_ok=True)
+        source_root = os.path.realpath(self.db_dir)
+        try:
+            source_stat = os.stat(source_root)
+            source_identity = (
+                f"{source_root}\0{source_stat.st_dev}\0{source_stat.st_ino}"
+            )
+        except OSError:
+            source_identity = f"{source_root}\00\00"
+        self.cache_namespace = hashlib.sha256(
+            source_identity.encode("utf-8")
+        ).hexdigest()
+        self.cache_dir = os.path.join(self.CACHE_DIR, self.cache_namespace)
+        os.makedirs(self.cache_dir, exist_ok=True)
         try:
             os.chmod(self.CACHE_DIR, 0o700)
+            os.chmod(self.cache_dir, 0o700)
         except OSError:
             pass
+
+    @staticmethod
+    def _file_identity(path):
+        try:
+            value = os.stat(path)
+        except OSError:
+            return None
+        return (
+            int(value.st_dev), int(value.st_ino), int(value.st_size),
+            int(value.st_mtime_ns),
+        )
+
+    def _key_fingerprint(self, rel_path):
+        key = self._get_key(rel_path)
+        if not key:
+            return "no-key"
+        return hashlib.sha256(str(key).encode("utf-8")).hexdigest()
+
+    def _cache_path(self, rel_path):
+        normalized = str(rel_path or "").replace("\\", "/")
+        rel_digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+        identity = hashlib.sha256(
+            f"{normalized}\0{self._key_fingerprint(rel_path)}".encode("utf-8")
+        ).hexdigest()
+        return os.path.join(self.cache_dir, f"{rel_digest}-{identity}.db")
+
+    def _fallback_cache_path(self, rel_path):
+        normalized = str(rel_path or "").replace("\\", "/")
+        rel_digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+        try:
+            matches = [
+                os.path.join(self.cache_dir, name)
+                for name in os.listdir(self.cache_dir)
+                if name.startswith(rel_digest + "-") and name.endswith(".db")
+            ]
+        except OSError:
+            return ""
+        return matches[0] if len(matches) == 1 else ""
 
     def refresh_cache_view(self):
         """Clear in-memory DB/cache metadata without deleting cached DB files."""
@@ -369,14 +420,27 @@ class WeChatDB:
         fd, pinned = tempfile.mkstemp(
             prefix=f".snapshot-{hashlib.md5(rel_path.encode()).hexdigest()[:12]}-",
             suffix=".db",
-            dir=self.CACHE_DIR,
+            dir=self.cache_dir,
         )
         os.close(fd)
-        os.unlink(pinned)
+        source = None
+        destination = None
         try:
-            os.link(path, pinned)
-        except OSError:
-            shutil.copy2(path, pinned)
+            source = sqlite3.connect(f"file:{quote(path)}?mode=ro", uri=True)
+            destination = sqlite3.connect(pinned)
+            source.backup(destination)
+            destination.commit()
+        except sqlite3.Error as exc:
+            try:
+                os.unlink(pinned)
+            except OSError:
+                pass
+            raise WeChatSourceDegraded("source_snapshot_failed") from exc
+        finally:
+            if destination is not None:
+                destination.close()
+            if source is not None:
+                source.close()
         try:
             os.chmod(pinned, 0o600)
         except OSError:
@@ -388,9 +452,9 @@ class WeChatDB:
         """Clear all DB decryption caches, force re-decrypt on next query."""
         self.refresh_cache_view()
         # Clean up cached files on disk
-        if os.path.isdir(self.CACHE_DIR):
+        if os.path.isdir(self.cache_dir):
             import glob as _glob
-            for f in _glob.glob(os.path.join(self.CACHE_DIR, "*.db")):
+            for f in _glob.glob(os.path.join(self.cache_dir, "*.db")):
                 try:
                     os.remove(f)
                 except OSError:
@@ -435,26 +499,30 @@ class WeChatDB:
             return None
 
         wal_path = db_path + "-wal"
-        try:
-            db_mtime = os.path.getmtime(db_path)
-            wal_mtime = os.path.getmtime(wal_path) if os.path.exists(wal_path) else 0
-        except OSError:
+        db_identity = self._file_identity(db_path)
+        wal_identity = self._file_identity(wal_path)
+        if db_identity is None:
             return None
+        key_fingerprint = self._key_fingerprint(rel_path)
 
         # Check cache
         if rel_path in self._db_cache:
-            c_db_mt, c_wal_mt, c_path = self._db_cache[rel_path]
-            # After WAL checkpoint, WAL file disappears (wal_mtime goes from non-zero to 0).
-            # If db_mtime also hasn't changed (data merged into main file), cache is still valid.
-            wal_ok = (c_wal_mt == wal_mtime) or (wal_mtime == 0 and c_db_mt == db_mtime)
-            if c_db_mt == db_mtime and wal_ok and os.path.exists(c_path):
-                return self._pin_source_snapshot(rel_path, c_path)
+            record = self._db_cache[rel_path]
+            cache_path = record["cache_path"]
+            if (
+                record["db_identity"] == db_identity
+                and record["wal_identity"] == wal_identity
+                and record["key_fingerprint"] == key_fingerprint
+                and record["published_identity"] == self._file_identity(cache_path)
+            ):
+                return self._pin_source_snapshot(rel_path, cache_path)
 
         # Decrypt
-        h = hashlib.md5(rel_path.encode()).hexdigest()[:12]
-        cache_path = os.path.join(self.CACHE_DIR, f"{h}.db")
+        cache_path = self._cache_path(rel_path)
 
-        fd, temp_path = tempfile.mkstemp(prefix=".partial-", suffix=".db", dir=self.CACHE_DIR)
+        fd, temp_path = tempfile.mkstemp(
+            prefix=".partial-", suffix=".db", dir=self.cache_dir
+        )
         os.close(fd)
         try:
             pages = decrypt_database(db_path, temp_path, enc_key)
@@ -479,7 +547,13 @@ class WeChatDB:
                 except OSError:
                     pass
 
-        self._db_cache[rel_path] = (db_mtime, wal_mtime, cache_path)
+        self._db_cache[rel_path] = {
+            "db_identity": db_identity,
+            "wal_identity": wal_identity,
+            "key_fingerprint": key_fingerprint,
+            "cache_path": cache_path,
+            "published_identity": self._file_identity(cache_path),
+        }
         return self._pin_source_snapshot(rel_path, cache_path)
 
     def _load_contacts(self):
@@ -670,8 +744,7 @@ class WeChatDB:
                     rel = f"message/{prefix}_{i}.db"
                     if rel in self.keys:
                         continue
-                    h = hashlib.md5(rel.encode()).hexdigest()[:12]
-                    cache_path = os.path.join(self.CACHE_DIR, f"{h}.db")
+                    cache_path = self._fallback_cache_path(rel)
                     if not os.path.exists(cache_path):
                         continue
                     conn = sqlite3.connect(cache_path)
@@ -739,10 +812,12 @@ class WeChatDB:
         except sqlite3.Error:
             return "NULL AS [__rowid]"
 
-    @staticmethod
-    def _db_shard_identity(db_path):
+    def _db_shard_identity(self, db_path):
         basename = os.path.basename(str(db_path))
-        return hashlib.sha256(f"wechat-db-shard-v1\0{basename}".encode()).hexdigest()[:20]
+        namespace = str(getattr(self, "cache_namespace", "legacy-unscoped"))
+        return hashlib.sha256(
+            f"wechat-db-shard-v2\0{namespace}\0{basename}".encode()
+        ).hexdigest()[:20]
 
     @staticmethod
     def _source_message_id(username, envelope):
@@ -784,6 +859,7 @@ class WeChatDB:
         since_inclusive=False,
         include_filtered=False,
         db_shard_id="",
+        after_cursor=None,
     ):
         self._load_contacts()
         is_group = "@chatroom" in username
@@ -810,7 +886,20 @@ class WeChatDB:
                     self._rowid_expr(conn, table_name),
                 ]
                 select_sql = ", ".join(select_fields)
-                if since_ts > 0:
+                if after_cursor is not None and page_forward:
+                    after_timestamp, after_rowid = after_cursor
+                    rows = conn.execute(f"""
+                        SELECT {select_sql}
+                        FROM [{table_name}]
+                        WHERE create_time > ?
+                           OR (create_time = ? AND rowid > ?)
+                        ORDER BY create_time ASC, rowid ASC
+                        LIMIT ?
+                    """, (
+                        int(after_timestamp), int(after_timestamp),
+                        int(after_rowid), max(1, int(limit)),
+                    )).fetchall()
+                elif since_ts > 0:
                     order = "ASC" if page_forward else "DESC"
                     comparison = ">=" if since_inclusive else ">"
                     rows = conn.execute(f"""
@@ -842,7 +931,10 @@ class WeChatDB:
             return []
 
         # Sort by time, take the latest limit entries
-        all_rows.sort(key=lambda row: row["create_time"])
+        all_rows.sort(key=lambda row: (
+            int(row.get("create_time") or 0),
+            int(row.get("__rowid") or 0),
+        ))
         if page_forward:
             rows = all_rows[:limit]
         else:
@@ -934,11 +1026,13 @@ class WeChatDB:
 
         return messages
 
-    @staticmethod
-    def _source_shard_identity(rel_key):
+    def _source_shard_identity(self, rel_key):
         normalized = str(rel_key or "").replace("\\", "/").lower()
+        namespace = str(getattr(self, "cache_namespace", "legacy-unscoped"))
         return hashlib.sha256(
-            f"wechat-message-source-shard-v1\0{normalized}".encode("utf-8")
+            f"wechat-message-source-shard-v2\0{namespace}\0{normalized}".encode(
+                "utf-8"
+            )
         ).hexdigest()[:20]
 
     def _message_shard_specs(self):
@@ -977,8 +1071,7 @@ class WeChatDB:
                 rel_key = f"message/{prefix}_{index}.db"
                 if rel_key in rel_keys:
                     continue
-                digest = hashlib.md5(rel_key.encode()).hexdigest()[:12]
-                cache_path = os.path.join(self.CACHE_DIR, f"{digest}.db")
+                cache_path = self._fallback_cache_path(rel_key)
                 if os.path.isfile(cache_path):
                     specs.append({
                         "source_shard_id": self._source_shard_identity(rel_key),
@@ -1036,6 +1129,92 @@ class WeChatDB:
             include_filtered=True,
         )
 
+    def get_cursor_page_for_shard(
+        self,
+        username,
+        source_shard_id,
+        *,
+        cursor_token="",
+        since_ts=0,
+        limit=500,
+    ):
+        """Read one bounded cursor-complete keyset page from a frozen shard.
+
+        The opaque token binds the exact ``(create_time, rowid)`` position, so a
+        large same-second bucket never expands a request or an in-memory
+        ``seen_ids`` set beyond the configured page size.
+        """
+        page_limit = max(1, int(limit))
+        if cursor_token:
+            try:
+                decoded = json.loads(str(cursor_token))
+                after_cursor = (int(decoded[0]), int(decoded[1]))
+            except (TypeError, ValueError, IndexError, json.JSONDecodeError) as exc:
+                raise WeChatSourceDegraded("source_cursor_invalid") from exc
+        else:
+            after_cursor = (max(0, int(since_ts)), 0)
+
+        spec = next(
+            (
+                item
+                for item in self._message_shard_specs()
+                if item["source_shard_id"] == str(source_shard_id or "")
+            ),
+            None,
+        )
+        if spec is None:
+            raise WeChatSourceDegraded("source_shard_unknown")
+        path = spec["cache_path"] or self._get_decrypted_db(spec["rel_key"])
+        if not path:
+            raise WeChatSourceDegraded("source_shard_unavailable")
+        table_name = f"Msg_{hashlib.md5(username.encode()).hexdigest()}"
+        conn = None
+        try:
+            conn = sqlite3.connect(path)
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table_name,),
+            ).fetchone()
+        except Exception as exc:
+            raise WeChatSourceDegraded("source_shard_unavailable") from exc
+        finally:
+            if conn is not None:
+                conn.close()
+        if not exists:
+            return {"messages": [], "next_cursor": cursor_token, "exhausted": True}
+
+        source_path = os.path.join(self.db_dir, spec["rel_key"])
+        if spec["cache_path"]:
+            identity_path = spec["cache_path"]
+        elif self._is_plain_sqlite(source_path):
+            identity_path = source_path
+        else:
+            identity_path = self._cache_path(spec["rel_key"])
+        messages = self._get_messages_from_paths(
+            username,
+            [path],
+            table_name,
+            limit=page_limit + 1,
+            page_forward=True,
+            include_filtered=True,
+            db_shard_id=self._db_shard_identity(identity_path),
+            after_cursor=after_cursor,
+        )
+        exhausted = len(messages) <= page_limit
+        page = messages[:page_limit]
+        next_cursor = str(cursor_token or "")
+        if page:
+            envelope = page[-1].get("source_envelope") or {}
+            next_cursor = json.dumps([
+                int(envelope.get("create_time") or 0),
+                int(envelope.get("rowid") or 0),
+            ], separators=(",", ":"))
+        return {
+            "messages": page,
+            "next_cursor": next_cursor,
+            "exhausted": exhausted,
+        }
+
     def _get_messages_for_shard(
         self,
         username,
@@ -1081,8 +1260,7 @@ class WeChatDB:
         elif self._is_plain_sqlite(source_path):
             identity_path = source_path
         else:
-            digest = hashlib.md5(spec["rel_key"].encode()).hexdigest()[:12]
-            identity_path = os.path.join(self.CACHE_DIR, f"{digest}.db")
+            identity_path = self._cache_path(spec["rel_key"])
         return self._get_messages_from_paths(
             username,
             [path],

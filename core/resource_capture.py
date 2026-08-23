@@ -8,6 +8,8 @@ string observed in the WeChat message, not an AI-produced summary.
 """
 from __future__ import annotations
 
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -16,6 +18,7 @@ import re
 import sqlite3
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 
 from .attachment_archive import AttachmentArchive
@@ -28,8 +31,9 @@ from .link_preview import URL_RE
 from .wechat_db import WeChatSourceDegraded
 
 
-SCHEMA_VERSION = 1
-BACKFILL_PAGE_SIZE = 50_000
+SCHEMA_VERSION = 2
+BACKFILL_PAGE_SIZE = 1_000
+BACKFILL_RUN_TTL_SECONDS = 24 * 60 * 60
 LINK_ID_DOMAIN = b"we-groupchat-resource-link-v1\0"
 CHAT_ID_DOMAIN = "we-groupchat-resource-chat-v1\0"
 RETRYABLE_FILE_STATES = (
@@ -119,6 +123,7 @@ def eligible_selected_chats(config):
             "username": username,
             "alias": _safe_label(alias, fallback),
             "selected_since": max(0, int(selected.get("selected_since") or 0)),
+            "selection_id": str(selected.get("selection_id") or ""),
         })
     return result
 
@@ -155,12 +160,16 @@ class SelectedResourceCapture:
         now_func=time.time,
         random_func=random.random,
         archive_id_factory=None,
+        backfill_run_id_factory=None,
     ):
         self.config = dict(config or {})
         self.source = source
         self.now_func = now_func
         self.random_func = random_func
         self.archive_id_factory = archive_id_factory or (lambda: str(uuid.uuid4()))
+        self.backfill_run_id_factory = backfill_run_id_factory or (
+            lambda: str(uuid.uuid4())
+        )
         self.db_path = os.path.abspath(os.path.expanduser(
             self.config.get("resource_capture_db")
             or os.path.join(DATA_DIR, "resource_capture.db")
@@ -193,6 +202,30 @@ class SelectedResourceCapture:
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
+    @contextmanager
+    def _operation_lock(self):
+        """Serialize source/cursor work across app and explicit CLI runs."""
+        lock_path = self.db_path + ".capture.lock"
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                    raise ResourceCaptureError("capture_worker_busy") from exc
+                raise
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)
+
     def _ensure_schema(self):
         os.makedirs(os.path.dirname(self.db_path), mode=0o700, exist_ok=True)
         try:
@@ -214,6 +247,7 @@ class SelectedResourceCapture:
                     chat_alias TEXT NOT NULL,
                     start_timestamp INTEGER NOT NULL,
                     selected_since INTEGER NOT NULL DEFAULT 0,
+                    selection_id TEXT NOT NULL DEFAULT '',
                     selection_epoch INTEGER NOT NULL DEFAULT 1,
                     updated_at REAL NOT NULL
                 );
@@ -223,6 +257,7 @@ class SelectedResourceCapture:
                     source_shard_id TEXT NOT NULL,
                     cursor_timestamp INTEGER NOT NULL,
                     cursor_message_ids_json TEXT NOT NULL DEFAULT '[]',
+                    source_cursor_token TEXT NOT NULL DEFAULT '',
                     source_state TEXT NOT NULL DEFAULT 'healthy',
                     last_error_code TEXT NOT NULL DEFAULT '',
                     updated_at REAL NOT NULL,
@@ -266,8 +301,61 @@ class SelectedResourceCapture:
                     ON resource_occurrences(status, next_retry_at, occurrence_id);
                 CREATE INDEX IF NOT EXISTS idx_resource_occurrences_object
                     ON resource_occurrences(object_sha256, occurrence_id);
+
+                CREATE TABLE IF NOT EXISTS resource_backfill_runs (
+                    run_id TEXT PRIMARY KEY,
+                    mode TEXT NOT NULL,
+                    from_timestamp INTEGER NOT NULL,
+                    selected_chat_digest TEXT NOT NULL,
+                    source_manifest_digest TEXT NOT NULL DEFAULT '',
+                    candidate_digest TEXT NOT NULL DEFAULT '',
+                    source_complete INTEGER NOT NULL DEFAULT 0,
+                    state TEXT NOT NULL,
+                    scanned INTEGER NOT NULL DEFAULT 0,
+                    discovered_links INTEGER NOT NULL DEFAULT 0,
+                    discovered_files INTEGER NOT NULL DEFAULT 0,
+                    inserted_links INTEGER NOT NULL DEFAULT 0,
+                    inserted_files INTEGER NOT NULL DEFAULT 0,
+                    error_code TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    applied_at REAL NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS resource_backfill_staged_occurrences (
+                    run_id TEXT NOT NULL,
+                    chat_username TEXT NOT NULL,
+                    chat_key TEXT NOT NULL,
+                    chat_alias TEXT NOT NULL,
+                    source_message_id TEXT NOT NULL,
+                    resource_index INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    source_timestamp INTEGER NOT NULL,
+                    source_month TEXT NOT NULL,
+                    source_time TEXT NOT NULL DEFAULT '',
+                    source_sender TEXT NOT NULL DEFAULT '',
+                    original_name TEXT NOT NULL DEFAULT '',
+                    observed_url TEXT NOT NULL DEFAULT '',
+                    url_sha256 TEXT NOT NULL DEFAULT '',
+                    declared_size INTEGER,
+                    declared_hash TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL,
+                    candidate_sha256 TEXT NOT NULL,
+                    PRIMARY KEY(
+                        run_id, chat_username, source_message_id, kind,
+                        resource_index
+                    ),
+                    FOREIGN KEY(run_id) REFERENCES resource_backfill_runs(run_id)
+                        ON DELETE CASCADE,
+                    CHECK(kind IN ('link', 'file'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_resource_backfill_stage_run
+                    ON resource_backfill_staged_occurrences(
+                        run_id, candidate_sha256
+                    );
                 """
             )
+            conn.execute("BEGIN IMMEDIATE")
             columns = {
                 str(row[1]) for row in conn.execute("PRAGMA table_info(resource_chats)")
             }
@@ -281,6 +369,21 @@ class SelectedResourceCapture:
                     "ALTER TABLE resource_chats "
                     "ADD COLUMN selection_epoch INTEGER NOT NULL DEFAULT 1"
                 )
+            if "selection_id" not in columns:
+                conn.execute(
+                    "ALTER TABLE resource_chats "
+                    "ADD COLUMN selection_id TEXT NOT NULL DEFAULT ''"
+                )
+            shard_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(resource_shards)")
+            }
+            if "source_cursor_token" not in shard_columns:
+                conn.execute(
+                    "ALTER TABLE resource_shards "
+                    "ADD COLUMN source_cursor_token TEXT NOT NULL DEFAULT ''"
+                )
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.commit()
         finally:
             conn.close()
@@ -310,16 +413,48 @@ class SelectedResourceCapture:
             conn.close()
 
     def _ensure_archive_id(self):
-        value = self._meta_get("archive_id")
-        if value:
-            return value
-        value = str(self.archive_id_factory())
+        existing = self._meta_get("archive_id")
+        if existing:
+            try:
+                return str(uuid.UUID(existing))
+            except ValueError as exc:
+                raise ResourceCaptureError("archive_id_invalid") from exc
+        conn = self._connect()
         try:
-            value = str(uuid.UUID(value))
+            has_identity_bound_data = any(
+                int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                for table in ("resource_chats", "resource_occurrences")
+            )
+        finally:
+            conn.close()
+        if has_identity_bound_data:
+            raise ResourceCaptureError("archive_identity_missing")
+        candidate = str(self.archive_id_factory())
+        try:
+            candidate = str(uuid.UUID(candidate))
         except ValueError as exc:
             raise ResourceCaptureError("archive_id_invalid") from exc
-        self._meta_set("archive_id", value)
-        return value
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT OR IGNORE INTO resource_meta(key, value) VALUES ('archive_id', ?)",
+                (candidate,),
+            )
+            row = conn.execute(
+                "SELECT value FROM resource_meta WHERE key = 'archive_id'"
+            ).fetchone()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        value = str(row["value"] if row else "")
+        try:
+            return str(uuid.UUID(value))
+        except ValueError as exc:
+            raise ResourceCaptureError("archive_id_invalid") from exc
 
     def _chat_key(self, username):
         return hashlib.sha256(
@@ -333,6 +468,7 @@ class SelectedResourceCapture:
                 "alias": chat["alias"],
                 "chat_key": self._chat_key(chat["username"]),
                 "selected_since": int(chat.get("selected_since") or 0),
+                "selection_id": str(chat.get("selection_id") or ""),
             }
             for chat in eligible_selected_chats(self.config)
         ]
@@ -355,6 +491,7 @@ class SelectedResourceCapture:
                     (chat["username"],),
                 ).fetchone()
                 selected_since = int(chat.get("selected_since") or 0)
+                selection_id = str(chat.get("selection_id") or "")
                 start = (
                     default_start
                     if start_timestamp is not None or not selected_since
@@ -365,32 +502,38 @@ class SelectedResourceCapture:
                         """
                         INSERT INTO resource_chats(
                             chat_username, chat_key, chat_alias, start_timestamp,
-                            selected_since, selection_epoch, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, 1, ?)
+                            selected_since, selection_id, selection_epoch, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, 1, ?)
                         """,
                         (
                             chat["username"], chat["chat_key"], chat["alias"],
-                            start, selected_since, self.now_func(),
+                            start, selected_since, selection_id, self.now_func(),
                         ),
                     )
                     inserted += 1
                 else:
                     epoch_changed = bool(
-                        selected_since
-                        and int(existing["selected_since"] or 0) != selected_since
+                        (selection_id and str(existing["selection_id"] or "") != selection_id)
+                        or (
+                            not selection_id
+                            and selected_since
+                            and int(existing["selected_since"] or 0) != selected_since
+                        )
                     )
                     if epoch_changed:
                         conn.execute(
                             """
                             UPDATE resource_chats
                             SET chat_key = ?, chat_alias = ?, start_timestamp = ?,
-                                selected_since = ?, selection_epoch = selection_epoch + 1,
+                                selected_since = ?, selection_id = ?,
+                                selection_epoch = selection_epoch + 1,
                                 updated_at = ?
                             WHERE chat_username = ?
                             """,
                             (
                                 chat["chat_key"], chat["alias"], start,
-                                selected_since, self.now_func(), chat["username"],
+                                selected_since, selection_id, self.now_func(),
+                                chat["username"],
                             ),
                         )
                         conn.execute(
@@ -491,10 +634,39 @@ class SelectedResourceCapture:
         finally:
             conn.close()
 
-    def _source_page(self, username, source_shard_id, cursor_timestamp, seen_ids, limit):
+    def _source_page(
+        self,
+        username,
+        source_shard_id,
+        cursor_timestamp,
+        seen_ids,
+        limit,
+        *,
+        cursor_token="",
+    ):
         if self.source is None:
             raise ResourceCaptureError("source_unavailable")
-        request_limit = max(1, int(limit)) + len(seen_ids)
+        keyset_reader = getattr(self.source, "get_cursor_page_for_shard", None)
+        if callable(keyset_reader):
+            result = keyset_reader(
+                username,
+                source_shard_id,
+                cursor_token=str(cursor_token or ""),
+                since_ts=max(0, int(cursor_timestamp)),
+                limit=max(1, int(limit)),
+            )
+            messages = list((result or {}).get("messages") or [])
+            return (
+                messages,
+                str((result or {}).get("next_cursor") or cursor_token or ""),
+                bool((result or {}).get("exhausted")),
+            )
+
+        # Compatibility adapters still use timestamp + identity filtering. Keep
+        # their request strictly bounded; production WeChatDB uses the opaque
+        # keyset path above and therefore handles arbitrarily large same-second
+        # buckets without growing this request.
+        request_limit = max(1, int(limit))
         reader = getattr(
             self.source,
             "get_cursor_messages_for_shard",
@@ -521,7 +693,8 @@ class SelectedResourceCapture:
             int(item.get("timestamp") or 0),
             str(item.get("source_message_id") or ""),
         ))
-        return fresh[:limit]
+        page = fresh[:limit]
+        return page, "", len(messages) < request_limit or not page
 
     @staticmethod
     def _cursor_after(messages, old_timestamp, old_ids):
@@ -542,6 +715,124 @@ class SelectedResourceCapture:
     def _inserted(cursor):
         return max(0, int(cursor.rowcount or 0))
 
+    @staticmethod
+    def _candidate_sha256(candidate):
+        payload = json.dumps(
+            candidate,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _normalized_occurrence_candidates(
+        self,
+        chat,
+        messages,
+        *,
+        include_links=True,
+        include_files=True,
+    ):
+        for message in messages:
+            source_message_id = str(message.get("source_message_id") or "").strip()
+            timestamp = int(message.get("timestamp") or 0)
+            if not source_message_id or not timestamp:
+                continue
+            source_time = str(message.get("time_str") or "")[:40]
+            sender = str(
+                message.get("sender") or message.get("group_nickname") or ""
+            )[:80]
+            month = _month(timestamp)
+            text = str(message.get("text") or message.get("content") or "")
+
+            for index, url in enumerate(_exact_links(text) if include_links else ()):
+                yield {
+                    "chat_username": chat["username"],
+                    "chat_key": chat["chat_key"],
+                    "chat_alias": chat["alias"],
+                    "source_message_id": source_message_id,
+                    "resource_index": index,
+                    "kind": "link",
+                    "source_timestamp": timestamp,
+                    "source_month": month,
+                    "source_time": source_time,
+                    "source_sender": sender,
+                    "original_name": _link_title(text, url),
+                    "observed_url": url,
+                    "url_sha256": _url_sha256(url),
+                    "declared_size": None,
+                    "declared_hash": "",
+                    "status": "ready_metadata",
+                }
+
+            resources = (message.get("resources") or []) if include_files else ()
+            for fallback_index, resource in enumerate(resources):
+                if (
+                    not isinstance(resource, dict)
+                    or str(resource.get("kind") or "") != "file"
+                ):
+                    continue
+                try:
+                    resource_index = max(
+                        0, int(resource.get("resource_index", fallback_index))
+                    )
+                except (TypeError, ValueError):
+                    resource_index = fallback_index
+                declared_size = resource.get("declared_size")
+                if declared_size is not None:
+                    try:
+                        declared_size = max(0, int(declared_size))
+                    except (TypeError, ValueError):
+                        declared_size = None
+                yield {
+                    "chat_username": chat["username"],
+                    "chat_key": chat["chat_key"],
+                    "chat_alias": chat["alias"],
+                    "source_message_id": source_message_id,
+                    "resource_index": resource_index,
+                    "kind": "file",
+                    "source_timestamp": timestamp,
+                    "source_month": month,
+                    "source_time": source_time,
+                    "source_sender": sender,
+                    "original_name": _safe_label(
+                        resource.get("original_name"), "attachment"
+                    ),
+                    "observed_url": "",
+                    "url_sha256": "",
+                    "declared_size": declared_size,
+                    "declared_hash": str(
+                        resource.get("declared_hash") or resource.get("md5") or ""
+                    ).lower()[:128],
+                    "status": "queued",
+                }
+
+    @staticmethod
+    def _insert_normalized_occurrence(conn, candidate, now):
+        return conn.execute(
+            """
+            INSERT OR IGNORE INTO resource_occurrences(
+                chat_username, chat_key, chat_alias, source_message_id,
+                resource_index, kind, source_timestamp, source_month,
+                source_time, source_sender, original_name, observed_url,
+                url_sha256, declared_size, declared_hash, status,
+                created_at, updated_at
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                candidate["chat_username"], candidate["chat_key"],
+                candidate["chat_alias"], candidate["source_message_id"],
+                candidate["resource_index"], candidate["kind"],
+                candidate["source_timestamp"], candidate["source_month"],
+                candidate["source_time"], candidate["source_sender"],
+                candidate["original_name"], candidate["observed_url"],
+                candidate["url_sha256"], candidate["declared_size"],
+                candidate["declared_hash"], candidate["status"], now, now,
+            ),
+        )
+
     def _insert_occurrences(
         self,
         conn,
@@ -554,73 +845,38 @@ class SelectedResourceCapture:
     ):
         captured_links = 0
         captured_files = 0
-        for message in messages:
-            source_message_id = str(message.get("source_message_id") or "").strip()
-            timestamp = int(message.get("timestamp") or 0)
-            if not source_message_id or not timestamp:
-                continue
-            source_time = str(message.get("time_str") or "")[:40]
-            sender = str(message.get("sender") or message.get("group_nickname") or "")[:80]
-            month = _month(timestamp)
-            text = str(message.get("text") or message.get("content") or "")
-
-            for index, url in enumerate(_exact_links(text) if include_links else ()):
-                cursor = conn.execute(
-                    """
-                    INSERT OR IGNORE INTO resource_occurrences(
-                        chat_username, chat_key, chat_alias, source_message_id,
-                        resource_index, kind, source_timestamp, source_month,
-                        source_time, source_sender, original_name, observed_url,
-                        url_sha256, status, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 'link', ?, ?, ?, ?, ?, ?, ?,
-                              'ready_metadata', ?, ?)
-                    """,
-                    (
-                        chat["username"], chat["chat_key"], chat["alias"],
-                        source_message_id, index, timestamp, month, source_time,
-                        sender, _link_title(text, url), url, _url_sha256(url), now, now,
-                    ),
-                )
-                captured_links += self._inserted(cursor)
-
-            resources = (message.get("resources") or []) if include_files else ()
-            for fallback_index, resource in enumerate(resources):
-                if not isinstance(resource, dict) or str(resource.get("kind") or "") != "file":
-                    continue
-                try:
-                    resource_index = max(0, int(resource.get("resource_index", fallback_index)))
-                except (TypeError, ValueError):
-                    resource_index = fallback_index
-                declared_size = resource.get("declared_size")
-                if declared_size is not None:
-                    try:
-                        declared_size = max(0, int(declared_size))
-                    except (TypeError, ValueError):
-                        declared_size = None
-                cursor = conn.execute(
-                    """
-                    INSERT OR IGNORE INTO resource_occurrences(
-                        chat_username, chat_key, chat_alias, source_message_id,
-                        resource_index, kind, source_timestamp, source_month,
-                        source_time, source_sender, original_name, declared_size,
-                        declared_hash, status, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 'file', ?, ?, ?, ?, ?, ?, ?,
-                              'queued', ?, ?)
-                    """,
-                    (
-                        chat["username"], chat["chat_key"], chat["alias"],
-                        source_message_id, resource_index, timestamp, month,
-                        source_time, sender,
-                        _safe_label(resource.get("original_name"), "attachment"),
-                        declared_size,
-                        str(resource.get("declared_hash") or resource.get("md5") or "").lower()[:128],
-                        now, now,
-                    ),
-                )
-                captured_files += self._inserted(cursor)
+        candidates = self._normalized_occurrence_candidates(
+            chat,
+            messages,
+            include_links=include_links,
+            include_files=include_files,
+        )
+        for candidate in candidates:
+            inserted = self._inserted(
+                self._insert_normalized_occurrence(conn, candidate, now)
+            )
+            if candidate["kind"] == "link":
+                captured_links += inserted
+            else:
+                captured_files += inserted
         return captured_links, captured_files
 
     def scan(self):
+        try:
+            with self._operation_lock():
+                return self._scan_locked()
+        except ResourceCaptureError as exc:
+            if exc.code == "capture_worker_busy":
+                return {
+                    "state": "worker_busy",
+                    "scanned": 0,
+                    "captured_links": 0,
+                    "captured_files": 0,
+                    "error_code": exc.code,
+                }
+            raise
+
+    def _scan_locked(self):
         chats = self.selected_chats()
         if not chats:
             return {
@@ -670,9 +926,10 @@ class SelectedResourceCapture:
                 except (TypeError, ValueError, json.JSONDecodeError):
                     seen_ids = set()
                 try:
-                    messages = self._source_page(
+                    messages, next_cursor_token, _exhausted = self._source_page(
                         chat["username"], source_shard_id,
                         cursor_timestamp, seen_ids, max_messages,
+                        cursor_token=str(shard["source_cursor_token"] or ""),
                     )
                 except WeChatSourceDegraded as exc:
                     code = self._source_error_code(exc)
@@ -689,18 +946,25 @@ class SelectedResourceCapture:
                 try:
                     conn.execute("BEGIN IMMEDIATE")
                     links, files = self._insert_occurrences(conn, chat, messages, now)
-                    conn.execute(
+                    updated = conn.execute(
                         """
                         UPDATE resource_shards
                         SET cursor_timestamp = ?, cursor_message_ids_json = ?,
-                            source_state = 'healthy', last_error_code = '', updated_at = ?
+                            source_cursor_token = ?, source_state = 'healthy',
+                            last_error_code = '', updated_at = ?
                         WHERE chat_username = ? AND source_shard_id = ?
+                          AND cursor_timestamp = ?
+                          AND source_cursor_token = ?
                         """,
                         (
-                            new_timestamp, json.dumps(sorted(new_ids)), now,
-                            chat["username"], source_shard_id,
+                            new_timestamp, json.dumps(sorted(new_ids)),
+                            next_cursor_token, now, chat["username"],
+                            source_shard_id, cursor_timestamp,
+                            str(shard["source_cursor_token"] or ""),
                         ),
                     )
+                    if int(updated.rowcount or 0) != 1:
+                        raise ResourceCaptureError("source_cursor_changed")
                     conn.commit()
                 except Exception:
                     conn.rollback()
@@ -724,101 +988,270 @@ class SelectedResourceCapture:
             "error_code": source_error_code,
         }
 
-    def backfill(self, from_timestamp, *, apply=False):
-        """Plan or explicitly apply historical occurrences without moving live cursors."""
+    def backfill(self, from_timestamp, *, apply=False, run_id=""):
+        """Stage or apply one identity-bound link-and-file backfill run."""
         return self._run_backfill(
             from_timestamp,
             apply=apply,
+            run_id=run_id,
             include_links=True,
             include_files=True,
             mode="links_and_files",
         )
 
-    def backfill_links(self, from_timestamp, *, apply=False):
-        """Plan or apply exact historical links without touching attachment cache."""
+    def backfill_links(self, from_timestamp, *, apply=False, run_id=""):
+        """Stage or apply exact historical links without attachment access."""
         return self._run_backfill(
             from_timestamp,
             apply=apply,
+            run_id=run_id,
             include_links=True,
             include_files=False,
             mode="links_only",
         )
 
-    def _run_backfill(
+    @staticmethod
+    def _digest_json(value):
+        payload = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _selected_chat_digest(self, chats=None):
+        chats = self.selected_chats() if chats is None else chats
+        return self._digest_json([
+            {
+                "username": chat["username"],
+                "chat_key": chat["chat_key"],
+                "alias": chat["alias"],
+                "selected_since": int(chat.get("selected_since") or 0),
+                "selection_id": str(chat.get("selection_id") or ""),
+            }
+            for chat in chats
+        ])
+
+    def cleanup_backfill_runs(self):
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                "DELETE FROM resource_backfill_runs WHERE expires_at <= ?",
+                (self.now_func(),),
+            )
+            removed = self._inserted(cursor)
+            conn.commit()
+            return removed
+        finally:
+            conn.close()
+
+    def _create_backfill_run(self, mode, from_timestamp, chats):
+        run_id = str(self.backfill_run_id_factory())
+        try:
+            run_id = str(uuid.UUID(run_id))
+        except ValueError as exc:
+            raise ResourceCaptureError("backfill_run_id_invalid") from exc
+        now = self.now_func()
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO resource_backfill_runs(
+                    run_id, mode, from_timestamp, selected_chat_digest,
+                    state, created_at, expires_at
+                ) VALUES (?, ?, ?, ?, 'staging', ?, ?)
+                """,
+                (
+                    run_id, mode, max(0, int(from_timestamp)),
+                    self._selected_chat_digest(chats), now,
+                    now + BACKFILL_RUN_TTL_SECONDS,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return run_id
+
+    def _stage_backfill_page(
+        self,
+        run_id,
+        chat,
+        page,
+        *,
+        include_links,
+        include_files,
+    ):
+        inserted_links = 0
+        inserted_files = 0
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for candidate in self._normalized_occurrence_candidates(
+                chat,
+                page,
+                include_links=include_links,
+                include_files=include_files,
+            ):
+                cursor = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO resource_backfill_staged_occurrences(
+                        run_id, chat_username, chat_key, chat_alias,
+                        source_message_id, resource_index, kind,
+                        source_timestamp, source_month, source_time,
+                        source_sender, original_name, observed_url, url_sha256,
+                        declared_size, declared_hash, status, candidate_sha256
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        candidate["chat_username"], candidate["chat_key"],
+                        candidate["chat_alias"], candidate["source_message_id"],
+                        candidate["resource_index"], candidate["kind"],
+                        candidate["source_timestamp"], candidate["source_month"],
+                        candidate["source_time"], candidate["source_sender"],
+                        candidate["original_name"], candidate["observed_url"],
+                        candidate["url_sha256"], candidate["declared_size"],
+                        candidate["declared_hash"], candidate["status"],
+                        self._candidate_sha256(candidate),
+                    ),
+                )
+                if self._inserted(cursor):
+                    if candidate["kind"] == "link":
+                        inserted_links += 1
+                    else:
+                        inserted_files += 1
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return inserted_links, inserted_files
+
+    def _staged_candidate_digest(self, conn, run_id):
+        digest = hashlib.sha256()
+        for row in conn.execute(
+            """
+            SELECT *
+            FROM resource_backfill_staged_occurrences
+            WHERE run_id = ?
+            ORDER BY chat_username, source_timestamp, source_message_id,
+                     kind, resource_index
+            """,
+            (run_id,),
+        ):
+            candidate = {
+                key: row[key]
+                for key in (
+                    "chat_username", "chat_key", "chat_alias",
+                    "source_message_id", "resource_index", "kind",
+                    "source_timestamp", "source_month", "source_time",
+                    "source_sender", "original_name", "observed_url",
+                    "url_sha256", "declared_size", "declared_hash", "status",
+                )
+            }
+            candidate_hash = self._candidate_sha256(candidate)
+            if candidate_hash != str(row["candidate_sha256"]):
+                digest.update(b"tampered:")
+            digest.update(candidate_hash.encode("ascii"))
+            digest.update(b"\n")
+        return digest.hexdigest()
+
+    @staticmethod
+    def _backfill_result(row, **overrides):
+        value = dict(row or {})
+        result = {
+            "state": str(value.get("state") or "run_not_found"),
+            "run_id": str(value.get("run_id") or ""),
+            "candidate_digest": str(value.get("candidate_digest") or ""),
+            "selected_chat_digest": str(value.get("selected_chat_digest") or ""),
+            "source_manifest_digest": str(value.get("source_manifest_digest") or ""),
+            "scanned": int(value.get("scanned") or 0),
+            "discovered_links": int(value.get("discovered_links") or 0),
+            "discovered_files": int(value.get("discovered_files") or 0),
+            "inserted_links": int(value.get("inserted_links") or 0),
+            "inserted_files": int(value.get("inserted_files") or 0),
+            "error_code": str(value.get("error_code") or ""),
+            "mode": str(value.get("mode") or ""),
+            "from_timestamp": int(value.get("from_timestamp") or 0),
+            "source_complete": bool(value.get("source_complete")),
+        }
+        result.update(overrides)
+        return result
+
+    def _finish_backfill_plan(
+        self,
+        run_id,
+        *,
+        state,
+        source_complete,
+        scanned,
+        discovered_links,
+        discovered_files,
+        source_manifest,
+        error_code="",
+    ):
+        conn = self._connect()
+        try:
+            candidate_digest = self._staged_candidate_digest(conn, run_id)
+            conn.execute(
+                """
+                UPDATE resource_backfill_runs
+                SET source_manifest_digest = ?, candidate_digest = ?,
+                    source_complete = ?, state = ?, scanned = ?,
+                    discovered_links = ?, discovered_files = ?, error_code = ?
+                WHERE run_id = ?
+                """,
+                (
+                    self._digest_json(source_manifest), candidate_digest,
+                    1 if source_complete else 0, state, scanned,
+                    discovered_links, discovered_files, error_code, run_id,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM resource_backfill_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            conn.commit()
+            return self._backfill_result(row)
+        finally:
+            conn.close()
+
+    def _plan_backfill(
         self,
         from_timestamp,
         *,
-        apply,
         include_links,
         include_files,
         mode,
     ):
-        snapshot = getattr(self.source, "source_snapshot", None)
-        if snapshot is not None:
-            with snapshot():
-                return self._backfill(
-                    from_timestamp,
-                    apply=apply,
-                    include_links=include_links,
-                    include_files=include_files,
-                    mode=mode,
-                )
-        return self._backfill(
-            from_timestamp,
-            apply=apply,
-            include_links=include_links,
-            include_files=include_files,
-            mode=mode,
-        )
-
-    def _backfill(
-        self,
-        from_timestamp,
-        *,
-        apply=False,
-        include_links=True,
-        include_files=True,
-        mode="links_and_files",
-    ):
+        from_timestamp = max(0, int(from_timestamp))
         chats = self.selected_chats()
         if not chats:
-            return {
+            return self._backfill_result({
                 "state": "no_selected_chats",
                 "mode": mode,
-                "from_timestamp": max(0, int(from_timestamp)),
-                "source_complete": False,
-                "scanned": 0,
-                "discovered_links": 0,
-                "discovered_files": 0,
-                "inserted_links": 0,
-                "inserted_files": 0,
-            }
+                "from_timestamp": from_timestamp,
+            })
         if self.source is None:
-            return {
+            return self._backfill_result({
                 "state": "source_unavailable",
                 "mode": mode,
-                "from_timestamp": max(0, int(from_timestamp)),
-                "source_complete": False,
-                "scanned": 0,
-                "discovered_links": 0,
-                "discovered_files": 0,
-                "inserted_links": 0,
-                "inserted_files": 0,
+                "from_timestamp": from_timestamp,
                 "error_code": "source_unavailable",
-            }
-        self.initialize_selected_chat_cursors()
-        max_messages = max(1, int(
-            self.config.get("resource_backup_max_messages_per_scan", 500)
-        ))
-        max_messages = max(max_messages, BACKFILL_PAGE_SIZE)
+            })
+        self.cleanup_backfill_runs()
+        run_id = self._create_backfill_run(mode, from_timestamp, chats)
+        page_size = min(2_000, max(500, int(
+            self.config.get("resource_backup_max_messages_per_scan", BACKFILL_PAGE_SIZE)
+        )))
         scanned = 0
         discovered_links = 0
         discovered_files = 0
-        inserted_links = 0
-        inserted_files = 0
         degraded_shards = 0
         source_error_code = ""
-        pending_batches = []
+        source_manifest = []
         for chat in chats:
             try:
                 source_shards = list(self.source.get_message_shards(chat["username"]))
@@ -826,18 +1259,24 @@ class SelectedResourceCapture:
                 degraded_shards += 1
                 source_error_code = self._source_error_code(exc)
                 continue
+            source_manifest.append({
+                "chat_key": chat["chat_key"],
+                "source_shards": list(source_shards),
+            })
             if not source_shards:
                 degraded_shards += 1
                 source_error_code = "source_shards_unavailable"
                 continue
             for source_shard_id in source_shards:
-                cursor_timestamp = max(0, int(from_timestamp))
+                cursor_timestamp = from_timestamp
                 seen_ids = set()
+                cursor_token = ""
                 while True:
                     try:
-                        page = self._source_page(
+                        page, next_cursor_token, exhausted = self._source_page(
                             chat["username"], source_shard_id,
-                            cursor_timestamp, seen_ids, max_messages,
+                            cursor_timestamp, seen_ids, page_size,
+                            cursor_token=cursor_token,
                         )
                     except WeChatSourceDegraded as exc:
                         degraded_shards += 1
@@ -846,77 +1285,213 @@ class SelectedResourceCapture:
                     if not page:
                         break
                     scanned += len(page)
-                    page_links = sum(
-                        len(_exact_links(str(message.get("text") or message.get("content") or "")))
-                        for message in page
-                    ) if include_links else 0
-                    page_files = sum(
-                        1
-                        for message in page
-                        for resource in (message.get("resources") or [])
-                        if isinstance(resource, dict)
-                        and str(resource.get("kind") or "") == "file"
-                    ) if include_files else 0
-                    discovered_links += page_links
-                    discovered_files += page_files
-                    if apply and (page_links or page_files):
-                        relevant = []
-                        for message in page:
-                            has_links = include_links and bool(_exact_links(str(
-                                message.get("text") or message.get("content") or ""
-                            )))
-                            has_files = include_files and any(
-                                isinstance(resource, dict)
-                                and str(resource.get("kind") or "") == "file"
-                                for resource in (message.get("resources") or [])
-                            )
-                            if has_links or has_files:
-                                relevant.append(message)
-                        if relevant:
-                            pending_batches.append((chat, relevant))
-                    cursor_timestamp, seen_ids = self._cursor_after(
-                        page, cursor_timestamp, seen_ids
-                    )
-                    if len(page) < max_messages:
-                        break
-        if apply and not degraded_shards and pending_batches:
-            conn = self._connect()
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                for chat, messages in pending_batches:
-                    links, files = self._insert_occurrences(
-                        conn,
+                    links, files = self._stage_backfill_page(
+                        run_id,
                         chat,
-                        messages,
-                        self.now_func(),
+                        page,
                         include_links=include_links,
                         include_files=include_files,
                     )
-                    inserted_links += links
-                    inserted_files += files
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-            finally:
-                conn.close()
-        return {
-            "state": (
-                "source_degraded"
-                if degraded_shards
-                else "applied" if apply else "planned"
-            ),
-            "scanned": scanned,
-            "discovered_links": discovered_links,
-            "discovered_files": discovered_files,
-            "inserted_links": inserted_links,
-            "inserted_files": inserted_files,
-            "degraded_shards": degraded_shards,
-            "error_code": source_error_code,
-            "mode": mode,
-            "from_timestamp": max(0, int(from_timestamp)),
-            "source_complete": degraded_shards == 0,
-        }
+                    discovered_links += links
+                    discovered_files += files
+                    cursor_timestamp, seen_ids = self._cursor_after(
+                        page, cursor_timestamp, seen_ids
+                    )
+                    cursor_token = next_cursor_token
+                    if exhausted:
+                        break
+        return self._finish_backfill_plan(
+            run_id,
+            state="source_degraded" if degraded_shards else "planned",
+            source_complete=degraded_shards == 0,
+            scanned=scanned,
+            discovered_links=discovered_links,
+            discovered_files=discovered_files,
+            source_manifest=source_manifest,
+            error_code=source_error_code,
+        )
+
+    def _apply_backfill_run(self, run_id, *, mode, from_timestamp):
+        if not run_id:
+            return self._backfill_result({
+                "state": "plan_required",
+                "mode": mode,
+                "from_timestamp": max(0, int(from_timestamp)),
+                "error_code": "backfill_run_id_required",
+            })
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM resource_backfill_runs WHERE run_id = ?",
+                (str(run_id),),
+            ).fetchone()
+            if row is None:
+                return self._backfill_result({
+                    "state": "run_not_found",
+                    "run_id": str(run_id),
+                    "mode": mode,
+                    "from_timestamp": max(0, int(from_timestamp)),
+                    "error_code": "backfill_run_not_found",
+                })
+            result = self._backfill_result(row)
+            if float(row["expires_at"] or 0) <= self.now_func():
+                return self._backfill_result(row, state="plan_expired", source_complete=False)
+            if row["state"] == "applied":
+                return result
+            if (
+                row["state"] != "planned"
+                or not bool(row["source_complete"])
+                or str(row["mode"]) != mode
+                or int(row["from_timestamp"]) != max(0, int(from_timestamp))
+            ):
+                return self._backfill_result(
+                    row,
+                    state="plan_not_applicable",
+                    source_complete=False,
+                    error_code="backfill_plan_not_applicable",
+                )
+            if str(row["selected_chat_digest"]) != self._selected_chat_digest():
+                return self._backfill_result(
+                    row,
+                    state="selection_changed",
+                    source_complete=False,
+                    error_code="selected_chat_digest_mismatch",
+                )
+            if str(row["candidate_digest"]) != self._staged_candidate_digest(conn, run_id):
+                return self._backfill_result(
+                    row,
+                    state="candidate_mismatch",
+                    source_complete=False,
+                    error_code="candidate_digest_mismatch",
+                )
+
+            # Planning is staging-only. Canonical chat/cursor rows are created or
+            # reconciled only after the user applies the identity-bound plan.
+            self.initialize_selected_chat_cursors()
+            now = self.now_func()
+            conn.execute("BEGIN IMMEDIATE")
+            before = conn.total_changes
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO resource_occurrences(
+                    chat_username, chat_key, chat_alias, source_message_id,
+                    resource_index, kind, source_timestamp, source_month,
+                    source_time, source_sender, original_name, observed_url,
+                    url_sha256, declared_size, declared_hash, status,
+                    created_at, updated_at
+                )
+                SELECT chat_username, chat_key, chat_alias, source_message_id,
+                       resource_index, kind, source_timestamp, source_month,
+                       source_time, source_sender, original_name, observed_url,
+                       url_sha256, declared_size, declared_hash, status, ?, ?
+                FROM resource_backfill_staged_occurrences
+                WHERE run_id = ? AND kind = 'link'
+                """,
+                (now, now, run_id),
+            )
+            inserted_links = conn.total_changes - before
+            before = conn.total_changes
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO resource_occurrences(
+                    chat_username, chat_key, chat_alias, source_message_id,
+                    resource_index, kind, source_timestamp, source_month,
+                    source_time, source_sender, original_name, observed_url,
+                    url_sha256, declared_size, declared_hash, status,
+                    created_at, updated_at
+                )
+                SELECT chat_username, chat_key, chat_alias, source_message_id,
+                       resource_index, kind, source_timestamp, source_month,
+                       source_time, source_sender, original_name, observed_url,
+                       url_sha256, declared_size, declared_hash, status, ?, ?
+                FROM resource_backfill_staged_occurrences
+                WHERE run_id = ? AND kind = 'file'
+                """,
+                (now, now, run_id),
+            )
+            inserted_files = conn.total_changes - before
+            conn.execute(
+                """
+                UPDATE resource_backfill_runs
+                SET state = 'applied', applied_at = ?, inserted_links = ?,
+                    inserted_files = ?
+                WHERE run_id = ? AND state = 'planned'
+                """,
+                (now, inserted_links, inserted_files, run_id),
+            )
+            applied = conn.execute(
+                "SELECT * FROM resource_backfill_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            conn.commit()
+            return self._backfill_result(applied)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _run_backfill(
+        self,
+        from_timestamp,
+        *,
+        apply,
+        run_id,
+        include_links,
+        include_files,
+        mode,
+    ):
+        try:
+            with self._operation_lock():
+                return self._run_backfill_locked(
+                    from_timestamp,
+                    apply=apply,
+                    run_id=run_id,
+                    include_links=include_links,
+                    include_files=include_files,
+                    mode=mode,
+                )
+        except ResourceCaptureError as exc:
+            if exc.code == "capture_worker_busy":
+                return self._backfill_result({
+                    "state": "worker_busy",
+                    "mode": mode,
+                    "from_timestamp": max(0, int(from_timestamp)),
+                    "error_code": exc.code,
+                })
+            raise
+
+    def _run_backfill_locked(
+        self,
+        from_timestamp,
+        *,
+        apply,
+        run_id,
+        include_links,
+        include_files,
+        mode,
+    ):
+        if apply:
+            return self._apply_backfill_run(
+                run_id,
+                mode=mode,
+                from_timestamp=from_timestamp,
+            )
+        snapshot = getattr(self.source, "source_snapshot", None)
+        if snapshot is not None:
+            with snapshot():
+                return self._plan_backfill(
+                    from_timestamp,
+                    include_links=include_links,
+                    include_files=include_files,
+                    mode=mode,
+                )
+        return self._plan_backfill(
+            from_timestamp,
+            include_links=include_links,
+            include_files=include_files,
+            mode=mode,
+        )
 
     def _retry_delay(self, attempt_count):
         base = max(1, int(self.config.get("attachment_archive_retry_base_seconds", 300)))
@@ -1103,7 +1678,7 @@ class SelectedResourceCapture:
             "error_code": self._meta_get("source_error_code", ""),
         }
 
-    def run(self, resolve_limit=50, *, resolve_files=True):
+    def run(self, resolve_limit=50, *, resolve_files=False):
         scan = self.scan()
         resolve = (
             self.resolve_pending_files(limit=resolve_limit)

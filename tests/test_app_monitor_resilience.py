@@ -150,13 +150,20 @@ class AppMonitorResilienceTests(unittest.TestCase):
             "monitor_enabled": True,
         }
         app._rebuild_monitor_menu = unittest.mock.Mock()
+        app._update_config = unittest.mock.Mock(
+            side_effect=lambda *, patch=None, mutator=None: (
+                app.config.update(patch or {}) or app.config
+            )
+        )
 
-        with patch("app.save_config") as save, patch("app._notify") as notify:
+        with patch("app._notify") as notify:
             app._toggle_background_notifications(None)
 
         self.assertFalse(app.config["background_notifications_enabled"])
         self.assertTrue(app.config["monitor_enabled"])
-        save.assert_called_once_with(app.config)
+        app._update_config.assert_called_once_with(
+            patch={"background_notifications_enabled": False}
+        )
         notify.assert_called_once()
         app._rebuild_monitor_menu.assert_called_once()
 

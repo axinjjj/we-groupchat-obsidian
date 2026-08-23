@@ -190,7 +190,8 @@ independently deployed microservices. Editable sources:
 - macOS may ask once per menu-app process for access to WeChat App Data. The
   project does not schedule short-lived source/resource workers that would make
   that process-lifetime consent recur; attachment-byte resolution is a separate
-  explicit opt-in and link-only backfill never reads the attachment cache.
+  in-memory session opt-in that resets on every app restart and is never
+  restored from config. Link-only backfill never reads the attachment cache.
 - Cloud AI providers receive the text you ask them to summarize. Use Ollama if you want the AI step to stay local.
 - Remote link previews are disabled by default. If you set `monitor_fetch_links: true`, the app fetches public URLs found in monitored messages, and those remote sites may receive your request metadata. Link preview has a conservative SSRF guard, but it is still a best-effort public URL preview, not a hardened crawler.
 - MCP read tools expose local chat-derived data to the MCP client. Some management tools can mutate local metadata such as groups or config-derived state.
@@ -207,6 +208,19 @@ When sharing the project, send the [public repository](https://github.com/Indeli
 or the [Chinese README](https://github.com/IndelibleVivi/we-groupchat-obsidian/blob/main/README.zh-CN.md).
 Do not re-zip a checkout that you have already run; it may contain `.venv`,
 local runtime state, caches, logs, or private debugging material.
+
+For a shareable source zip, build from the exact committed Git tree. The package
+contains a hash-bound `share-manifest.json`; a copied tree without `.git` can
+build only from that manifest allowlist and fails closed if a listed file is
+missing, modified, symlinked, or non-regular:
+
+```bash
+.venv/bin/python scripts/build_share_package.py
+```
+
+The generated zip includes an extra `群友使用说明.md` quick-start file and
+omits internal handoff docs such as `docs/working-continuity.md` and
+`docs/superpowers/`.
 
 ## Requirements
 
@@ -325,19 +339,17 @@ Source reliability helpers:
 .venv/bin/python scripts/resource_backup.py enable
 .venv/bin/python scripts/resource_backup.py disable
 .venv/bin/python scripts/resource_backup.py backfill-links --all
-.venv/bin/python scripts/resource_backup.py backfill-links --all --apply
+.venv/bin/python scripts/resource_backup.py backfill-links --all --apply --run-id <run-id-from-plan>
 .venv/bin/python scripts/resource_backup.py backfill-links --from YYYY-MM-DD
-.venv/bin/python scripts/resource_backup.py backfill-links --from YYYY-MM-DD --apply
+.venv/bin/python scripts/resource_backup.py backfill-links --from YYYY-MM-DD --apply --run-id <run-id-from-plan>
 .venv/bin/python scripts/resource_backup.py backfill --all
-.venv/bin/python scripts/resource_backup.py backfill --all --apply
+.venv/bin/python scripts/resource_backup.py backfill --all --apply --run-id <run-id-from-plan>
 .venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD
-.venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply
+.venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply --run-id <run-id-from-plan>
 .venv/bin/python scripts/resource_backup.py status
 .venv/bin/python scripts/resource_backup.py plan
 .venv/bin/python scripts/resource_backup.py run
 .venv/bin/python scripts/resource_backup.py run --resolve-files --resolve-limit 10
-.venv/bin/python scripts/resource_backup.py enable-file-resolution
-.venv/bin/python scripts/resource_backup.py disable-file-resolution
 .venv/bin/python scripts/resource_backup.py verify
 # Legacy-agent inspection/removal only; new installation is refused.
 .venv/bin/python scripts/resource_backup.py agent-status
@@ -370,13 +382,14 @@ Source reliability helpers:
 Source-guard and mounted-resource scheduling live inside the long-running menu
 app. Their old `install-agent` commands reject new short-lived jobs; the
 `uninstall-agent` commands remain for upgrading users. `backfill-links` is a
-links-only plan/apply entry: it never reads attachment bytes, writes nothing if
-any known source shard is incomplete, and commits the completed scan in one
-transaction. Mounted-resource, attachment-archive, and direct-Drive backfills
-are dry plans unless `--apply` is present. Mounted-resource `backfill --all`
-scans all history still available in the selected chats' local WeChat shards;
-it remains idempotent and does not move live cursors. Ordinary resource `run`
-also skips attachment-byte resolution; `--resolve-files` is explicit. Drive
+links-only staged plan/apply entry: it never reads attachment bytes, and no
+canonical occurrence is written if a known shard is incomplete. Planning uses
+bounded 500-2,000-row keyset pages and does not create or advance live cursors.
+Apply requires the exact unexpired `run_id` returned by that plan and consumes
+only its staged rows; it never rescans source after confirmation. Ordinary
+resource `run` skips attachment-byte resolution. `--resolve-files` authorizes
+only that explicit CLI run, while menu consent lasts only for the current app
+process. Drive
 `enable` does not authenticate, select chats, backfill, or run an upload. Backup `verify` checks bytes visible at the configured filesystem target
 and deliberately makes no claim about provider-side upload. See the
 [source reliability guide](docs/source-reliability.md) for mounted handoff,

@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import sys
 import time
+import uuid
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
@@ -16,7 +17,7 @@ if str(PROJECT_DIR) not in sys.path:
 from core.config import (
     load_config,
     normalize_path_value,
-    save_config,
+    update_config,
     selected_resource_backup_chats,
 )
 from core.key_extractor import get_cached_keys
@@ -85,6 +86,12 @@ def _exit_code(result):
         "uninstall_failed",
         "script_missing",
         "long_lived_app_required",
+        "plan_required",
+        "plan_expired",
+        "plan_not_applicable",
+        "run_not_found",
+        "selection_changed",
+        "candidate_mismatch",
     }:
         return 2
     return 0
@@ -113,8 +120,6 @@ def build_parser():
     sub.add_parser("clear-selected-chats")
     sub.add_parser("enable")
     sub.add_parser("disable")
-    sub.add_parser("enable-file-resolution")
-    sub.add_parser("disable-file-resolution")
     sub.add_parser("init")
     sub.add_parser("scan")
     backfill = sub.add_parser("backfill")
@@ -126,6 +131,11 @@ def build_parser():
         help="Scan all locally available history for the selected chats.",
     )
     backfill.add_argument("--apply", action="store_true")
+    backfill.add_argument(
+        "--run-id",
+        default="",
+        help="Apply the exact staged run returned by a previous plan.",
+    )
     backfill_links = sub.add_parser(
         "backfill-links",
         help="Plan/apply exact historical links without resolving attachment files.",
@@ -138,6 +148,11 @@ def build_parser():
         help="Scan all locally available history for exact links.",
     )
     backfill_links.add_argument("--apply", action="store_true")
+    backfill_links.add_argument(
+        "--run-id",
+        default="",
+        help="Apply the exact staged run returned by a previous plan.",
+    )
     resolve = sub.add_parser("resolve")
     resolve.add_argument("--limit", type=int, default=50)
     sub.add_parser("index")
@@ -165,6 +180,12 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if (
+        args.command in {"backfill", "backfill-links"}
+        and args.apply
+        and not args.run_id
+    ):
+        raise SystemExit("--apply requires the --run-id returned by the plan")
     config = load_config()
 
     if args.command == "list-chats":
@@ -191,18 +212,20 @@ def main(argv=None):
             _print({"state": "invalid_selection", "available_chats": len(choices)})
             return 2
         previous = {
-            chat["username"]: int(chat.get("selected_since") or 0)
+            chat["username"]: chat
             for chat in selected_resource_backup_chats(config)
         }
         now = int(time.time())
         selected = []
         for index in indexes:
             chat = dict(choices[index - 1])
-            chat["selected_since"] = previous.get(chat["username"]) or now
+            old = previous.get(chat["username"]) or {}
+            chat["selected_since"] = int(old.get("selected_since") or now)
+            chat["selection_id"] = str(old.get("selection_id") or uuid.uuid4())
             selected.append(chat)
-        updated = dict(config)
-        updated["resource_backup_selected_chats"] = selected
-        save_config(updated)
+        updated = update_config(patch={
+            "resource_backup_selected_chats": selected,
+        })
         _print({
             "state": "configured",
             "selected_chats": len(selected),
@@ -210,31 +233,17 @@ def main(argv=None):
         })
         return 0
     if args.command == "clear-selected-chats":
-        updated = dict(config)
-        updated["resource_backup_selected_chats"] = []
-        save_config(updated)
+        update_config(patch={"resource_backup_selected_chats": []})
         _print({"state": "configured", "selected_chats": 0})
         return 0
-    if args.command in {
-        "enable",
-        "disable",
-        "enable-file-resolution",
-        "disable-file-resolution",
-    }:
-        updated = dict(config)
-        if args.command in {"enable", "disable"}:
-            updated["resource_backup_enabled"] = args.command == "enable"
-        else:
-            updated["resource_backup_file_resolution_enabled"] = (
-                args.command == "enable-file-resolution"
-            )
-        save_config(updated)
+    if args.command in {"enable", "disable"}:
+        updated = update_config(patch={
+            "resource_backup_enabled": args.command == "enable",
+        })
         _print({
             "state": "configured",
             "background_enabled": bool(updated.get("resource_backup_enabled", False)),
-            "file_resolution_enabled": bool(
-                updated.get("resource_backup_file_resolution_enabled", False)
-            ),
+            "file_resolution_policy": "explicit_per_run_or_app_session",
             "runtime": "long_lived_app",
         })
         return 0
@@ -281,14 +290,16 @@ def main(argv=None):
     elif args.command == "scan":
         result = _capture(config, source=True).scan()
     elif args.command == "backfill":
-        result = _capture(config, source=True).backfill(
+        result = _capture(config, source=not args.apply).backfill(
             0 if args.all else _from_timestamp(args.from_date),
             apply=args.apply,
+            run_id=args.run_id,
         )
     elif args.command == "backfill-links":
-        result = _capture(config, source=True).backfill_links(
+        result = _capture(config, source=not args.apply).backfill_links(
             0 if args.all else _from_timestamp(args.from_date),
             apply=args.apply,
+            run_id=args.run_id,
         )
     elif args.command == "resolve":
         result = _capture(config).resolve_pending_files(limit=max(1, args.limit))
@@ -310,9 +321,7 @@ def main(argv=None):
                 "target": "configured" if load_resource_backup_settings()["target"] else "not configured",
                 "link_export_mode": load_resource_backup_settings()["link_export_mode"],
                 "background_enabled": bool(config.get("resource_backup_enabled", False)),
-                "file_resolution_enabled": bool(
-                    config.get("resource_backup_file_resolution_enabled", False)
-                ),
+                "file_resolution_policy": "explicit_per_run_or_app_session",
                 "runtime": "long_lived_app",
             },
             "capture": capture.status(),

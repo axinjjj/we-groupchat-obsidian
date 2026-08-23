@@ -14,7 +14,7 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from core.config import load_config, save_config
+from core.config import load_config, update_config
 from core.background_jobs import runtime_identity
 from core.launch_agent import launch_agent_status
 from core.project_identity import SOURCE_GUARD_LAUNCH_AGENT_LABEL
@@ -61,10 +61,7 @@ def uninstall_agent(*, path: Path | None = None, runner=_run) -> int:
 
 
 def _set_config(key: str, value) -> dict:
-    config = load_config()
-    config[key] = value
-    save_config(config)
-    return load_config()
+    return update_config(patch={key: value})
 
 
 def print_status(config: dict) -> int:

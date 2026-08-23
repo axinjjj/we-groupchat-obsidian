@@ -143,7 +143,8 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
 - 程序读取本机微信数据库副本，不修改微信聊天数据库。
 - 首次提取数据库 key，或微信更新后重新提取 key，可能需要对 `WeChat.app` 做 ad-hoc re-sign。脚本不会在普通双击启动时偷偷执行这一步，必须显式运行带 `--allow-wechat-resign` 的命令。
 - macOS 可能在每次菜单 app 进程启动时询问一次 WeChat App Data 权限。项目不会再调度短命 source/resource
-  worker 反复消耗这个 process-lifetime consent；附件 bytes 解析另有显式开关，links-only backfill 不读取附件 cache。
+  worker 反复消耗这个 process-lifetime consent；附件 bytes 解析是仅存在于内存、本次 app 会话有效的
+  显式授权，重启后必定归零，也不会从 config 恢复。Links-only backfill 不读取附件 cache。
 - 聊天内容会发送给你自己配置的 AI provider。使用 Ollama 本地模型时，内容可以完全不离开本机；使用云端 provider 时，请按对应服务的隐私规则自行判断。
 - API Key 存储在 macOS Keychain，不写入 repo。
 - 本地配置、书签、monitor state、数据库 key、日志、SQLite DB 和 Markdown 导出默认在 `~/.we-groupchat-obsidian/` 或你的 Obsidian vault 中，不应该提交到 git。旧 `~/.wechat-summary/` 只作为本机 migration/compatibility 路径保留。
@@ -172,6 +173,17 @@ rg -n "sk-|api[_-]?key|secret|token|password|BEGIN .*PRIVATE|wxid_|chatroom|\\.w
 或[中文版 README](https://github.com/IndelibleVivi/we-groupchat-obsidian/blob/main/README.zh-CN.md)。
 不要重新压缩自己正在运行的 checkout；其中可能已经出现 `.venv`、本机 runtime、
 cache、日志或私有调试材料。
+
+如果只是把源码包发给朋友，建议用 sanitized share zip，而不是直接压缩当前工作目录：
+
+```bash
+.venv/bin/python scripts/build_share_package.py
+```
+
+生成的 zip 严格取当前 commit 的 Git tree，并附带 hash-bound `share-manifest.json`。没有 `.git` 的复制目录
+只能按该 manifest allowlist 构建；listed file 缺失、被修改、是 symlink 或非 regular file 时都会 fail closed。
+包仍会排除本机 runtime、`.venv`、build/cache 产物和 internal continuity docs，并额外附带一份
+`群友使用说明.md` 快速入门。
 
 ## 安装
 
@@ -294,19 +306,17 @@ Source reliability 运维脚本：
 .venv/bin/python scripts/resource_backup.py enable
 .venv/bin/python scripts/resource_backup.py disable
 .venv/bin/python scripts/resource_backup.py backfill-links --all
-.venv/bin/python scripts/resource_backup.py backfill-links --all --apply
+.venv/bin/python scripts/resource_backup.py backfill-links --all --apply --run-id <plan 返回的 run-id>
 .venv/bin/python scripts/resource_backup.py backfill-links --from YYYY-MM-DD
-.venv/bin/python scripts/resource_backup.py backfill-links --from YYYY-MM-DD --apply
+.venv/bin/python scripts/resource_backup.py backfill-links --from YYYY-MM-DD --apply --run-id <plan 返回的 run-id>
 .venv/bin/python scripts/resource_backup.py backfill --all
-.venv/bin/python scripts/resource_backup.py backfill --all --apply
+.venv/bin/python scripts/resource_backup.py backfill --all --apply --run-id <plan 返回的 run-id>
 .venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD
-.venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply
+.venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply --run-id <plan 返回的 run-id>
 .venv/bin/python scripts/resource_backup.py status
 .venv/bin/python scripts/resource_backup.py plan
 .venv/bin/python scripts/resource_backup.py run
 .venv/bin/python scripts/resource_backup.py run --resolve-files --resolve-limit 10
-.venv/bin/python scripts/resource_backup.py enable-file-resolution
-.venv/bin/python scripts/resource_backup.py disable-file-resolution
 .venv/bin/python scripts/resource_backup.py verify
 # 以下两个命令只负责检查/移除旧 agent；不会再安装新 agent。
 .venv/bin/python scripts/resource_backup.py agent-status
@@ -337,12 +347,12 @@ Source reliability 运维脚本：
 ```
 
 Source guard 与 mounted-resource scheduling 都位于长驻菜单 app。旧 `install-agent` 命令会拒绝创建新的
-短命 job；`uninstall-agent` 只为升级用户清理旧 plist。`backfill-links` 是 links-only plan/apply 入口：
-不读附件 bytes；任一 known shard 不完整时写入数必须为 0；完整扫描后才单事务提交。
-Mounted-resource、attachment-archive 与 direct-Drive backfill 默认都是 dry plan，只有显式
-`--apply` 才登记历史 item。Mounted-resource `backfill --all` 会扫描被选群聊在本地 WeChat shards
-里仍然可读的全部历史；它保持 idempotent，且不移动 live cursor。普通 resource `run` 同样默认不解析
-附件，只有 `--resolve-files` 才显式开启。Drive `enable` 不会顺手 auth、选群、backfill 或 upload。Backup `verify`
+短命 job；`uninstall-agent` 只为升级用户清理旧 plist。`backfill-links` 是 links-only staged plan/apply
+入口：不读附件 bytes；任一 known shard 不完整时 canonical occurrence 写入数必须为 0。Plan 以
+500-2,000 rows 的 bounded keyset page 写入 staging，不创建或推进 live cursor；apply 必须同时给出
+`--apply` 与 plan 返回的未过期 `--run-id`，只消费那一份 staged rows，不会确认后再扫描 source。
+普通 resource `run` 默认不解析附件；`--resolve-files` 只授权该次显式 CLI run，菜单授权仅持续当前
+app process。Drive `enable` 不会顺手 auth、选群、backfill 或 upload。Backup `verify`
 只验证 configured filesystem target 上看得到的 bytes，绝不宣称 provider-side upload 已完成。Drive
 mounted handoff、可选 Drive API、完整状态、resolver 规则、存储结构和失败边界见
 [来源可靠性指南](docs/source-reliability.zh-CN.md)。

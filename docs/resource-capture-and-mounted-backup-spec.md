@@ -1,6 +1,6 @@
 # Resource Capture & Mounted Backup Specification
 
-- Status: draft 0.3
+- Status: draft 0.4
 - Target release: resource backup v3
 - Applies to: selected-chat links, selected-chat file occurrences, shared local CAS objects, Obsidian resource indexes, and mounted-filesystem handoff
 
@@ -136,19 +136,20 @@ selected + unselected occurrences -> bytes may be handed off once;
 only unselected occurrences -> object remains local
 ```
 
-Removing a chat from selection stops future capture and future inclusion in newly generated views/snapshots. Existing backup bytes are not automatically deleted. Each selection entry carries a private `selected_since` epoch. Re-selecting a previously removed chat creates a new epoch and new from-now cursors; the unselected gap is never captured implicitly.
+Removing a chat from selection stops future capture and future inclusion in newly generated views/snapshots. Existing backup bytes are not automatically deleted. Each selection entry carries a private UUID `selection_id` plus a display/source lower-bound `selected_since`. Re-selecting a previously removed chat creates a new UUID epoch and new from-now cursors even within the same second; the unselected gap is never captured implicitly.
 
 ## 7. Source capture and cursor correctness
 
 Each source shard has an independent cursor consisting of:
 
 - cursor timestamp;
-- the set of source message IDs already consumed at that timestamp;
+- an opaque source-owned keyset token binding `(create_time, rowid)`;
+- the set of source message IDs already consumed at that timestamp for legacy adapter migration;
 - source health state and last privacy-safe error code.
 
 For each shard page:
 
-1. read a complete page from the source adapter;
+1. read a bounded complete page from the source adapter;
 2. deterministically extract all link and file occurrences;
 3. insert occurrences and advance that shard cursor in one SQLite transaction;
 4. commit;
@@ -156,14 +157,18 @@ For each shard page:
 
 If a shard is unavailable, unknown, incomplete, or raises a source-degraded error, that shard cursor must not advance. Healthy shards may continue independently.
 
-The first initialization and every unselected-to-selected transition use `from now` semantics. Historical capture is a separate dry-plan/apply action:
+The first initialization and every unselected-to-selected transition use `from now` semantics. Historical capture is an identity-bound staged plan/apply action:
 
 ```bash
 python scripts/resource_backup.py backfill --from YYYY-MM-DD
-python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply
+python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply --run-id <run-id-from-plan>
 ```
 
-Backfill inserts idempotent occurrences without moving the live per-shard cursors.
+Planning freezes the selection/source manifest and writes 500-2,000-row keyset
+pages to SQLite staging without mutating canonical chat, cursor, or occurrence
+rows. Apply verifies the unexpired run ID, selection digest, and staged candidate
+digest, then inserts idempotent occurrences without rescanning source or moving
+the live per-shard cursors.
 
 ## 8. Resource extraction
 
@@ -240,6 +245,13 @@ without that marker, the worker preserves it and writes a sibling such as
 point to the actual generated filename. Two unmanaged collisions fail closed
 rather than overwriting either file.
 
+Each Obsidian and mounted-view surface has its own hidden ownership manifest
+containing `archive_id` and the exact managed path set. Every render writes an
+explicit scope root even when the selection is empty. Stale paths are removed
+only when the prior manifest or ownership marker proves they are app-generated;
+unmanaged files are preserved. Rendering and managed GC run under the same
+cross-process operation lock as mounted handoff.
+
 ## 10. Mounted-filesystem handoff
 
 The target may be a Google Drive for Desktop Stream files mount or another writable filesystem directory. It is stored in a dedicated private `resource_backup.json` settings file rather than reusing the generic attachment-backup v2 target. This prevents the older all-CAS snapshot command from accidentally treating the selected-chat Drive destination as its own unrestricted target.
@@ -296,7 +308,9 @@ protected data. Status/uninstall remain only to detect and remove legacy plists.
 Resource background work captures occurrences, refreshes indexes, attempts
 mounted handoff, and writes receipts/snapshots when appropriate. File-byte
 resolution is disabled by default and requires a separate explicit menu
-confirmation or CLI opt-in. Link-only backfill never reads attachment bytes.
+confirmation or `--resolve-files` on the current CLI run. Menu consent is
+in-memory only and resets on process exit. Link-only backfill never reads
+attachment bytes.
 
 ## 11. Status vocabulary
 
@@ -345,7 +359,7 @@ A snapshot contains only currently eligible occurrences. It must not include raw
 
 `resources.jsonl` is canonical JSON Lines sorted by occurrence order. Each record includes occurrence identity, selected-chat identity, source time/sender, resource metadata, local capture state, and mounted handoff state.
 
-`manifest.json` records counts, object identities, link export mode, and the SHA-256 of `resources.jsonl`.
+`manifest.json` records `archive_id`, counts, object identities, link export mode, and the SHA-256 of `resources.jsonl`.
 
 `COMPLETE` is written last and binds the manifest and resource catalog hashes. An incomplete directory without a valid `COMPLETE` marker is not a complete snapshot.
 
@@ -427,11 +441,11 @@ python scripts/resource_backup.py set-target "/path/chosen/in/Finder"
 python scripts/resource_backup.py set-link-export-mode redacted
 python scripts/resource_backup.py init
 python scripts/resource_backup.py backfill-links --all
-python scripts/resource_backup.py backfill-links --all --apply
+python scripts/resource_backup.py backfill-links --all --apply --run-id <run-id-from-plan>
 python scripts/resource_backup.py backfill --all
-python scripts/resource_backup.py backfill --all --apply
+python scripts/resource_backup.py backfill --all --apply --run-id <run-id-from-plan>
 python scripts/resource_backup.py backfill --from YYYY-MM-DD
-python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply
+python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply --run-id <run-id-from-plan>
 python scripts/resource_backup.py run
 python scripts/resource_backup.py run --resolve-files --resolve-limit 10
 python scripts/resource_backup.py verify

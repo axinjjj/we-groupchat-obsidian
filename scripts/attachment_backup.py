@@ -12,7 +12,7 @@ if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
 from core.attachment_backup import AttachmentBackup
-from core.config import load_config, normalize_path_value, save_config
+from core.config import load_config, normalize_path_value, update_config
 
 
 def _print(value):
@@ -45,13 +45,11 @@ def main(argv=None):
         target = normalize_path_value(args.path)
         if not target:
             parser.error("path must not be empty")
-        config["attachment_backup_target"] = target
-        save_config(config)
+        update_config(patch={"attachment_backup_target": target})
         _print({"state": "configured", "target": "configured"})
         return 0
     if args.command == "clear-target":
-        config["attachment_backup_target"] = ""
-        save_config(config)
+        update_config(patch={"attachment_backup_target": ""})
         _print({"state": "target_not_configured"})
         return 0
 

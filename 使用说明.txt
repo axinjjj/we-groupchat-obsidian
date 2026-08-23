@@ -166,3 +166,12 @@ A：直接发送公开 repo 或中文版 README 链接：
 
    不要重新压缩自己正在运行的 checkout；其中可能已经出现 .venv、本机 runtime、
    cache、日志或私有调试材料。
+
+   如果需要发送独立源码包，请在干净的 committed checkout 运行：
+
+     .venv/bin/python scripts/build_share_package.py
+
+   它会从当前 commit 的 exact Git tree 生成 sanitized zip，只包含源码、README、常用命令、测试和
+   给朋友看的「群友使用说明.md」，并写入每个 payload file 的 SHA-256 manifest。
+   没有 .git 的复制目录只能按这份 manifest allowlist 重建；listed file 缺失、被修改或是 symlink
+   时会直接拒绝。包里不会包含 .venv、.git、notes、build/dist、__pycache__ 或 internal continuity docs。

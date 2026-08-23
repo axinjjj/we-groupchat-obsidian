@@ -239,13 +239,13 @@ worker 不会在 mount 缺失时把那个路径重新创建成普通本地目录
 .venv/bin/python scripts/resource_backup.py set-link-export-mode redacted
 .venv/bin/python scripts/resource_backup.py init
 .venv/bin/python scripts/resource_backup.py backfill-links --all
-.venv/bin/python scripts/resource_backup.py backfill-links --all --apply
+.venv/bin/python scripts/resource_backup.py backfill-links --all --apply --run-id <plan 返回的 run-id>
 .venv/bin/python scripts/resource_backup.py backfill-links --from YYYY-MM-DD
-.venv/bin/python scripts/resource_backup.py backfill-links --from YYYY-MM-DD --apply
+.venv/bin/python scripts/resource_backup.py backfill-links --from YYYY-MM-DD --apply --run-id <plan 返回的 run-id>
 .venv/bin/python scripts/resource_backup.py backfill --all
-.venv/bin/python scripts/resource_backup.py backfill --all --apply
+.venv/bin/python scripts/resource_backup.py backfill --all --apply --run-id <plan 返回的 run-id>
 .venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD
-.venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply
+.venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply --run-id <plan 返回的 run-id>
 .venv/bin/python scripts/resource_backup.py status
 .venv/bin/python scripts/resource_backup.py plan
 .venv/bin/python scripts/resource_backup.py run
@@ -253,11 +253,12 @@ worker 不会在 mount 缺失时把那个路径重新创建成普通本地目录
 .venv/bin/python scripts/resource_backup.py verify
 ```
 
-`init` 只初始化 from-now cursors。停选后重新选择会建立新的 private selection epoch，不会吞回停选 gap；
-历史 backfill 是独立 dry-plan/apply 命令，也不会移动 live cursor。`backfill --all` 从 timestamp zero
-开始，表示扫描 known local WeChat message shards 中仍然可读的全部历史，并不保证 provider 远端仍保留
-更早内容。`backfill-links` 是安全的 links-only 入口：只扫描 shard-complete page，不读取附件 bytes；
-任一 known shard degraded 时写入 0 rows；完整 apply 才在一个 SQLite transaction 中提交。普通 `run`
+`init` 只初始化 from-now cursors。每次 selection 都有 UUID epoch，因此同一秒内停选/重选也不会复用
+旧身份或吞回停选 gap。历史 backfill 是 identity-bound staged plan/apply，不移动 live cursor。Plan 冻结
+selection/source manifest，以 500-2,000 rows 的 bounded keyset page 写 staging，且不改 canonical
+chat、cursor 或 occurrence；apply 必须使用 exact unexpired `run-id`，复核 candidate digest 与 current
+selection digest，并且不重新扫描 source。`backfill --all` 表示 known local WeChat shards 中仍然可读的
+全部历史。`backfill-links` 不读取附件 bytes；任一 known shard degraded 时 canonical occurrence 写入 0 rows。普通 `run`
 捕获 deterministic metadata occurrence、默认跳过 file-byte resolution、即使 target 不可用也继续刷新
 本地 Obsidian index，然后才尝试 mounted handoff。`--resolve-files` 是显式授权。
 
@@ -293,8 +294,18 @@ Ordinary status 只有在 current catalog、target objects、有效 latest `COMP
 .venv/bin/python scripts/resource_backup.py uninstall-agent  # 清理旧 agent
 ```
 
-File-byte resolution 默认关闭，必须经菜单确认，或显式执行 `enable-file-resolution` / `--resolve-files`。
+菜单 app 在 source 初始化前取得 process-lifetime singleton。Main config writer 会在 lock 内重读最新
+revision、只 patch 所需字段，再用 same-directory atomic replace 发布；app 监听 revision 并在不重启的
+情况下 reconcile timers。显式 operator CLI source run 仍保留，但和 app 共用跨进程 capture lock；
+projection render、managed GC 与 mounted handoff 共用另一把 operation lock。
+
+File-byte resolution 默认关闭，必须经菜单确认，或在当前 CLI run 显式给出 `--resolve-files`。菜单授权
+只存在内存中，不写入 durable config，并在 app process 退出时归零。
 旧 resource LaunchAgent 可被检测和移除，但新安装会因同一 process-lifetime consent 原因被拒绝。
+
+手动通知只有在 capture healthy、resolution healthy 或因未授权而显式 skipped、本地 projection 成功，
+且 handoff 为 `idle` / `sync_delegated` 时才写“更新完成”。Source、resolution、projection 或 target 任一
+phase degraded 都会报告未完成，不会压扁成 success。
 
 ## 5. 可选 advanced selected-chat Google Drive API 直传
 

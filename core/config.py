@@ -1,8 +1,12 @@
 """Configuration management - app config and WeChat data path detection."""
+import fcntl
 import json
 import os
 import re
 import shlex
+import stat
+import tempfile
+import uuid
 
 from .project_identity import DATA_DIR_NAME, LEGACY_DATA_DIR_NAME
 from .taxonomy_assignment import FREE_FORM_PROFILE
@@ -17,6 +21,7 @@ LEGACY_DATA_CONFIG_FILE = os.path.join(LEGACY_DATA_DIR, "config.json")
 LEGACY_CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 
 DEFAULT_CONFIG = {
+    "config_revision": 0,
     "db_dir": "",
     "keys_file": os.path.join(DATA_DIR, "all_keys.json"),
     "decrypted_dir": os.path.join(DATA_DIR, "decrypted"),
@@ -80,7 +85,6 @@ DEFAULT_CONFIG = {
     "attachment_backup_target": "",
     "resource_backup_selected_chats": [],
     "resource_backup_enabled": False,
-    "resource_backup_file_resolution_enabled": False,
     "resource_backup_interval_seconds": 300,
     "resource_backup_max_messages_per_scan": 500,
     "resource_backup_min_free_bytes": 1024 * 1024 * 1024,
@@ -100,6 +104,18 @@ DEFAULT_CONFIG = {
     "mcp_send_mode": "disabled",
     "mcp_send_allowlist": [],
 }
+
+
+class ConfigError(RuntimeError):
+    """Content-free configuration storage failure."""
+
+    def __init__(self, code):
+        super().__init__(str(code))
+        self.code = str(code)
+
+
+class ConfigConflictError(ConfigError):
+    """A stale whole-document writer attempted to replace newer config."""
 
 
 def ensure_private_dir(path=DATA_DIR):
@@ -125,6 +141,22 @@ def _read_json(path):
             return json.load(f)
     except (json.JSONDecodeError, OSError):
         return None
+
+
+def _read_json_strict(path):
+    try:
+        mode = os.lstat(path).st_mode
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+            raise ConfigError("config_not_regular")
+        with open(path, encoding="utf-8") as handle:
+            value = json.load(handle)
+    except ConfigError:
+        raise
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ConfigError("config_corrupt") from exc
+    if not isinstance(value, dict):
+        raise ConfigError("config_corrupt")
+    return value
 
 
 def normalize_path_value(value):
@@ -221,6 +253,7 @@ def _sanitize_drive_chat_list(value):
 def _sanitize_resource_chat_list(value):
     clean_chats = _sanitize_drive_chat_list(value)
     selected_since = {}
+    selection_ids = {}
     if isinstance(value, list):
         for item in value:
             if not isinstance(item, dict):
@@ -232,10 +265,18 @@ def _sanitize_resource_chat_list(value):
                 stamp = 0
             if username and stamp and username not in selected_since:
                 selected_since[username] = stamp
+            selection_id = str(item.get("selection_id") or "").strip()
+            if username and selection_id and username not in selection_ids:
+                try:
+                    selection_ids[username] = str(uuid.UUID(selection_id))
+                except ValueError:
+                    pass
     for chat in clean_chats:
         stamp = selected_since.get(chat["username"], 0)
         if stamp:
             chat["selected_since"] = stamp
+        if chat["username"] in selection_ids:
+            chat["selection_id"] = selection_ids[chat["username"]]
     return clean_chats
 
 
@@ -268,6 +309,10 @@ def _sanitize_config(saved):
     cfg = dict(DEFAULT_CONFIG)
     if not isinstance(saved, dict):
         return cfg
+
+    revision = saved.get("config_revision")
+    if isinstance(revision, int) and revision >= 0:
+        cfg["config_revision"] = revision
 
     for key in (
         "ai_provider", "ai_model", "ollama_url", "ollama_model",
@@ -311,7 +356,7 @@ def _sanitize_config(saved):
         "monitor_notify_writes", "monitor_notify_checkins",
         "daily_digest_enabled", "daily_digest_notify",
         "wechat_source_guard_enabled", "attachment_archive_enabled",
-        "resource_backup_enabled", "resource_backup_file_resolution_enabled",
+        "resource_backup_enabled",
         "google_drive_file_sync_enabled", "google_drive_file_sync_paused",
         "google_drive_file_sync_keep_local_objects",
         "mcp_enable_send_message",
@@ -436,6 +481,136 @@ def _sanitize_config(saved):
     return cfg
 
 
+class ConfigStore:
+    """Locked, revisioned, atomic JSON configuration store.
+
+    Patch updates reload the canonical document while holding an exclusive
+    ``flock``. Whole-document replacement remains available for first-run and
+    migration code, but rejects stale revisions instead of losing an unrelated
+    concurrent update.
+    """
+
+    def __init__(self, path=None):
+        self.path = os.path.abspath(os.path.expanduser(path or CONFIG_FILE))
+        self.lock_path = self.path + ".lock"
+
+    def _lock(self, exclusive):
+        ensure_private_dir(os.path.dirname(self.path))
+        fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        return fd
+
+    @staticmethod
+    def _unlock(fd):
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def _read_locked(self):
+        if not os.path.lexists(self.path):
+            return None
+        return _sanitize_config(_read_json_strict(self.path))
+
+    def read(self):
+        fd = self._lock(False)
+        try:
+            return self._read_locked()
+        finally:
+            self._unlock(fd)
+
+    def _write_locked(self, value):
+        directory = os.path.dirname(self.path)
+        ensure_private_dir(directory)
+        temp_fd, temp_path = tempfile.mkstemp(
+            prefix=".config-", suffix=".json", dir=directory
+        )
+        try:
+            try:
+                os.fchmod(temp_fd, 0o600)
+            except OSError:
+                pass
+            with os.fdopen(temp_fd, "w", encoding="utf-8") as handle:
+                temp_fd = -1
+                json.dump(value, handle, indent=4, ensure_ascii=False)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, self.path)
+            temp_path = ""
+            ensure_private_file(self.path)
+            try:
+                directory_fd = os.open(directory, os.O_RDONLY)
+            except OSError:
+                directory_fd = -1
+            if directory_fd >= 0:
+                try:
+                    os.fsync(directory_fd)
+                except OSError:
+                    pass
+                finally:
+                    os.close(directory_fd)
+        finally:
+            if temp_fd >= 0:
+                os.close(temp_fd)
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+
+    def update(self, mutator):
+        if not callable(mutator):
+            raise TypeError("mutator must be callable")
+        fd = self._lock(True)
+        try:
+            current = self._read_locked()
+            missing = current is None
+            if current is None:
+                current = _load_initial_config_without_primary()
+            working = dict(current)
+            result = mutator(working)
+            if result is not None:
+                if not isinstance(result, dict):
+                    raise TypeError("config mutator must return dict or None")
+                working = result
+            normalized = _sanitize_config(working)
+            current_revision = int(current.get("config_revision") or 0)
+            normalized["config_revision"] = current_revision
+            if not missing and normalized == current:
+                return current
+            normalized["config_revision"] = current_revision + 1
+            self._write_locked(normalized)
+            return normalized
+        finally:
+            self._unlock(fd)
+
+    def replace(self, value, *, expected_revision=None):
+        fd = self._lock(True)
+        try:
+            current = self._read_locked()
+            current_revision = int((current or {}).get("config_revision") or 0)
+            if (
+                current is not None
+                and expected_revision is not None
+                and int(expected_revision) != current_revision
+            ):
+                raise ConfigConflictError("config_revision_conflict")
+            normalized = _sanitize_config(value)
+            normalized["config_revision"] = current_revision
+            if current is not None and normalized == current:
+                return current
+            normalized["config_revision"] = current_revision + 1
+            self._write_locked(normalized)
+            return normalized
+        finally:
+            self._unlock(fd)
+
+
 def merge_monitor_chat_preferences(
     config: dict,
     groups: list[dict],
@@ -465,24 +640,23 @@ def merge_monitor_chat_preferences(
     return updated
 
 
-def _load_saved_config():
-    saved = _read_json(CONFIG_FILE)
-    if saved is not None:
-        return _sanitize_config(saved)
-
+def _load_initial_config_without_primary():
     legacy_saved = _read_json(LEGACY_DATA_CONFIG_FILE)
     if legacy_saved is not None:
-        cfg = _sanitize_config(legacy_saved)
-        save_config(cfg)
-        return cfg
+        return _sanitize_config(legacy_saved)
 
     legacy = _read_json(LEGACY_CONFIG_FILE)
     if legacy is None:
         return dict(DEFAULT_CONFIG)
 
-    cfg = _sanitize_config(legacy)
-    save_config(cfg)
-    return cfg
+    return _sanitize_config(legacy)
+
+
+def _load_saved_config():
+    stored = ConfigStore().read()
+    if stored is not None:
+        return stored
+    return ConfigStore().update(lambda current: current)
 
 
 def auto_detect_db_dir():
@@ -547,16 +721,26 @@ def load_config():
     if not cfg["db_dir"] or not os.path.isdir(cfg["db_dir"]):
         detected = auto_detect_db_dir()
         if detected:
-            cfg["db_dir"] = detected
-            save_config(cfg)
+            cfg = update_config(patch={"db_dir": detected})
 
     return cfg
 
 
+def update_config(mutator=None, *, patch=None):
+    """Atomically update only the requested config fields."""
+    changes = dict(patch or {})
+
+    def apply(current):
+        current.update(changes)
+        if mutator is None:
+            return current
+        return mutator(current)
+
+    return ConfigStore().update(apply)
+
+
 def save_config(cfg):
-    """Save config."""
-    ensure_private_dir(DATA_DIR)
-    normalized = _sanitize_config(cfg)
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(normalized, f, indent=4, ensure_ascii=False)
-    ensure_private_file(CONFIG_FILE)
+    """Atomically replace config, rejecting a stale whole-document writer."""
+    value = dict(cfg or {})
+    expected_revision = value.get("config_revision")
+    return ConfigStore().replace(value, expected_revision=expected_revision)

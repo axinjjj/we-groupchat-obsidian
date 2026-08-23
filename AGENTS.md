@@ -8,6 +8,10 @@
   files that belong at repository root.
 - `core/` owns domain behavior, durable state, privacy boundaries, recovery,
   backup and projection contracts.
+- `core/config.py::ConfigStore` is the sole main-config write authority. Writers
+  patch the latest locked revision; do not reintroduce whole-snapshot UI/CLI
+  saves or non-atomic config writes. `core/app_runtime.py` owns the menu-app
+  process singleton.
 - `ai/` owns provider adapters; `ui/` owns reusable UI components.
 - `scripts/` contains thin operator entrypoints and compatibility cleanup
   commands. Put
@@ -16,6 +20,11 @@
   menu-bar process. macOS App Data consent is process-lifetime access, so their
   retired short-lived LaunchAgent modes must remain no-op cleanup surfaces and
   must not be reintroduced as Python or app-bundle interval workers.
+- Explicit resource CLI source operations remain operator entrypoints, but app
+  and CLI capture/backfill runs share the resource capture operation lock.
+  Historical backfill is staged: plan writes bounded keyset pages and apply
+  requires the exact unexpired `run_id`; never restore a confirm-then-rescan
+  path.
 - `launchers/` owns the canonical Finder-friendly `.command` entrypoints. The
   root `启动.command` is a compatibility stub for deployed source-mode
   LaunchAgents and must not grow a second implementation.
@@ -26,6 +35,13 @@
 
 - SQLite/CAS ledgers are authoritative for durable derived state. Markdown,
   indexes, digests, target views and SVG exports are rebuildable projections.
+- Attachment-byte consent is process/session-local and must never be persisted.
+  WeChat decrypted caches and source shard/message identities are namespaced by
+  source root; plaintext SQLite snapshots use Online Backup so WAL state is not
+  lost.
+- Resource projection manifests own generated-path GC. Empty selections still
+  render an explicit root; GC may remove only app-owned generated files and must
+  run under the projection/handoff operation lock.
 - Editable architecture truth lives in `docs/architecture/*.excalidraw`; SVGs
   under `docs/assets/architecture/` are portable generated exports and must be
   regenerated and visually inspected after source changes.
@@ -35,6 +51,9 @@
 - Public publication must preserve public-safe defaults and exclude raw chat
   identities/bodies, account identifiers, local paths, credentials, private
   continuity and live runtime data.
+- `scripts/build_share_package.py` packages the exact Git commit tree. Its
+  no-Git path is manifest-only and hash-verifies regular non-symlink entries;
+  do not reintroduce recursive fallback scanning.
 
 ## Verification and deployment
 

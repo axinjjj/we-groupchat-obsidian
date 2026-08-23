@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from datetime import datetime
 
 from core.background_jobs import dispatch_background_job
@@ -65,11 +66,12 @@ from core.config import (
     active_monitor_chats,
     selected_drive_sync_chats,
     load_config,
-    save_config,
+    update_config,
     merge_monitor_chat_preferences,
     CONFIG_FILE,
     DATA_DIR,
 )
+from core.app_runtime import AppAlreadyRunning, AppInstanceLock
 from core.mcp_config import claude_code_add_command, claude_desktop_config
 from core.daily_digest import (
     DAILY_DIGEST_STATE_FILE,
@@ -285,6 +287,7 @@ class WeGroupchatObsidianApp(rumps.App):
             except Exception:
                 pass
         self.config = load_config()
+        self._resource_file_resolution_session_enabled = False
         self.db = None
         self.ai = None
         self._summarizing = False
@@ -305,6 +308,7 @@ class WeGroupchatObsidianApp(rumps.App):
         self._resource_backup_lock = threading.Lock()
         self._source_guard_timer = None
         self._source_guard_lock = threading.Lock()
+        self._config_reconcile_timer = None
 
         # Build menu
         self.menu = [
@@ -344,6 +348,11 @@ class WeGroupchatObsidianApp(rumps.App):
         self._configure_resource_backup_timer()
         self._configure_drive_sync_timer()
         self._configure_source_guard_timer()
+        self._config_reconcile_timer = rumps.Timer(
+            self._on_config_reconcile_timer,
+            2,
+        )
+        self._config_reconcile_timer.start()
 
         # Background initialization
         threading.Thread(target=self._init_background, daemon=True).start()
@@ -365,6 +374,75 @@ class WeGroupchatObsidianApp(rumps.App):
             self.title = new_title
 
     # ── Settings menu ────────────────────────────────────────
+
+    def _update_config(self, *, patch=None, mutator=None):
+        self.config = update_config(mutator, patch=patch)
+        return self.config
+
+    @staticmethod
+    def _runtime_config_values(config, keys):
+        return tuple(config.get(key) for key in keys)
+
+    def _on_config_reconcile_timer(self, _):
+        try:
+            current = load_config()
+        except Exception as exc:
+            print(f"[config] reconcile read failed: {type(exc).__name__}")
+            return
+        if int(current.get("config_revision") or 0) == int(
+            self.config.get("config_revision") or 0
+        ):
+            return
+        self._reconcile_runtime_config(current)
+
+    def _reconcile_runtime_config(self, current):
+        previous = self.config
+        self.config = current
+        runtime_groups = (
+            (
+                ("monitor_enabled", "monitor_interval_minutes"),
+                self._configure_monitor_timer,
+            ),
+            (
+                (
+                    "daily_digest_enabled", "daily_digest_time",
+                    "daily_digest_timezone",
+                ),
+                self._configure_daily_digest_timer,
+            ),
+            (
+                ("resource_backup_enabled", "resource_backup_interval_seconds"),
+                self._configure_resource_backup_timer,
+            ),
+            (
+                (
+                    "google_drive_file_sync_enabled",
+                    "google_drive_file_sync_paused",
+                    "google_drive_file_sync_interval_seconds",
+                ),
+                self._configure_drive_sync_timer,
+            ),
+            (
+                (
+                    "wechat_source_guard_enabled",
+                    "wechat_source_guard_interval_seconds",
+                ),
+                self._configure_source_guard_timer,
+            ),
+        )
+        for keys, reconcile in runtime_groups:
+            if self._runtime_config_values(previous, keys) != self._runtime_config_values(
+                current, keys
+            ):
+                reconcile()
+        self._rebuild_settings_menu()
+        self._rebuild_monitor_menu()
+        self._rebuild_resource_backup_menu()
+        self._rebuild_drive_sync_menu()
+        print(
+            "[config] reconciled revision "
+            f"{int(current.get('config_revision') or 0)}"
+        )
 
     def _build_settings_menu(self):
         """Build settings submenu."""
@@ -476,6 +554,8 @@ class WeGroupchatObsidianApp(rumps.App):
             except Exception:
                 pass
             self._source_guard_timer = None
+        if not self.config.get("wechat_source_guard_enabled", False):
+            return
         interval = max(
             60,
             int(self.config.get("wechat_source_guard_interval_seconds", 300)),
@@ -488,7 +568,8 @@ class WeGroupchatObsidianApp(rumps.App):
         print(f"[source-guard] long-lived timer started: every {interval} seconds")
 
     def _on_source_guard_timer(self, _):
-        self._start_source_guard_consumer()
+        if self.config.get("wechat_source_guard_enabled", False):
+            self._start_source_guard_consumer()
 
     def _start_source_guard_consumer(self):
         threading.Thread(
@@ -537,9 +618,7 @@ class WeGroupchatObsidianApp(rumps.App):
         except Exception:
             links = files = pending = selected = 0
         enabled = bool(self.config.get("resource_backup_enabled", False))
-        resolve_files = bool(
-            self.config.get("resource_backup_file_resolution_enabled", False)
-        )
+        resolve_files = bool(self._resource_file_resolution_session_enabled)
         menu.add(rumps.MenuItem(
             f"状态: {'后台更新已开启' if enabled else '后台更新已关闭'}"
         ))
@@ -603,8 +682,7 @@ class WeGroupchatObsidianApp(rumps.App):
 
     def _toggle_resource_backup(self, _):
         enabled = not bool(self.config.get("resource_backup_enabled", False))
-        self.config["resource_backup_enabled"] = enabled
-        save_config(self.config)
+        self._update_config(patch={"resource_backup_enabled": enabled})
         if enabled:
             self._resource_capture_service().initialize_selected_chat_cursors()
         self._configure_resource_backup_timer()
@@ -623,9 +701,7 @@ class WeGroupchatObsidianApp(rumps.App):
         self._delayed_run(self._show_resource_file_resolution_dialog)
 
     def _show_resource_file_resolution_dialog(self):
-        enabled = not bool(
-            self.config.get("resource_backup_file_resolution_enabled", False)
-        )
+        enabled = not bool(self._resource_file_resolution_session_enabled)
         if enabled:
             self._bring_to_front()
             try:
@@ -638,8 +714,7 @@ class WeGroupchatObsidianApp(rumps.App):
                 self._release_front()
             if not confirmed:
                 return
-        self.config["resource_backup_file_resolution_enabled"] = enabled
-        save_config(self.config)
+        self._resource_file_resolution_session_enabled = enabled
         self._rebuild_resource_backup_menu()
         if enabled and self.db:
             self._start_resource_backup_consumer(manual=True)
@@ -670,11 +745,21 @@ class WeGroupchatObsidianApp(rumps.App):
             return
         try:
             config = load_config()
+            if not manual and not config.get("resource_backup_enabled", False):
+                result = {
+                    "capture": {
+                        "state": "disabled",
+                        "scan": {"state": "disabled"},
+                        "resolve": {"state": "skipped"},
+                    },
+                    "backup": {"state": "not_run"},
+                }
+                return
             capture = self._resource_capture_service(source=True, config=config)
             capture_result = capture.run(
                 resolve_limit=50,
                 resolve_files=bool(
-                    config.get("resource_backup_file_resolution_enabled", False)
+                    self._resource_file_resolution_session_enabled
                 ),
             )
             backup_result = MountedResourceBackup.from_config(
@@ -707,13 +792,25 @@ class WeGroupchatObsidianApp(rumps.App):
         backup = result.get("backup") or {}
         scan = capture.get("scan") or {}
         resolve = capture.get("resolve") or {}
+        capture_state = str(capture.get("state") or "unknown")
+        projection_state = str(
+            (backup.get("obsidian") or {}).get("state") or "unknown"
+        )
+        handoff_state = str(backup.get("state") or "unknown")
+        completed = (
+            capture_state == "healthy"
+            and str(resolve.get("state") or "") in {"healthy", "skipped"}
+            and projection_state in {"written", "unchanged"}
+            and handoff_state in {"idle", "sync_delegated"}
+        )
         _notify(
             "资源索引与本地备份",
-            "更新完成" if capture.get("state") not in {"failed", "source_degraded"} else "本轮未完成",
+            "更新完成" if completed else "本轮未完成",
             f"新增链接 {int(scan.get('captured_links') or 0)} · "
             f"新增文件 {int(scan.get('captured_files') or 0)} · "
             f"本地文件 {int(resolve.get('ready_local') or 0)} · "
-            f"handoff={backup.get('state') or 'unknown'}",
+            f"capture={capture_state} · projection={projection_state} · "
+            f"handoff={handoff_state}",
         )
 
     def _request_link_backfill(self, _):
@@ -792,11 +889,20 @@ class WeGroupchatObsidianApp(rumps.App):
                 f"state={result.get('state') or 'failed'} · error={result.get('error_code') or 'none'}；没有写入。",
             )
             return
+        run_id = str(result.get("run_id") or "")
+        candidate_digest = str(result.get("candidate_digest") or "")
+        if not run_id or not candidate_digest:
+            _notify(
+                "资源索引与本地备份",
+                "历史链接计划未完成",
+                "plan identity 缺失；没有写入。",
+            )
+            return
         self._bring_to_front()
         try:
             confirmed = self._confirm_dialog(
                 "确认补历史链接？",
-                f"范围: {scope}\n已完整扫描 {int(result.get('scanned') or 0)} 条 source rows\n发现 {int(result.get('discovered_links') or 0)} 个 exact link occurrences\n\n确认后写入本地 ledger 并重建 Obsidian/挂载目录索引；不会读取附件 bytes。",
+                f"范围: {scope}\n已完整扫描 {int(result.get('scanned') or 0)} 条 source rows\n发现 {int(result.get('discovered_links') or 0)} 个 exact link occurrences\nplan: {run_id}\ndigest: {candidate_digest[:16]}…\n\n确认后只消费这份 staged plan，写入本地 ledger 并重建 Obsidian/挂载目录索引；不会重新扫描 source，也不会读取附件 bytes。",
                 ok="写入",
             )
         finally:
@@ -806,11 +912,11 @@ class WeGroupchatObsidianApp(rumps.App):
         self._begin_task("补历史链接")
         threading.Thread(
             target=self._apply_link_backfill,
-            args=(from_timestamp,),
+            args=(from_timestamp, run_id),
             daemon=True,
         ).start()
 
-    def _apply_link_backfill(self, from_timestamp):
+    def _apply_link_backfill(self, from_timestamp, run_id):
         if not self._resource_backup_lock.acquire(blocking=False):
             self._run_on_main(
                 self._finish_link_backfill,
@@ -820,8 +926,12 @@ class WeGroupchatObsidianApp(rumps.App):
             return
         try:
             config = load_config()
-            capture = self._resource_capture_service(source=True, config=config)
-            result = capture.backfill_links(from_timestamp, apply=True)
+            capture = self._resource_capture_service(source=False, config=config)
+            result = capture.backfill_links(
+                from_timestamp,
+                apply=True,
+                run_id=run_id,
+            )
             if result.get("source_complete"):
                 projection = MountedResourceBackup.from_config(
                     config,
@@ -896,17 +1006,25 @@ class WeGroupchatObsidianApp(rumps.App):
             _notify("资源索引与本地备份", "输入错误", "请输入列表里的数字编号。")
             return
         now = int(time.time())
-        self.config["resource_backup_selected_chats"] = [
+        selected_chats = [
             {
                 **choices[index - 1],
                 "selected_since": int(
                     (selected.get(choices[index - 1]["username"]) or {}).get("selected_since")
                     or now
                 ),
+                "selection_id": str(
+                    (selected.get(choices[index - 1]["username"]) or {}).get(
+                        "selection_id"
+                    )
+                    or uuid.uuid4()
+                ),
             }
             for index in indexes
         ]
-        save_config(self.config)
+        self._update_config(patch={
+            "resource_backup_selected_chats": selected_chats,
+        })
         self._resource_capture_service().initialize_selected_chat_cursors()
         self._rebuild_resource_backup_menu()
         _notify("资源索引与本地备份", "群聊选择已保存", f"当前选择 {len(indexes)} 个群。")
@@ -1025,8 +1143,7 @@ class WeGroupchatObsidianApp(rumps.App):
 
     def _toggle_drive_sync(self, _):
         if self.config.get("google_drive_file_sync_enabled", False):
-            self.config["google_drive_file_sync_enabled"] = False
-            save_config(self.config)
+            self._update_config(patch={"google_drive_file_sync_enabled": False})
             self._configure_drive_sync_timer()
             self._rebuild_drive_sync_menu()
             _notify(
@@ -1036,9 +1153,10 @@ class WeGroupchatObsidianApp(rumps.App):
             )
             return
 
-        self.config["google_drive_file_sync_enabled"] = True
-        self.config["google_drive_file_sync_paused"] = False
-        save_config(self.config)
+        self._update_config(patch={
+            "google_drive_file_sync_enabled": True,
+            "google_drive_file_sync_paused": False,
+        })
         self._drive_sync_service().initialize_selected_chat_cursors()
         self._configure_drive_sync_timer()
         self._rebuild_drive_sync_menu()
@@ -1052,8 +1170,7 @@ class WeGroupchatObsidianApp(rumps.App):
         if not self.config.get("google_drive_file_sync_enabled", False):
             return
         paused = not self.config.get("google_drive_file_sync_paused", False)
-        self.config["google_drive_file_sync_paused"] = paused
-        save_config(self.config)
+        self._update_config(patch={"google_drive_file_sync_paused": paused})
         self._configure_drive_sync_timer()
         self._rebuild_drive_sync_menu()
         _notify(
@@ -1190,8 +1307,9 @@ class WeGroupchatObsidianApp(rumps.App):
                     "username": group["username"],
                     "alias": alias,
                 })
-            self.config["google_drive_file_sync_selected_chats"] = selected_chats
-            save_config(self.config)
+            self._update_config(patch={
+                "google_drive_file_sync_selected_chats": selected_chats,
+            })
             if self.config.get("google_drive_file_sync_enabled", False):
                 self._drive_sync_service().initialize_selected_chat_cursors()
             self._rebuild_drive_sync_menu()
@@ -1390,8 +1508,7 @@ class WeGroupchatObsidianApp(rumps.App):
     def _toggle_monitor(self, _):
         current = self.config.get("monitor_enabled", False)
         if current:
-            self.config["monitor_enabled"] = False
-            save_config(self.config)
+            self._update_config(patch={"monitor_enabled": False})
             self._configure_monitor_timer()
             _notify("关注推送", "已暂停", "后台关注推送已暂停")
             self._rebuild_monitor_menu()
@@ -1406,8 +1523,7 @@ class WeGroupchatObsidianApp(rumps.App):
             self._delayed_run(self._show_monitor_chat_dialog)
             return
 
-        self.config["monitor_enabled"] = True
-        save_config(self.config)
+        self._update_config(patch={"monitor_enabled": True})
         self._initialize_monitor_states_if_needed()
         self._configure_monitor_timer()
         _notify("关注推送", "已开启", "从当前时间开始，只检查新增消息")
@@ -1516,16 +1632,19 @@ class WeGroupchatObsidianApp(rumps.App):
                 return
 
             selected_groups = [groups[idx - 1] for idx in selected]
-            self.config = merge_monitor_chat_preferences(self.config, selected_groups)
-            self.config["monitor_chats"] = [
-                {"username": group["username"], "name": group["name"]}
-                for group in selected_groups
-            ]
             first = selected_groups[0]
-            self.config["monitor_chat_username"] = first["username"]
-            self.config["monitor_chat_display_name"] = first["name"]
+            def mutate(config):
+                updated = merge_monitor_chat_preferences(config, selected_groups)
+                updated["monitor_chats"] = [
+                    {"username": group["username"], "name": group["name"]}
+                    for group in selected_groups
+                ]
+                updated["monitor_chat_username"] = first["username"]
+                updated["monitor_chat_display_name"] = first["name"]
+                return updated
+
+            self._update_config(mutator=mutate)
             self._reset_monitor_states_to_now()
-            save_config(self.config)
             self._configure_monitor_timer()
             _notify("关注推送", "监控群聊已更新", f"从现在开始监控：{self._monitor_chat_label()}")
             self._rebuild_monitor_menu()
@@ -1545,14 +1664,20 @@ class WeGroupchatObsidianApp(rumps.App):
             if not clicked:
                 return
             topic = text.strip()
-            old_topic = self.config.get("monitor_topic", "")
-            self.config["monitor_topic"] = topic
-            if topic != old_topic:
+            topic_changed = []
+
+            def mutate(config):
+                topic_changed.append(topic != config.get("monitor_topic", ""))
+                config["monitor_topic"] = topic
+                if enable_after and topic and active_monitor_chats(config):
+                    config["monitor_enabled"] = True
+                return config
+
+            self._update_config(mutator=mutate)
+            if any(topic_changed):
                 self._reset_monitor_states_to_now()
             if enable_after and topic and self._monitor_chats():
-                self.config["monitor_enabled"] = True
                 self._initialize_monitor_states_if_needed()
-            save_config(self.config)
             self._configure_monitor_timer()
             if topic:
                 if self._monitor_chats():
@@ -1591,8 +1716,7 @@ class WeGroupchatObsidianApp(rumps.App):
             if minutes < 1 or minutes > 1440:
                 _notify("关注推送", "输入错误", "请输入 1-1440 之间的分钟数")
                 return
-            self.config["monitor_interval_minutes"] = minutes
-            save_config(self.config)
+            self._update_config(patch={"monitor_interval_minutes": minutes})
             self._configure_monitor_timer()
             _notify("关注推送", "检查间隔已更新", f"每 {minutes} 分钟检查一次")
             self._rebuild_monitor_menu()
@@ -1622,8 +1746,7 @@ class WeGroupchatObsidianApp(rumps.App):
 
     def _toggle_background_notifications(self, _):
         enabled = not bool(self.config.get("background_notifications_enabled", True))
-        self.config["background_notifications_enabled"] = enabled
-        save_config(self.config)
+        self._update_config(patch={"background_notifications_enabled": enabled})
         state = "已开启" if enabled else "已关闭"
         detail = (
             "后台命中、错误和 Daily Digest 可以显示 banner"
@@ -1635,8 +1758,7 @@ class WeGroupchatObsidianApp(rumps.App):
 
     def _toggle_monitor_checkins(self, _):
         enabled = not bool(self.config.get("monitor_notify_checkins"))
-        self.config["monitor_notify_checkins"] = enabled
-        save_config(self.config)
+        self._update_config(patch={"monitor_notify_checkins": enabled})
         state = "已开启" if enabled else "已关闭"
         detail = "后台检查即使未命中也会报平安" if enabled else "之后只在命中、写入或报错时提醒"
         _notify("关注推送", f"心跳通知{state}", detail)
@@ -1916,8 +2038,7 @@ class WeGroupchatObsidianApp(rumps.App):
                 return
             path = os.path.expanduser(text.strip())
             if not path:
-                self.config["monitor_obsidian_root"] = OBSIDIAN_ROOT
-                save_config(self.config)
+                self._update_config(patch={"monitor_obsidian_root": OBSIDIAN_ROOT})
                 ensure_obsidian_vault(
                     OBSIDIAN_ROOT,
                     obsidian_subdir=self.config.get("monitor_obsidian_subdir"),
@@ -1934,8 +2055,7 @@ class WeGroupchatObsidianApp(rumps.App):
             except OSError as e:
                 _notify("关注推送", "无法创建目录", str(e)[:180])
                 return
-            self.config["monitor_obsidian_root"] = path
-            save_config(self.config)
+            self._update_config(patch={"monitor_obsidian_root": path})
             ensure_obsidian_vault(path, obsidian_subdir=self.config.get("monitor_obsidian_subdir"))
             _notify("关注推送", "知识库位置已更新", path)
             self._rebuild_monitor_menu()
@@ -1961,8 +2081,7 @@ class WeGroupchatObsidianApp(rumps.App):
             if not clicked:
                 return
             subdir = safe_obsidian_subdir(text.strip() or "微信群聊/关注推送")
-            self.config["monitor_obsidian_subdir"] = subdir
-            save_config(self.config)
+            self._update_config(patch={"monitor_obsidian_subdir": subdir})
             root = self.config.get("monitor_obsidian_root") or OBSIDIAN_ROOT
             ensure_obsidian_vault(root, obsidian_subdir=subdir)
             _notify("关注推送", "Obsidian 子目录已更新", subdir)
@@ -2220,8 +2339,7 @@ class WeGroupchatObsidianApp(rumps.App):
     def _toggle_auto_refresh(self, _):
         """Toggle 'auto-refresh on menu open' setting."""
         current = self.config.get("auto_refresh_on_open", False)
-        self.config["auto_refresh_on_open"] = not current
-        save_config(self.config)
+        self._update_config(patch={"auto_refresh_on_open": not current})
         state = "开启" if not current else "关闭"
         _notify("微信总结", "设置已更新", f"自动刷新已{state}")
         self._rebuild_settings_menu()
@@ -2229,24 +2347,21 @@ class WeGroupchatObsidianApp(rumps.App):
     def _toggle_group_nickname(self, _):
         """Toggle 'show group nickname in summary' setting."""
         current = self.config.get("show_group_nickname", True)
-        self.config["show_group_nickname"] = not current
-        save_config(self.config)
+        self._update_config(patch={"show_group_nickname": not current})
         state = "开启" if not current else "关闭"
         _notify("微信总结", "设置已更新", f"总结中显示群昵称已{state}")
         self._rebuild_settings_menu()
 
     def _make_batch_limit_callback(self, val):
         def callback(_):
-            self.config["batch_msg_limit"] = val
-            save_config(self.config)
+            self._update_config(patch={"batch_msg_limit": val})
             _notify("微信总结", "设置已更新", f"小组总结每群条数: {val}")
             self._rebuild_settings_menu()
         return callback
 
     def _make_hide_inactive_callback(self, months):
         def callback(_):
-            self.config["hide_inactive_months"] = months
-            save_config(self.config)
+            self._update_config(patch={"hide_inactive_months": months})
             label = f"{months} 个月" if months > 0 else "关闭"
             _notify("微信总结", "设置已更新", f"隐藏不活跃群聊: {label}")
             self._rebuild_settings_menu()
@@ -2255,8 +2370,7 @@ class WeGroupchatObsidianApp(rumps.App):
 
     def _make_provider_callback(self, provider_key):
         def callback(sender):
-            self.config["ai_provider"] = provider_key
-            save_config(self.config)
+            self._update_config(patch={"ai_provider": provider_key})
             self.ai = None  # Recreate on next summary
 
             provider_name = dict(AI_PROVIDERS).get(provider_key, provider_key)
@@ -2447,9 +2561,8 @@ class WeGroupchatObsidianApp(rumps.App):
             )
             if not clicked:
                 return
-            self.config["ai_model"] = text.strip()
+            self._update_config(patch={"ai_model": text.strip()})
             self.ai = None
-            save_config(self.config)
             model = self.config["ai_model"] or "默认"
             _notify("微信总结", "AI 模型已更新", model)
             self._rebuild_settings_menu()
@@ -2512,7 +2625,7 @@ class WeGroupchatObsidianApp(rumps.App):
 
     def open_config_file(self, _):
         if not os.path.exists(CONFIG_FILE):
-            save_config(self.config)
+            self._update_config()
         subprocess.run(["open", CONFIG_FILE])
 
     def _open_summary_dir(self, _):
@@ -2565,7 +2678,8 @@ class WeGroupchatObsidianApp(rumps.App):
             self._start_attachment_archive_consumer()
         if self.config.get("resource_backup_enabled", False):
             self._start_resource_backup_consumer(manual=False)
-        self._start_source_guard_consumer()
+        if self.config.get("wechat_source_guard_enabled", False):
+            self._start_source_guard_consumer()
         if (
             self.config.get("google_drive_file_sync_enabled", False)
             and not self.config.get("google_drive_file_sync_paused", False)
@@ -4113,4 +4227,9 @@ class WeGroupchatObsidianApp(rumps.App):
 
 if __name__ == "__main__":
     print("微信总结 启动中...")
-    WeGroupchatObsidianApp().run()
+    try:
+        with AppInstanceLock():
+            WeGroupchatObsidianApp().run()
+    except AppAlreadyRunning:
+        print("[app] canonical menu app is already running")
+        raise SystemExit(2)

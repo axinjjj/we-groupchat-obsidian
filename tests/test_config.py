@@ -1,9 +1,14 @@
+import json
+import multiprocessing
 import os
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from core.config import (
+    ConfigConflictError,
+    ConfigError,
+    ConfigStore,
     DEFAULT_CONFIG,
     _sanitize_config,
     active_monitor_chats,
@@ -14,7 +19,121 @@ from core.config import (
 from core.taxonomy_assignment import FREE_FORM_PROFILE
 
 
+def _config_patch_worker(path, field, value, start_event, iterations=1):
+    store = ConfigStore(path)
+    start_event.wait(5)
+    for _ in range(iterations):
+        store.update(lambda config: {**config, field: value})
+
+
 class ConfigTests(unittest.TestCase):
+    def test_config_store_noop_patch_keeps_revision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConfigStore(os.path.join(tmp, "config.json"))
+            initial = store.replace({"monitor_enabled": False})
+
+            unchanged = store.update(
+                lambda config: {**config, "monitor_enabled": False}
+            )
+
+            self.assertEqual(unchanged, initial)
+
+    def test_config_store_preserves_concurrent_disjoint_process_updates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            store = ConfigStore(path)
+            initial = store.replace({})
+            context = multiprocessing.get_context("spawn")
+            start = context.Event()
+            left = context.Process(
+                target=_config_patch_worker,
+                args=(path, "monitor_enabled", True, start),
+            )
+            right = context.Process(
+                target=_config_patch_worker,
+                args=(path, "daily_digest_enabled", False, start),
+            )
+            left.start()
+            right.start()
+            start.set()
+            left.join(10)
+            right.join(10)
+
+            self.assertEqual(left.exitcode, 0)
+            self.assertEqual(right.exitcode, 0)
+            current = store.read()
+            self.assertTrue(current["monitor_enabled"])
+            self.assertFalse(current["daily_digest_enabled"])
+            self.assertEqual(
+                current["config_revision"],
+                initial["config_revision"] + 2,
+            )
+
+    def test_config_store_readers_observe_only_complete_json_documents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            store = ConfigStore(path)
+            store.replace({"monitor_interval_minutes": 1})
+            context = multiprocessing.get_context("spawn")
+            start = context.Event()
+            writer = context.Process(
+                target=_config_patch_worker,
+                args=(path, "monitor_interval_minutes", 2, start, 80),
+            )
+            writer.start()
+            start.set()
+            observed = 0
+            while writer.is_alive():
+                with open(path, encoding="utf-8") as handle:
+                    value = json.load(handle)
+                self.assertIn(value["monitor_interval_minutes"], {1, 2})
+                observed += 1
+            writer.join(10)
+
+            self.assertEqual(writer.exitcode, 0)
+            self.assertGreater(observed, 0)
+
+    def test_config_store_interrupted_publish_keeps_previous_canonical_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            store = ConfigStore(path)
+            before = store.replace({"monitor_enabled": False})
+
+            with patch("core.config.os.replace", side_effect=OSError("fixture")):
+                with self.assertRaises(OSError):
+                    store.update(
+                        lambda config: {**config, "monitor_enabled": True}
+                    )
+
+            after = store.read()
+            self.assertEqual(after, before)
+            self.assertFalse(after["monitor_enabled"])
+
+    def test_corrupt_primary_fails_closed_without_default_rewrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write('{"monitor_enabled":')
+            with open(path, "rb") as handle:
+                before = handle.read()
+
+            with self.assertRaisesRegex(ConfigError, "config_corrupt"):
+                ConfigStore(path).read()
+
+            with open(path, "rb") as handle:
+                self.assertEqual(handle.read(), before)
+
+    def test_stale_whole_document_replace_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConfigStore(os.path.join(tmp, "config.json"))
+            stale = store.replace({"monitor_enabled": False})
+            store.update(lambda config: {**config, "daily_digest_enabled": False})
+
+            with self.assertRaisesRegex(
+                ConfigConflictError, "config_revision_conflict"
+            ):
+                store.replace(stale, expected_revision=stale["config_revision"])
+
     def test_active_monitor_chats_falls_back_to_valid_v1_singleton(self):
         self.assertEqual(
             active_monitor_chats({
@@ -128,7 +247,6 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(DEFAULT_CONFIG["attachment_backup_target"], "")
         self.assertEqual(DEFAULT_CONFIG["resource_backup_selected_chats"], [])
         self.assertFalse(DEFAULT_CONFIG["resource_backup_enabled"])
-        self.assertFalse(DEFAULT_CONFIG["resource_backup_file_resolution_enabled"])
         self.assertEqual(DEFAULT_CONFIG["resource_backup_interval_seconds"], 300)
         self.assertEqual(DEFAULT_CONFIG["resource_backup_max_messages_per_scan"], 500)
         self.assertEqual(
@@ -156,7 +274,6 @@ class ConfigTests(unittest.TestCase):
             "attachment_archive_retry_max_seconds": 300,
             "attachment_backup_target": "~/Google Drive/WeChat backup",
             "resource_backup_enabled": True,
-            "resource_backup_file_resolution_enabled": True,
         })
 
         self.assertTrue(cfg["wechat_source_guard_enabled"])
@@ -176,7 +293,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg["attachment_archive_retry_max_seconds"], 300)
         self.assertTrue(cfg["attachment_backup_target"].endswith("Google Drive/WeChat backup"))
         self.assertTrue(cfg["resource_backup_enabled"])
-        self.assertTrue(cfg["resource_backup_file_resolution_enabled"])
+        self.assertNotIn("resource_backup_file_resolution_enabled", cfg)
 
     def test_google_drive_file_sync_config_is_private_opt_in_and_sanitized(self):
         cfg = _sanitize_config({

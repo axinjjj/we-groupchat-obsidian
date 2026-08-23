@@ -33,7 +33,10 @@ class ConfigureMonitorTests(unittest.TestCase):
             patch("scripts.configure_monitor.prompt", side_effect=prompts),
             patch("scripts.configure_monitor.choose_obsidian_root", return_value="/vault"),
             patch("scripts.configure_monitor.ensure_obsidian_vault"),
-            patch("scripts.configure_monitor.save_config", side_effect=save_config),
+            patch(
+                "scripts.configure_monitor.update_config",
+                side_effect=lambda *, patch: save_config(patch),
+            ),
             patch("scripts.configure_monitor.reset_state_to_now"),
         ):
             output = stdout if stdout is not None else StringIO()
