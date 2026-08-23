@@ -216,6 +216,27 @@ def _sanitize_drive_chat_list(value):
     return clean_chats
 
 
+def _sanitize_resource_chat_list(value):
+    clean_chats = _sanitize_drive_chat_list(value)
+    selected_since = {}
+    if isinstance(value, list):
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            username = str(item.get("username") or "").strip()
+            try:
+                stamp = max(0, int(item.get("selected_since") or 0))
+            except (TypeError, ValueError):
+                stamp = 0
+            if username and stamp and username not in selected_since:
+                selected_since[username] = stamp
+    for chat in clean_chats:
+        stamp = selected_since.get(chat["username"], 0)
+        if stamp:
+            chat["selected_since"] = stamp
+    return clean_chats
+
+
 def selected_drive_sync_chats(config: dict) -> list[dict]:
     """Return private selected-chat identities and stable user-facing aliases."""
     config = config if isinstance(config, dict) else {}
@@ -225,7 +246,7 @@ def selected_drive_sync_chats(config: dict) -> list[dict]:
 def selected_resource_backup_chats(config: dict) -> list[dict]:
     """Return the mounted-backup disclosure selection, independent of OAuth sync."""
     config = config if isinstance(config, dict) else {}
-    return _sanitize_drive_chat_list(config.get("resource_backup_selected_chats"))
+    return _sanitize_resource_chat_list(config.get("resource_backup_selected_chats"))
 
 
 def active_monitor_chats(config: dict) -> list[dict]:
@@ -272,7 +293,7 @@ def _sanitize_config(saved):
 
     selected_resource_chats = saved.get("resource_backup_selected_chats")
     if isinstance(selected_resource_chats, list):
-        cfg["resource_backup_selected_chats"] = _sanitize_drive_chat_list(
+        cfg["resource_backup_selected_chats"] = _sanitize_resource_chat_list(
             selected_resource_chats
         )
 

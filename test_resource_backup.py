@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -11,7 +12,7 @@ from contextlib import redirect_stdout
 from unittest.mock import patch
 
 import scripts.resource_backup as resource_backup_cli
-from core.resource_backup import MountedResourceBackup
+from core.resource_backup import MountedResourceBackup, _redact_url
 from core.resource_capture import SelectedResourceCapture, _exact_links, _url_sha256
 from core.wechat_db import WeChatSourceDegraded
 
@@ -417,6 +418,109 @@ class ResourceBackupTests(unittest.TestCase):
             conn.close()
         self.assertEqual(cursors, {"shard-a": 100, "shard-b": 200})
 
+    def test_reselect_starts_new_selection_epoch_without_gap_backfill(self):
+        config = dict(self.config)
+        config["resource_backup_selected_chats"] = [{
+            "username": self.selected,
+            "alias": "猫猫研究群",
+            "selected_since": 10,
+        }]
+        source = FakeSource({
+            self.selected: [{
+                "timestamp": 100,
+                "source_message_id": "before-deselect",
+                "text": "https://example.com/before",
+                "resources": [],
+            }],
+        })
+        capture = SelectedResourceCapture(
+            config,
+            source=source,
+            now_func=lambda: 200,
+            archive_id_factory=lambda: "00000000-0000-0000-0000-000000000001",
+        )
+        capture.initialize_selected_chat_cursors(start_timestamp=0)
+        capture.scan()
+
+        source.messages_by_chat[self.selected].extend([
+            {
+                "timestamp": 150,
+                "source_message_id": "selection-gap",
+                "text": "https://example.com/gap",
+                "resources": [],
+            },
+            {
+                "timestamp": 250,
+                "source_message_id": "after-reselect",
+                "text": "https://example.com/after",
+                "resources": [],
+            },
+        ])
+        capture.config["resource_backup_selected_chats"] = [{
+            "username": self.selected,
+            "alias": "猫猫研究群",
+            "selected_since": 200,
+        }]
+
+        capture.scan()
+
+        self.assertEqual(
+            [row["source_message_id"] for row in capture.occurrences()],
+            ["before-deselect", "after-reselect"],
+        )
+        conn = sqlite3.connect(self.capture_db)
+        try:
+            chat = conn.execute(
+                "SELECT selected_since, selection_epoch FROM resource_chats"
+            ).fetchone()
+            cursor = conn.execute(
+                "SELECT cursor_timestamp FROM resource_shards"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(chat, (200, 2))
+        self.assertEqual(cursor, 250)
+
+    def test_explicit_backfill_applies_history_without_moving_live_cursor(self):
+        source = FakeSource({
+            self.selected: [{
+                "timestamp": 100,
+                "source_message_id": "historical-resource",
+                "text": "https://example.com/history",
+                "resources": [{
+                    "kind": "file",
+                    "resource_index": 0,
+                    "original_name": "history.pdf",
+                }],
+            }],
+        })
+        capture = SelectedResourceCapture(
+            self.config,
+            source=source,
+            now_func=lambda: 200,
+            archive_id_factory=lambda: "00000000-0000-0000-0000-000000000001",
+        )
+        capture.initialize_selected_chat_cursors(start_timestamp=200)
+        capture.scan()
+
+        planned = capture.backfill(0, apply=False)
+        applied = capture.backfill(0, apply=True)
+
+        self.assertEqual(planned["state"], "planned")
+        self.assertEqual(planned["discovered_links"], 1)
+        self.assertEqual(planned["discovered_files"], 1)
+        self.assertEqual(capture.backfill(0, apply=True)["inserted_links"], 0)
+        self.assertEqual(applied["inserted_links"], 1)
+        self.assertEqual(applied["inserted_files"], 1)
+        conn = sqlite3.connect(self.capture_db)
+        try:
+            cursor = conn.execute(
+                "SELECT cursor_timestamp FROM resource_shards"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(cursor, 200)
+
     def test_capture_run_reports_source_unavailable_instead_of_healthy(self):
         capture = SelectedResourceCapture(
             self.config,
@@ -504,6 +608,142 @@ class ResourceBackupTests(unittest.TestCase):
         self.assertEqual(manifest["handoff_semantics"], "pending_resources")
         self.assertEqual(manifest["unresolved_file_count"], 2)
         self.assertTrue(os.path.isfile(os.path.join(snapshot_dir, "COMPLETE")))
+
+    def test_unchanged_catalog_rebuilds_deleted_snapshot(self):
+        capture = self._ready_capture()
+        identifiers = iter(("first", "second"))
+        backup = MountedResourceBackup(
+            self.config,
+            capture=capture,
+            now_func=lambda: 1_787_600_000,
+            id_factory=lambda: next(identifiers),
+        )
+        first = backup.run()
+        shutil.rmtree(os.path.join(
+            backup.backup_root, "snapshots", first["snapshot"]["snapshot_id"]
+        ))
+
+        second = backup.run()
+
+        self.assertEqual(second["snapshot"]["state"], "written")
+        self.assertNotEqual(
+            second["snapshot"]["snapshot_id"], first["snapshot"]["snapshot_id"]
+        )
+        self.assertIsNotNone(backup._load_snapshot())
+
+    def test_unchanged_catalog_rebuilds_snapshot_without_valid_complete(self):
+        capture = self._ready_capture()
+        identifiers = iter(("first", "second"))
+        backup = MountedResourceBackup(
+            self.config,
+            capture=capture,
+            now_func=lambda: 1_787_600_000,
+            id_factory=lambda: next(identifiers),
+        )
+        first = backup.run()
+        complete = os.path.join(
+            backup.backup_root, "snapshots", first["snapshot"]["snapshot_id"],
+            "COMPLETE",
+        )
+        os.unlink(complete)
+
+        second = backup.run()
+
+        self.assertEqual(second["snapshot"]["state"], "written")
+        self.assertNotEqual(
+            second["snapshot"]["snapshot_id"], first["snapshot"]["snapshot_id"]
+        )
+        self.assertIsNotNone(backup._load_snapshot())
+
+    def test_snapshot_fingerprint_includes_link_export_mode(self):
+        source = FakeSource({
+            self.selected: [{
+                "timestamp": 100,
+                "source_message_id": "plain-link",
+                "text": "https://example.com/plain?topic=one",
+                "resources": [],
+            }],
+        })
+        capture = SelectedResourceCapture(
+            self.config,
+            source=source,
+            now_func=lambda: 200,
+            archive_id_factory=lambda: "00000000-0000-0000-0000-000000000001",
+        )
+        capture.initialize_selected_chat_cursors(start_timestamp=0)
+        capture.scan()
+        identifiers = iter(("full", "redacted"))
+        full = MountedResourceBackup(
+            self.config, capture=capture, link_export_mode="full",
+            now_func=lambda: 300, id_factory=lambda: next(identifiers),
+        )
+        first = full.run()
+        redacted = MountedResourceBackup(
+            self.config, capture=capture, link_export_mode="redacted",
+            now_func=lambda: 300, id_factory=lambda: next(identifiers),
+        )
+
+        second = redacted.run()
+
+        self.assertEqual(second["snapshot"]["state"], "written")
+        self.assertNotEqual(
+            second["snapshot"]["snapshot_id"], first["snapshot"]["snapshot_id"]
+        )
+        self.assertEqual(
+            redacted._load_snapshot()["manifest"]["link_export_mode"], "redacted"
+        )
+
+    def test_redacted_mode_covers_authorization_and_credential_variants(self):
+        url = (
+            "https://example.com/file?authorization=Bearer-secret"
+            "&credential=credential-secret&credentials=plural-secret"
+            "&jwt=jwt-secret&x-amz-credential=amz-secret"
+            "&x-amz-signature=signed-secret&safe=visible"
+        )
+
+        redacted = _redact_url(url)
+
+        for secret in (
+            "Bearer-secret", "credential-secret", "plural-secret",
+            "jwt-secret", "amz-secret", "signed-secret",
+        ):
+            self.assertNotIn(secret, redacted)
+        self.assertIn("safe=visible", redacted)
+        self.assertGreaterEqual(redacted.count("REDACTED"), 6)
+
+    def test_malformed_matched_url_fails_closed_without_crashing(self):
+        malformed = "https://example.com／evil?token=secret-value"
+
+        self.assertEqual(_redact_url(malformed), "REDACTED_INVALID_URL")
+        source = FakeSource({
+            self.selected: [{
+                "timestamp": 100,
+                "source_message_id": "malformed-link",
+                "text": malformed,
+                "resources": [],
+            }],
+        })
+        capture = SelectedResourceCapture(
+            self.config,
+            source=source,
+            now_func=lambda: 200,
+            archive_id_factory=lambda: "00000000-0000-0000-0000-000000000001",
+        )
+        capture.initialize_selected_chat_cursors(start_timestamp=0)
+        capture.scan()
+        backup = self._backup(capture)
+
+        result = backup.run()
+
+        self.assertEqual(result["state"], "sync_delegated")
+        snapshot = backup._load_snapshot()
+        with open(
+            os.path.join(snapshot["directory"], "resources.jsonl"),
+            encoding="utf-8",
+        ) as handle:
+            exported = handle.read()
+        self.assertIn("REDACTED_INVALID_URL", exported)
+        self.assertNotIn("secret-value", exported)
 
     def test_unresolved_and_unconfigured_runs_have_nonzero_cli_exit_status(self):
         for state in (
@@ -697,6 +937,177 @@ class ResourceBackupTests(unittest.TestCase):
         self.assertEqual(result["error_code"], "target_directory_conflict")
         self.assertFalse(os.path.exists(os.path.join(outside, "v3")))
 
+    def test_plan_rejects_symlink_at_objects_snapshots_and_views(self):
+        capture = self._ready_capture()
+        for relative in ("objects", "snapshots", "views"):
+            with self.subTest(relative=relative):
+                branch_target = os.path.join(self.root, "target-" + relative)
+                outside = os.path.join(self.root, "outside-" + relative)
+                os.makedirs(os.path.join(branch_target, "wgo-resource-backup", "v3"))
+                os.makedirs(outside)
+                os.symlink(
+                    outside,
+                    os.path.join(branch_target, "wgo-resource-backup", "v3", relative),
+                )
+                config = dict(self.config)
+                config["resource_backup_target"] = branch_target
+                backup = MountedResourceBackup(config, capture=capture)
+
+                plan = backup.plan()
+
+                self.assertEqual(plan["state"], "invalid_target")
+                self.assertEqual(plan["error_code"], "target_subtree_conflict")
+
+    def test_run_returns_target_failed_for_snapshot_directory_conflict(self):
+        capture = self._ready_capture()
+        backup = self._backup(capture)
+        backup._ensure_target_dir(backup.backup_root)
+        with open(os.path.join(backup.backup_root, "snapshots"), "wb") as handle:
+            handle.write(b"conflict")
+
+        result = backup.run()
+
+        self.assertEqual(result["state"], "target_failed")
+        self.assertIn("target_subtree_conflict", result["error_codes"])
+        self.assertIsNone(backup._state_row())
+
+    def test_run_returns_target_failed_for_target_view_conflict(self):
+        capture = self._ready_capture()
+        backup = self._backup(capture)
+        backup._ensure_target_dir(backup.backup_root)
+        with open(os.path.join(backup.backup_root, "views"), "wb") as handle:
+            handle.write(b"conflict")
+
+        result = backup.run()
+
+        self.assertEqual(result["state"], "target_failed")
+        self.assertIn("target_subtree_conflict", result["error_codes"])
+        self.assertIsNone(backup._state_row())
+
+    def test_status_handoff_semantics_are_derived_from_current_evidence(self):
+        capture = self._ready_capture()
+
+        no_target_config = dict(self.config)
+        no_target_config["resource_backup_target"] = ""
+        no_target = MountedResourceBackup(no_target_config, capture=capture)
+        self.assertEqual(
+            no_target.status()["handoff_semantics"], "target_not_configured"
+        )
+
+        pending = self._backup(capture)
+        self.assertEqual(pending.status()["handoff_semantics"], "pending")
+        completed = pending.run()
+        self.assertEqual(completed["state"], "sync_delegated")
+        self.assertEqual(pending.status()["handoff_semantics"], "sync_delegated")
+
+        snapshot_dir = pending._snapshot_dir()
+        os.unlink(os.path.join(snapshot_dir, "COMPLETE"))
+        self.assertEqual(pending.status()["handoff_semantics"], "pending")
+
+        unresolved_config = dict(self.config)
+        unresolved_config["resource_capture_db"] = os.path.join(
+            self.root, "unresolved-resource-capture.db"
+        )
+        unresolved_config["attachment_archive_root"] = os.path.join(
+            self.root, "unresolved-archive"
+        )
+        unresolved_capture = SelectedResourceCapture(
+            unresolved_config,
+            source=FakeSource({self.selected: [self._selected_message()]}),
+            now_func=lambda: 1_787_500_000,
+            random_func=lambda: 0.5,
+            archive_id_factory=lambda: "00000000-0000-0000-0000-000000000002",
+        )
+        unresolved_capture.initialize_selected_chat_cursors(start_timestamp=0)
+        unresolved_capture.scan()
+        for filename in os.listdir(self.file_month):
+            os.unlink(os.path.join(self.file_month, filename))
+        unresolved_capture.resolve_pending_files(limit=10)
+        unresolved_target = os.path.join(self.root, "unresolved-target")
+        os.makedirs(unresolved_target)
+        unresolved_config["resource_backup_target"] = unresolved_target
+        unresolved = MountedResourceBackup(
+            unresolved_config, capture=unresolved_capture
+        )
+        self.assertEqual(
+            unresolved.status()["handoff_semantics"], "pending_resources"
+        )
+
+    def test_raw_chat_username_never_crosses_export_boundary(self):
+        config = dict(self.config)
+        config["monitor_chats"] = [{
+            "username": self.selected,
+            "name": self.selected,
+        }]
+        config["monitor_chat_aliases"] = {}
+        config["resource_backup_selected_chats"] = [{
+            "username": self.selected,
+            "alias": self.selected,
+        }]
+        capture = SelectedResourceCapture(
+            config,
+            source=FakeSource({self.selected: [self._selected_message()]}),
+            now_func=lambda: 1_787_500_000,
+            archive_id_factory=lambda: "00000000-0000-0000-0000-000000000001",
+        )
+        capture.initialize_selected_chat_cursors(start_timestamp=0)
+        capture.scan()
+        capture.resolve_pending_files(limit=10)
+        backup = MountedResourceBackup(config, capture=capture)
+
+        result = backup.run()
+
+        self.assertNotIn("@chatroom", json.dumps(result, ensure_ascii=False))
+        snapshot = backup._load_snapshot()
+        with open(
+            os.path.join(snapshot["directory"], "resources.jsonl"), encoding="utf-8"
+        ) as handle:
+            self.assertNotIn("@chatroom", handle.read())
+        self.assertTrue(all(
+            "@chatroom" not in path
+            for path, _dirs, _files in os.walk(backup.backup_root)
+        ))
+
+    def test_casefold_equivalent_aliases_get_distinct_paths(self):
+        other = "other-selected@chatroom"
+        config = dict(self.config)
+        config["monitor_chats"] = [
+            {"username": self.selected, "name": "Research"},
+            {"username": other, "name": "research"},
+        ]
+        config["resource_backup_selected_chats"] = [
+            {"username": self.selected, "alias": "Research"},
+            {"username": other, "alias": "research"},
+        ]
+        source = FakeSource({
+            self.selected: [self._selected_message()],
+            other: [{
+                "timestamp": 100,
+                "source_message_id": "casefold-other",
+                "text": "https://example.com/other",
+                "resources": [],
+            }],
+        })
+        capture = SelectedResourceCapture(
+            config,
+            source=source,
+            now_func=lambda: 1_787_500_000,
+            archive_id_factory=lambda: "00000000-0000-0000-0000-000000000001",
+        )
+        capture.initialize_selected_chat_cursors(start_timestamp=0)
+        capture.scan()
+        backup = MountedResourceBackup(config, capture=capture)
+
+        backup.render_obsidian_indexes()
+
+        root = os.path.join(self.obsidian_root, "微信群聊", "关注推送")
+        directories = sorted(
+            name for name in os.listdir(root)
+            if os.path.isdir(os.path.join(root, name))
+        )
+        self.assertEqual(len(directories), 2)
+        self.assertTrue(all("--" in name for name in directories))
+
     def test_configured_target_symlink_is_rejected(self):
         capture = self._ready_capture()
         actual = os.path.join(self.root, "actual-target")
@@ -756,6 +1167,7 @@ class ResourceBackupCliTests(unittest.TestCase):
         with (
             patch.object(resource_backup_cli, "load_config", return_value=self.config),
             patch.object(resource_backup_cli, "save_config") as save_config,
+            patch.object(resource_backup_cli.time, "time", return_value=1_787_500_000),
             redirect_stdout(output),
         ):
             result = resource_backup_cli.main(["set-selected-chats", "1"])
@@ -764,13 +1176,63 @@ class ResourceBackupCliTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(
             saved["resource_backup_selected_chats"],
-            [{"username": "first@chatroom", "alias": "First Group"}],
+            [{
+                "username": "first@chatroom",
+                "alias": "First Group",
+                "selected_since": 1_787_500_000,
+            }],
         )
         self.assertEqual(
             saved["google_drive_file_sync_selected_chats"],
             self.config.get("google_drive_file_sync_selected_chats"),
         )
         self.assertNotIn("@chatroom", output.getvalue())
+
+    def test_cli_scan_source_unavailable_returns_structured_json(self):
+        output = io.StringIO()
+        with (
+            patch.object(resource_backup_cli, "load_config", return_value=self.config),
+            patch.object(resource_backup_cli, "_source", return_value=None),
+            patch.object(resource_backup_cli, "_capture") as capture_factory,
+            redirect_stdout(output),
+        ):
+            capture_factory.return_value.scan.return_value = {
+                "state": "source_unavailable",
+                "error_code": "source_unavailable",
+            }
+            result = resource_backup_cli.main(["scan"])
+
+        self.assertEqual(result, 2)
+        self.assertEqual(json.loads(output.getvalue())["state"], "source_unavailable")
+
+    def test_source_unavailable_is_a_local_state_not_system_exit(self):
+        with patch.object(resource_backup_cli, "get_cached_keys", return_value={}):
+            self.assertIsNone(resource_backup_cli._source({"db_dir": ""}))
+
+    def test_cli_run_with_source_unavailable_still_handoffs(self):
+        output = io.StringIO()
+        capture = type("Capture", (), {})()
+        capture.run = lambda resolve_limit=50: {
+            "state": "source_unavailable",
+            "scan": {"state": "source_unavailable"},
+            "resolve": {"state": "healthy", "ready_local": 1},
+        }
+        backup = type("Backup", (), {})()
+        backup.run = lambda: {"state": "sync_delegated", "copied": 1}
+        with (
+            patch.object(resource_backup_cli, "load_config", return_value=self.config),
+            patch.object(resource_backup_cli, "_source", return_value=None),
+            patch.object(resource_backup_cli, "_capture", return_value=capture),
+            patch.object(resource_backup_cli, "_backup", return_value=backup) as backup_factory,
+            redirect_stdout(output),
+        ):
+            result = resource_backup_cli.main(["run"])
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(result, 2)
+        self.assertEqual(payload["state"], "source_unavailable")
+        self.assertEqual(payload["backup"]["state"], "sync_delegated")
+        backup_factory.assert_called_once()
 
 
 if __name__ == "__main__":

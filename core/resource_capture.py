@@ -101,17 +101,24 @@ def eligible_selected_chats(config):
     aliases = config.get("monitor_chat_aliases")
     aliases = aliases if isinstance(aliases, dict) else {}
     result = []
-    for selected in selected_resource_backup_chats(config):
+    for index, selected in enumerate(selected_resource_backup_chats(config), 1):
         username = str(selected.get("username") or "").strip()
         if username not in active:
             continue
-        alias = (
-            str(selected.get("alias") or "").strip()
-            or str(aliases.get(username) or "").strip()
-            or active[username]
-            or username
-        )
-        result.append({"username": username, "alias": _safe_label(alias)})
+        fallback = f"未命名群聊 {index}"
+        alias = ""
+        for candidate in (
+            selected.get("alias"), aliases.get(username), active[username]
+        ):
+            value = str(candidate or "").strip()
+            if value and "@chatroom" not in value.casefold():
+                alias = value
+                break
+        result.append({
+            "username": username,
+            "alias": _safe_label(alias, fallback),
+            "selected_since": max(0, int(selected.get("selected_since") or 0)),
+        })
     return result
 
 
@@ -205,6 +212,8 @@ class SelectedResourceCapture:
                     chat_key TEXT NOT NULL,
                     chat_alias TEXT NOT NULL,
                     start_timestamp INTEGER NOT NULL,
+                    selected_since INTEGER NOT NULL DEFAULT 0,
+                    selection_epoch INTEGER NOT NULL DEFAULT 1,
                     updated_at REAL NOT NULL
                 );
 
@@ -258,6 +267,19 @@ class SelectedResourceCapture:
                     ON resource_occurrences(object_sha256, occurrence_id);
                 """
             )
+            columns = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(resource_chats)")
+            }
+            if "selected_since" not in columns:
+                conn.execute(
+                    "ALTER TABLE resource_chats "
+                    "ADD COLUMN selected_since INTEGER NOT NULL DEFAULT 0"
+                )
+            if "selection_epoch" not in columns:
+                conn.execute(
+                    "ALTER TABLE resource_chats "
+                    "ADD COLUMN selection_epoch INTEGER NOT NULL DEFAULT 1"
+                )
             conn.commit()
         finally:
             conn.close()
@@ -309,6 +331,7 @@ class SelectedResourceCapture:
                 "username": chat["username"],
                 "alias": chat["alias"],
                 "chat_key": self._chat_key(chat["username"]),
+                "selected_since": int(chat.get("selected_since") or 0),
             }
             for chat in eligible_selected_chats(self.config)
         ]
@@ -317,31 +340,75 @@ class SelectedResourceCapture:
         return [chat["chat_key"] for chat in self.selected_chats()]
 
     def initialize_selected_chat_cursors(self, start_timestamp=None):
-        start = int(self.now_func() if start_timestamp is None else start_timestamp)
+        default_start = int(
+            self.now_func() if start_timestamp is None else start_timestamp
+        )
         chats = self.selected_chats()
         inserted = 0
+        reselected = 0
         conn = self._connect()
         try:
             for chat in chats:
                 existing = conn.execute(
-                    "SELECT 1 FROM resource_chats WHERE chat_username = ?",
+                    "SELECT * FROM resource_chats WHERE chat_username = ?",
                     (chat["username"],),
                 ).fetchone()
-                conn.execute(
-                    """
-                    INSERT INTO resource_chats(
-                        chat_username, chat_key, chat_alias, start_timestamp, updated_at
-                    ) VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(chat_username) DO UPDATE SET
-                        chat_key = excluded.chat_key,
-                        chat_alias = excluded.chat_alias,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        chat["username"], chat["chat_key"], chat["alias"],
-                        start, self.now_func(),
-                    ),
+                selected_since = int(chat.get("selected_since") or 0)
+                start = (
+                    default_start
+                    if start_timestamp is not None or not selected_since
+                    else selected_since
                 )
+                if existing is None:
+                    conn.execute(
+                        """
+                        INSERT INTO resource_chats(
+                            chat_username, chat_key, chat_alias, start_timestamp,
+                            selected_since, selection_epoch, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, 1, ?)
+                        """,
+                        (
+                            chat["username"], chat["chat_key"], chat["alias"],
+                            start, selected_since, self.now_func(),
+                        ),
+                    )
+                    inserted += 1
+                else:
+                    epoch_changed = bool(
+                        selected_since
+                        and int(existing["selected_since"] or 0) != selected_since
+                    )
+                    if epoch_changed:
+                        conn.execute(
+                            """
+                            UPDATE resource_chats
+                            SET chat_key = ?, chat_alias = ?, start_timestamp = ?,
+                                selected_since = ?, selection_epoch = selection_epoch + 1,
+                                updated_at = ?
+                            WHERE chat_username = ?
+                            """,
+                            (
+                                chat["chat_key"], chat["alias"], start,
+                                selected_since, self.now_func(), chat["username"],
+                            ),
+                        )
+                        conn.execute(
+                            "DELETE FROM resource_shards WHERE chat_username = ?",
+                            (chat["username"],),
+                        )
+                        reselected += 1
+                    else:
+                        conn.execute(
+                            """
+                            UPDATE resource_chats
+                            SET chat_key = ?, chat_alias = ?, updated_at = ?
+                            WHERE chat_username = ?
+                            """,
+                            (
+                                chat["chat_key"], chat["alias"], self.now_func(),
+                                chat["username"],
+                            ),
+                        )
                 conn.execute(
                     """
                     UPDATE resource_occurrences
@@ -350,7 +417,6 @@ class SelectedResourceCapture:
                     """,
                     (chat["chat_key"], chat["alias"], self.now_func(), chat["username"]),
                 )
-                inserted += 1 if existing is None else 0
             conn.commit()
         finally:
             conn.close()
@@ -358,7 +424,8 @@ class SelectedResourceCapture:
             "state": "initialized",
             "selected_chats": len(chats),
             "new_chats": inserted,
-            "start_timestamp": start,
+            "reselected_chats": reselected,
+            "start_timestamp": default_start,
         }
 
     def _chat_row(self, username):
@@ -637,6 +704,114 @@ class SelectedResourceCapture:
             "captured_links": captured_links,
             "captured_files": captured_files,
             "initialized_chats": initialized,
+            "degraded_shards": degraded_shards,
+            "error_code": source_error_code,
+        }
+
+    def backfill(self, from_timestamp, *, apply=False):
+        """Plan or explicitly apply historical occurrences without moving live cursors."""
+        chats = self.selected_chats()
+        if not chats:
+            return {
+                "state": "no_selected_chats",
+                "scanned": 0,
+                "discovered_links": 0,
+                "discovered_files": 0,
+                "inserted_links": 0,
+                "inserted_files": 0,
+            }
+        if self.source is None:
+            return {
+                "state": "source_unavailable",
+                "scanned": 0,
+                "discovered_links": 0,
+                "discovered_files": 0,
+                "inserted_links": 0,
+                "inserted_files": 0,
+                "error_code": "source_unavailable",
+            }
+        self.initialize_selected_chat_cursors()
+        max_messages = max(1, int(
+            self.config.get("resource_backup_max_messages_per_scan", 500)
+        ))
+        scanned = 0
+        discovered_links = 0
+        discovered_files = 0
+        inserted_links = 0
+        inserted_files = 0
+        degraded_shards = 0
+        source_error_code = ""
+        for chat in chats:
+            try:
+                source_shards = list(self.source.get_message_shards(chat["username"]))
+            except WeChatSourceDegraded as exc:
+                degraded_shards += 1
+                source_error_code = self._source_error_code(exc)
+                continue
+            if not source_shards:
+                degraded_shards += 1
+                source_error_code = "source_shards_unavailable"
+                continue
+            for source_shard_id in source_shards:
+                cursor_timestamp = max(0, int(from_timestamp))
+                seen_ids = set()
+                while True:
+                    try:
+                        page = self._source_page(
+                            chat["username"], source_shard_id,
+                            cursor_timestamp, seen_ids, max_messages,
+                        )
+                    except WeChatSourceDegraded as exc:
+                        degraded_shards += 1
+                        source_error_code = self._source_error_code(exc)
+                        break
+                    if not page:
+                        break
+                    scanned += len(page)
+                    page_links = sum(
+                        len(_exact_links(str(message.get("text") or message.get("content") or "")))
+                        for message in page
+                    )
+                    page_files = sum(
+                        1
+                        for message in page
+                        for resource in (message.get("resources") or [])
+                        if isinstance(resource, dict)
+                        and str(resource.get("kind") or "") == "file"
+                    )
+                    discovered_links += page_links
+                    discovered_files += page_files
+                    if apply and (page_links or page_files):
+                        conn = self._connect()
+                        try:
+                            conn.execute("BEGIN IMMEDIATE")
+                            links, files = self._insert_occurrences(
+                                conn, chat, page, self.now_func()
+                            )
+                            inserted_links += links
+                            inserted_files += files
+                            conn.commit()
+                        except Exception:
+                            conn.rollback()
+                            raise
+                        finally:
+                            conn.close()
+                    cursor_timestamp, seen_ids = self._cursor_after(
+                        page, cursor_timestamp, seen_ids
+                    )
+                    if len(page) < max_messages:
+                        break
+        return {
+            "state": (
+                "source_degraded"
+                if degraded_shards
+                else "applied" if apply else "planned"
+            ),
+            "scanned": scanned,
+            "discovered_links": discovered_links,
+            "discovered_files": discovered_files,
+            "inserted_links": inserted_links,
+            "inserted_files": inserted_files,
             "degraded_shards": degraded_shards,
             "error_code": source_error_code,
         }

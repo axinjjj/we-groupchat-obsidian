@@ -37,7 +37,11 @@ SENSITIVE_QUERY_KEYS = {
     "access_token",
     "api_key",
     "auth",
+    "authorization",
     "code",
+    "credential",
+    "credentials",
+    "jwt",
     "key",
     "password",
     "secret",
@@ -193,6 +197,10 @@ def _safe_part(value, fallback="未命名", max_len=100):
     return (cleaned[:max_len].rstrip(" .") or fallback)
 
 
+def _path_collision_key(value):
+    return unicodedata.normalize("NFKC", str(value or "")).casefold()
+
+
 def _safe_subdir(value):
     parts = []
     for part in re.split(r"[/\\]+", str(value or "")):
@@ -250,7 +258,10 @@ def _sensitive_query_key(key):
     tokens = [token for token in re.split(r"[^a-z0-9]+", lowered) if token]
     compact = "".join(tokens)
     if any(
-        token in {"token", "secret", "password", "signature", "sig", "auth", "session"}
+        token in {
+            "token", "secret", "password", "signature", "sig", "auth",
+            "authorization", "credential", "credentials", "jwt", "session",
+        }
         for token in tokens
     ):
         return True
@@ -260,8 +271,12 @@ def _sensitive_query_key(key):
         marker in compact
         for marker in (
             "accesstoken",
+            "authorization",
             "authtoken",
             "apikey",
+            "credential",
+            "credentials",
+            "jwt",
             "sessionid",
             "sessiontoken",
             "signature",
@@ -272,7 +287,10 @@ def _sensitive_query_key(key):
 
 
 def _redact_url(url):
-    parsed = urlsplit(str(url or ""))
+    try:
+        parsed = urlsplit(str(url or ""))
+    except ValueError:
+        return "REDACTED_INVALID_URL"
     if not parsed.query:
         return str(url or "")
     query = []
@@ -475,7 +493,7 @@ class MountedResourceBackup:
                 pass
             os.close(fd)
 
-    def _target_boundary_error(self):
+    def _target_boundary_error(self, occurrences=None, object_rows=None):
         if not self.target:
             return ""
         if os.path.lexists(self.target):
@@ -522,6 +540,42 @@ class MountedResourceBackup:
                     return "target_directory_escape"
             except ValueError:
                 return "target_directory_escape"
+        planned = {
+            os.path.join(self.backup_root, "objects"),
+            os.path.join(self.backup_root, "objects", "sha256"),
+            os.path.join(self.backup_root, "snapshots"),
+            os.path.join(self.backup_root, "views"),
+        }
+        for row in object_rows or []:
+            planned.add(os.path.dirname(os.path.join(
+                self.backup_root, self._target_relpath(row)
+            )))
+        for chat_part in self._chat_path_parts(occurrences or []).values():
+            chat_root = os.path.join(self.backup_root, "views", chat_part)
+            planned.add(chat_root)
+            planned.add(os.path.join(chat_root, "资源索引"))
+        for path in sorted(planned):
+            relative = os.path.relpath(path, self.backup_root)
+            current = self.backup_root
+            for part in relative.split(os.sep):
+                if part in {"", "."}:
+                    continue
+                current = os.path.join(current, part)
+                if not os.path.lexists(current):
+                    continue
+                try:
+                    mode = os.lstat(current).st_mode
+                except OSError:
+                    return "target_directory_unavailable"
+                if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+                    return "target_subtree_conflict"
+                try:
+                    if os.path.commonpath(
+                        (os.path.realpath(current), target_real)
+                    ) != target_real:
+                        return "target_directory_escape"
+                except ValueError:
+                    return "target_directory_escape"
         return ""
 
     def _ensure_target_dir(self, path):
@@ -939,13 +993,20 @@ class MountedResourceBackup:
         )
         state = self._state_row()
         if state and state["catalog_sha256"] == resources_sha256:
-            return {
-                "state": "unchanged",
-                "snapshot_id": str(state["snapshot_id"]),
-                "catalog_sha256": resources_sha256,
-                "handoff_semantics": handoff_semantics,
-                "unresolved_files": unresolved_files,
-            }
+            existing = self._load_snapshot(str(state["snapshot_id"]))
+            manifest = existing["manifest"] if existing else {}
+            if (
+                manifest.get("resources_sha256") == resources_sha256
+                and manifest.get("link_export_mode") == self.link_export_mode
+                and manifest.get("handoff_semantics") == handoff_semantics
+            ):
+                return {
+                    "state": "unchanged",
+                    "snapshot_id": str(state["snapshot_id"]),
+                    "catalog_sha256": resources_sha256,
+                    "handoff_semantics": handoff_semantics,
+                    "unresolved_files": unresolved_files,
+                }
 
         snapshot_id = self._snapshot_id()
         snapshot_dir = os.path.join(self.backup_root, "snapshots", snapshot_id)
@@ -1106,22 +1167,38 @@ class MountedResourceBackup:
             lines.extend(["", f"<!-- source_message_id: {first.get('source_message_id', '')} -->", ""])
         return "\n".join(lines).rstrip() + "\n"
 
+    @staticmethod
+    def _chat_path_parts(occurrences):
+        aliases = {}
+        collision_groups = defaultdict(set)
+        for row in occurrences:
+            chat_key = str(row.get("chat_key") or "")
+            chat_alias = str(row.get("chat_alias") or "未命名群聊")
+            safe = _safe_part(chat_alias, "未命名群聊")
+            aliases[(chat_key, chat_alias)] = safe
+            collision_groups[_path_collision_key(safe)].add(chat_key)
+        return {
+            identity: (
+                f"{safe}--{identity[0][:8]}"
+                if len(collision_groups[_path_collision_key(safe)]) > 1
+                else safe
+            )
+            for identity, safe in aliases.items()
+        }
+
     def _render_indexes_at(self, base_root, occurrences, *, target_view=False):
         grouped = defaultdict(lambda: defaultdict(list))
-        path_aliases = defaultdict(set)
         for row in occurrences:
             chat_key = str(row.get("chat_key") or "")
             chat_alias = str(row.get("chat_alias") or "未命名群聊")
             grouped[(chat_key, chat_alias)][
                 str(row.get("source_month") or "未标月份")
             ].append(row)
-            path_aliases[_safe_part(chat_alias, "未命名群聊")].add(chat_key)
+        chat_parts = self._chat_path_parts(occurrences)
         delivery_map = self._delivery_map()
         written = 0
         for (chat_key, chat_alias), months in grouped.items():
-            chat_part = _safe_part(chat_alias, "未命名群聊")
-            if len(path_aliases[chat_part]) > 1:
-                chat_part = f"{chat_part}--{chat_key[:8]}"
+            chat_part = chat_parts[(chat_key, chat_alias)]
             chat_root = os.path.join(base_root, chat_part)
             index_dir = os.path.join(chat_root, "资源索引")
             if target_view:
@@ -1213,9 +1290,9 @@ class MountedResourceBackup:
         return self._render_indexes_at(root, occurrences, target_view=True)
 
     def plan(self):
-        boundary = self._target_boundary_error()
         occurrences = self.capture.occurrences(selected_only=True)
         objects = self._object_rows(occurrences)
+        boundary = self._target_boundary_error(occurrences, objects)
         delivery_map = self._delivery_map()
         pending = 0
         for row in objects:
@@ -1229,12 +1306,26 @@ class MountedResourceBackup:
             )
             if not _within(target_path, self.backup_root) or not os.path.lexists(target_path):
                 pending += 1
+                continue
+            try:
+                target_stat = os.lstat(target_path)
+            except OSError:
+                pending += 1
+                continue
+            if (
+                stat.S_ISLNK(target_stat.st_mode)
+                or not stat.S_ISREG(target_stat.st_mode)
+                or int(target_stat.st_size) != int(row["object_size"])
+            ):
+                pending += 1
         if boundary:
             state = "invalid_target"
         elif not self.target:
             state = "target_not_configured"
         elif not os.path.isdir(self.target) or not os.access(self.target, os.W_OK):
             state = "destination_unavailable"
+        elif not self.capture.selected_chats():
+            state = "no_selected_chats"
         else:
             state = "ready"
         return {
@@ -1261,11 +1352,19 @@ class MountedResourceBackup:
                 "failed": 0,
                 "obsidian": obsidian,
             }
-        boundary = self._target_boundary_error()
+        occurrences = self.capture.occurrences(selected_only=True)
+        object_rows = self._object_rows(occurrences)
+        boundary = self._target_boundary_error(occurrences, object_rows)
         if boundary:
+            state = (
+                "target_failed"
+                if boundary == "target_subtree_conflict"
+                else "invalid_target"
+            )
             return {
-                "state": "invalid_target",
+                "state": state,
                 "error_code": boundary,
+                "error_codes": [boundary] if state == "target_failed" else [],
                 "copied": 0,
                 "failed": 0,
                 "obsidian": obsidian,
@@ -1286,20 +1385,35 @@ class MountedResourceBackup:
             }
         try:
             with self._worker_lock():
-                return self._run_locked(obsidian=obsidian)
-        except ResourceBackupError as exc:
-            if exc.code == "worker_busy":
+                return self._run_locked(
+                    obsidian=obsidian,
+                    occurrences=occurrences,
+                    object_rows=object_rows,
+                )
+        except (ResourceBackupError, ArchiveError, OSError) as exc:
+            if str(getattr(exc, "code", "")) == "worker_busy":
                 return {
                     "state": "worker_busy",
                     "copied": 0,
                     "failed": 0,
                     "obsidian": obsidian,
                 }
-            raise
+            code = str(getattr(exc, "code", "") or type(exc).__name__)
+            return {
+                "state": "target_failed",
+                "copied": 0,
+                "reused": 0,
+                "failed": 1,
+                "error_codes": [code],
+                "obsidian": obsidian,
+            }
 
-    def _run_locked(self, *, obsidian=None):
-        occurrences = self.capture.occurrences(selected_only=True)
-        object_rows = self._object_rows(occurrences)
+    def _run_locked(self, *, obsidian=None, occurrences=None, object_rows=None):
+        occurrences = (
+            self.capture.occurrences(selected_only=True)
+            if occurrences is None else occurrences
+        )
+        object_rows = self._object_rows(occurrences) if object_rows is None else object_rows
         self._ensure_target_dir(self.backup_root)
         copied = 0
         reused = 0
@@ -1328,8 +1442,8 @@ class MountedResourceBackup:
 
         delivery_map = self._delivery_map()
         records = self._catalog_records(occurrences, delivery_map)
-        snapshot = self._write_snapshot(records, object_rows, delivery_map)
         target_indexes = self._render_target_indexes(occurrences)
+        snapshot = self._write_snapshot(records, object_rows, delivery_map)
         unresolved_files = int(snapshot.get("unresolved_files") or 0)
         if unresolved_files:
             state = "pending_resources"
@@ -1419,10 +1533,36 @@ class MountedResourceBackup:
     def status(self):
         plan = self.plan()
         state = self._state_row() if self.destination_id else None
+        plan_state = str(plan.get("state") or "")
+        if plan_state != "ready":
+            handoff_semantics = plan_state or "pending"
+        elif int(plan.get("unresolved_files") or 0):
+            handoff_semantics = "pending_resources"
+        elif int(plan.get("pending_objects") or 0):
+            handoff_semantics = "pending"
+        else:
+            occurrences = self.capture.occurrences(selected_only=True)
+            delivery_map = self._delivery_map()
+            records = self._catalog_records(occurrences, delivery_map)
+            resources_sha256 = hashlib.sha256(
+                _canonical_jsonl_bytes(records)
+            ).hexdigest()
+            snapshot = (
+                self._load_snapshot(str(state["snapshot_id"])) if state else None
+            )
+            manifest = snapshot["manifest"] if snapshot else {}
+            delegated = (
+                state is not None
+                and str(state["catalog_sha256"]) == resources_sha256
+                and manifest.get("resources_sha256") == resources_sha256
+                and manifest.get("link_export_mode") == self.link_export_mode
+                and manifest.get("handoff_semantics") == "sync_delegated"
+            )
+            handoff_semantics = "sync_delegated" if delegated else "pending"
         return {
             **plan,
             "latest_snapshot": str(state["snapshot_id"]) if state else "",
-            "handoff_semantics": "sync_delegated",
+            "handoff_semantics": handoff_semantics,
             "remote_verified": False,
             "link_export_mode": self.link_export_mode,
         }

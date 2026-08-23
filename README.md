@@ -309,6 +309,8 @@ Source reliability helpers:
 .venv/bin/python scripts/resource_backup.py set-target "<existing-mounted-directory>"
 .venv/bin/python scripts/resource_backup.py set-link-export-mode redacted
 .venv/bin/python scripts/resource_backup.py init
+.venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD
+.venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply
 .venv/bin/python scripts/resource_backup.py status
 .venv/bin/python scripts/resource_backup.py plan
 .venv/bin/python scripts/resource_backup.py run --resolve-limit 10
@@ -344,9 +346,9 @@ Source reliability helpers:
 `wechat_source_guard.py install-agent` writes a one-shot `StartInterval` plist
 but does not load it; `--load-now` is the separate activation step.
 `resource_backup.py install-agent` installs and loads its short-lived scheduled
-worker and therefore belongs only after the manual canary. `attachment_archive.py backfill`
-and `google_drive_file_sync.py backfill` are dry plans unless `--apply` is
-present. Drive `enable` does not authenticate, select chats, backfill, or run an
+worker and therefore belongs only after the manual canary. Mounted-resource,
+attachment-archive, and direct-Drive backfills are dry plans unless `--apply`
+is present. Drive `enable` does not authenticate, select chats, backfill, or run an
 upload. Backup `verify` checks bytes visible at the configured filesystem target
 and deliberately makes no claim about provider-side upload. See the
 [source reliability guide](docs/source-reliability.md) for mounted handoff,

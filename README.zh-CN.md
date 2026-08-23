@@ -283,6 +283,8 @@ Source reliability 运维脚本：
 .venv/bin/python scripts/resource_backup.py set-target "<已经存在的挂载目录>"
 .venv/bin/python scripts/resource_backup.py set-link-export-mode redacted
 .venv/bin/python scripts/resource_backup.py init
+.venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD
+.venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply
 .venv/bin/python scripts/resource_backup.py status
 .venv/bin/python scripts/resource_backup.py plan
 .venv/bin/python scripts/resource_backup.py run --resolve-limit 10
@@ -318,7 +320,7 @@ Source reliability 运维脚本：
 `wechat_source_guard.py install-agent` 只写入 one-shot `StartInterval` plist，不会加载；`--load-now`
 才是单独的 activation。`resource_backup.py install-agent` 会安装并加载短命 scheduled worker，必须放在
 manual canary 通过之后。
-`attachment_archive.py backfill` 和 `google_drive_file_sync.py backfill` 默认都是 dry plan，只有显式
+Mounted-resource、attachment-archive 与 direct-Drive backfill 默认都是 dry plan，只有显式
 `--apply` 才登记历史 item。Drive `enable` 不会顺手 auth、选群、backfill 或 upload。Backup `verify`
 只验证 configured filesystem target 上看得到的 bytes，绝不宣称 provider-side upload 已完成。Drive
 mounted handoff、可选 Drive API、完整状态、resolver 规则、存储结构和失败边界见

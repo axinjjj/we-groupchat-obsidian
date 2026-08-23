@@ -231,7 +231,11 @@ class ConfigTests(unittest.TestCase):
                 {"username": "oauth@chatroom", "alias": "OAuth lane"},
             ],
             "resource_backup_selected_chats": [
-                {"username": " mounted@chatroom ", "alias": " Mounted lane "},
+                {
+                    "username": " mounted@chatroom ",
+                    "alias": " Mounted lane ",
+                    "selected_since": 123,
+                },
                 {"username": "mounted@chatroom", "alias": "duplicate"},
                 {"username": "wxid_person", "alias": "ignored"},
             ],
@@ -246,7 +250,11 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertEqual(
             selected_resource_backup_chats(cfg),
-            [{"username": "mounted@chatroom", "alias": "Mounted lane"}],
+            [{
+                "username": "mounted@chatroom",
+                "alias": "Mounted lane",
+                "selected_since": 123,
+            }],
         )
         self.assertEqual(cfg["resource_backup_interval_seconds"], 600)
         self.assertEqual(cfg["resource_backup_max_messages_per_scan"], 750)

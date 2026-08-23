@@ -238,13 +238,16 @@ worker 不会在 mount 缺失时把那个路径重新创建成普通本地目录
 .venv/bin/python scripts/resource_backup.py set-target "<已经存在的挂载目录>"
 .venv/bin/python scripts/resource_backup.py set-link-export-mode redacted
 .venv/bin/python scripts/resource_backup.py init
+.venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD
+.venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply
 .venv/bin/python scripts/resource_backup.py status
 .venv/bin/python scripts/resource_backup.py plan
 .venv/bin/python scripts/resource_backup.py run --resolve-limit 10
 .venv/bin/python scripts/resource_backup.py verify
 ```
 
-`init` 只初始化 from-now cursors。`run` 捕获 deterministic occurrences、把 due files resolve 到共享
+`init` 只初始化 from-now cursors。停选后重新选择会建立新的 private selection epoch，不会吞回停选 gap；
+历史 backfill 是独立 dry-plan/apply 命令，也不会移动 live cursor。`run` 捕获 deterministic occurrences、把 due files resolve 到共享
 CAS、即使 target 不可用也继续刷新本地 Obsidian index，然后才尝试 mounted handoff。
 
 ```text
@@ -255,7 +258,8 @@ CAS、即使 target 不可用也继续刷新本地 Obsidian index，然后才尝
 ```
 
 Plan 与 run 都拒绝 filesystem root、与本地 source 相同/嵌套/祖先关系的 target、configured-target
-symlink，以及 app-owned subtree 中的 symlink/non-directory component。第一次复制会边写边 hash，并立即
+symlink，以及 planned object、snapshot、view、chat-index directory chain 中的 symlink/non-directory
+component。Snapshot/view 冲突返回 structured `target_failed`。第一次复制会边写边 hash，并立即
 readback target bytes。后续 scheduled run 只信任本地 delivery receipt、regular-file type 与 logical size，
 避免重新 hydrate streamed placeholder；显式 `verify` 才完整 rehash target。
 
@@ -263,6 +267,11 @@ readback target bytes。后续 scheduled run 只信任本地 delivery receipt、
 upload 或 remote checksum verification。如果仍有 eligible file unresolved，系统可以发布 hash-bound
 `COMPLETE` catalog snapshot，但 run state 必须是 `pending_resources`，manifest 记录
 `snapshot_completeness=catalog_complete`，CLI 非零退出。`COMPLETE` 绑定 catalog，不会凭空补出缺失 bytes。
+
+Ordinary status 只有在 current catalog、target objects、有效 latest `COMPLETE`、link mode 与 manifest
+全部一致时才报告 `sync_delegated`。Snapshot 缺失或 object pending 时报告 `pending`，file unresolved 时报告
+`pending_resources`。WeChat source unavailable 时，one-shot CLI 仍会继续处理已有 ledger/CAS 的 resolve、index
+与 mounted handoff，输出 structured JSON，并因 source outage 返回非零。
 
 一个 manual canary 从另一 Drive surface 验证以后，才显式安装短命 scheduler：
 

@@ -136,7 +136,7 @@ selected + unselected occurrences -> bytes may be handed off once;
 only unselected occurrences -> object remains local
 ```
 
-Removing a chat from selection stops future capture and future inclusion in newly generated views/snapshots. Existing backup bytes are not automatically deleted.
+Removing a chat from selection stops future capture and future inclusion in newly generated views/snapshots. Existing backup bytes are not automatically deleted. Each selection entry carries a private `selected_since` epoch. Re-selecting a previously removed chat creates a new epoch and new from-now cursors; the unselected gap is never captured implicitly.
 
 ## 7. Source capture and cursor correctness
 
@@ -156,7 +156,14 @@ For each shard page:
 
 If a shard is unavailable, unknown, incomplete, or raises a source-degraded error, that shard cursor must not advance. Healthy shards may continue independently.
 
-The first initialization uses `from now` semantics. Historical backfill requires a separate explicit action and is not part of this patch.
+The first initialization and every unselected-to-selected transition use `from now` semantics. Historical capture is a separate dry-plan/apply action:
+
+```bash
+python scripts/resource_backup.py backfill --from YYYY-MM-DD
+python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply
+```
+
+Backfill inserts idempotent occurrences without moving the live per-shard cursors.
 
 ## 8. Resource extraction
 
@@ -346,7 +353,7 @@ records `handoff_semantics=pending_resources` and a non-zero
 `unresolved_file_count`; the run remains non-successful until those bytes are
 resolved and delivered.
 
-A new snapshot is skipped when the canonical resource catalog hash is unchanged.
+A new snapshot is skipped only when the canonical resource catalog hash is unchanged, the recorded target snapshot still has a valid hash-bound `COMPLETE`, and its `link_export_mode` plus handoff semantics match the current run. A missing or invalid target snapshot is rebuilt even when local SQLite still holds the old catalog hash.
 
 ## 13. Link privacy modes
 
@@ -360,11 +367,12 @@ full      exact observed URLs are exported
 
 The local occurrence ledger always preserves the exact observed URL. Redaction affects only exported projections.
 
-Keys such as token, access_token, secret, password, signature, auth, code, and similar variants are treated as sensitive for redacted output.
+Keys such as token, access_token, secret, password, signature, auth, authorization, credential, credentials, jwt, signed-URL credential/signature variants, code, and similar variants are treated as sensitive for redacted output. A URL that cannot be parsed safely exports `REDACTED_INVALID_URL`; parse failure never falls back to the exact URL and never terminates the worker.
 
 ## 14. Failure semantics
 
 - Source failure: do not advance the failed shard cursor.
+- Source unavailable at process start: return structured `source_unavailable`, then continue due local resolution, Obsidian projection, and mounted handoff from the existing ledger/CAS; the composite CLI exit remains non-zero.
 - CAS resolution failure: retain the occurrence and retry according to local archive policy.
 - Target unavailable: retain all local state; do not alter source cursors or CAS;
   continue refreshing the local Obsidian resource index.
@@ -405,7 +413,7 @@ The first live rollout is bounded:
 11. run a second ordinary handoff and confirm it uses local receipts without
     rehashing streamed target objects;
 12. only after the canary passes, explicitly install the short-lived LaunchAgent;
-13. stop before historical backfill.
+13. keep historical backfill as a separate explicit dry-plan/apply decision.
 
 The intended operator sequence is:
 
@@ -415,12 +423,15 @@ python scripts/resource_backup.py set-selected-chats 1
 python scripts/resource_backup.py set-target "/path/chosen/in/Finder"
 python scripts/resource_backup.py set-link-export-mode redacted
 python scripts/resource_backup.py init
+python scripts/resource_backup.py backfill --from YYYY-MM-DD
+python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply
 python scripts/resource_backup.py run --resolve-limit 10
 python scripts/resource_backup.py verify
 python scripts/resource_backup.py install-agent --interval-seconds 300
 ```
 
-`init` is from-now only. `run` remains safe before the target is available: it
+`init` is from-now only. Re-selection also starts a new from-now epoch. Explicit
+`backfill --apply` does not move that live cursor. `run` remains safe before the target is available: it
 captures eligible occurrences and refreshes the local Obsidian index, then
 reports the target state without fabricating a remote success. The final
 `install-agent` step is intentionally separate so code review and canary testing

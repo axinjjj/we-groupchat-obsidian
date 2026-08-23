@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 from pathlib import Path
 import sys
+import time
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
@@ -39,10 +41,15 @@ def _print(value):
 def _source(config):
     keys = get_cached_keys() or {}
     if not keys or not config.get("db_dir"):
-        raise SystemExit(
-            "WeChat source is unavailable: configure db_dir and extract database keys first."
-        )
+        return None
     return WeChatDB(config["db_dir"], keys)
+
+
+def _from_timestamp(value):
+    try:
+        return int(datetime.strptime(value, "%Y-%m-%d").timestamp())
+    except ValueError as exc:
+        raise SystemExit("--from must use YYYY-MM-DD") from exc
 
 
 def _capture(config, *, source=False):
@@ -105,6 +112,9 @@ def build_parser():
     sub.add_parser("clear-selected-chats")
     sub.add_parser("init")
     sub.add_parser("scan")
+    backfill = sub.add_parser("backfill")
+    backfill.add_argument("--from", dest="from_date", required=True)
+    backfill.add_argument("--apply", action="store_true")
     resolve = sub.add_parser("resolve")
     resolve.add_argument("--limit", type=int, default=50)
     sub.add_parser("index")
@@ -152,7 +162,16 @@ def main(argv=None):
         if not indexes or any(index < 1 or index > len(choices) for index in indexes):
             _print({"state": "invalid_selection", "available_chats": len(choices)})
             return 2
-        selected = [choices[index - 1] for index in indexes]
+        previous = {
+            chat["username"]: int(chat.get("selected_since") or 0)
+            for chat in selected_resource_backup_chats(config)
+        }
+        now = int(time.time())
+        selected = []
+        for index in indexes:
+            chat = dict(choices[index - 1])
+            chat["selected_since"] = previous.get(chat["username"]) or now
+            selected.append(chat)
         updated = dict(config)
         updated["resource_backup_selected_chats"] = selected
         save_config(updated)
@@ -210,6 +229,10 @@ def main(argv=None):
         result = _capture(config).initialize_selected_chat_cursors()
     elif args.command == "scan":
         result = _capture(config, source=True).scan()
+    elif args.command == "backfill":
+        result = _capture(config, source=True).backfill(
+            _from_timestamp(args.from_date), apply=args.apply
+        )
     elif args.command == "resolve":
         result = _capture(config).resolve_pending_files(limit=max(1, args.limit))
     elif args.command == "index":

@@ -271,13 +271,17 @@ the worker never recreates a missing mount path.
 .venv/bin/python scripts/resource_backup.py set-target "<existing-mounted-directory>"
 .venv/bin/python scripts/resource_backup.py set-link-export-mode redacted
 .venv/bin/python scripts/resource_backup.py init
+.venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD
+.venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply
 .venv/bin/python scripts/resource_backup.py status
 .venv/bin/python scripts/resource_backup.py plan
 .venv/bin/python scripts/resource_backup.py run --resolve-limit 10
 .venv/bin/python scripts/resource_backup.py verify
 ```
 
-`init` seeds from-now cursors only. `run` captures deterministic occurrences,
+`init` seeds from-now cursors only. Re-selecting a removed chat creates a new
+private selection epoch and skips the unselected gap. Historical backfill is a
+separate dry-plan/apply command and does not move live cursors. `run` captures deterministic occurrences,
 resolves due files into the shared CAS, refreshes local Obsidian indexes even
 when the target is unavailable, and then attempts mounted handoff.
 
@@ -292,7 +296,8 @@ The mounted subtree is:
 
 Plan and run reject filesystem-root, same/nested/ancestor local-source targets,
 a symlink configured target, and a symlink or non-directory in the app-owned
-subtree. A successful first copy hashes while writing and immediately reads the
+subtree, including planned object, snapshot, view, and chat-index directories.
+Snapshot/view conflicts return structured `target_failed` results. A successful first copy hashes while writing and immediately reads the
 target bytes back. Later scheduled runs trust the local delivery receipt plus
 regular-file type and logical size so they do not rehydrate streamed
 placeholders. Explicit `verify` performs the full target rehash.
@@ -304,6 +309,13 @@ catalog may still publish a hash-bound `COMPLETE` snapshot, but the run state is
 `pending_resources`, the manifest says `snapshot_completeness=catalog_complete`,
 and the CLI exits non-zero. `COMPLETE` binds the catalog; it does not fabricate
 missing bytes.
+
+Ordinary status reports `sync_delegated` only when the current catalog, target
+objects, valid latest `COMPLETE`, link mode, and manifest all agree. A missing
+snapshot or pending object reports `pending`; unresolved files report
+`pending_resources`. If WeChat source is unavailable, the one-shot CLI still
+resolves and hands off existing ledger/CAS state, emits structured JSON, and
+returns non-zero for the source outage.
 
 After one manual canary is verified from another Drive surface, the optional
 short-lived scheduler can be installed explicitly:
