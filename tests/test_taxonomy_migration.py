@@ -397,14 +397,14 @@ class TaxonomyMigrationTests(unittest.TestCase):
         self.assertIn("example_limit", output)
 
     def test_cli_sanitizes_unexpected_runtime_errors(self):
-        secret = "/private/example-vault/private-title"
+        sensitive_value = "/private/example-vault/private-title"
         stdout = io.StringIO()
         stderr = io.StringIO()
         with (
             mock.patch("scripts.migrate_taxonomy.load_config", return_value=self.config),
             mock.patch(
                 "scripts.migrate_taxonomy.preview_migration",
-                side_effect=RuntimeError(secret),
+                side_effect=RuntimeError(sensitive_value),
             ),
             redirect_stdout(stdout),
             redirect_stderr(stderr),
@@ -417,7 +417,7 @@ class TaxonomyMigrationTests(unittest.TestCase):
         output = stdout.getvalue() + stderr.getvalue()
         self.assertEqual(result, 1)
         self.assertIn("migration_error", output)
-        self.assertNotIn(secret, output)
+        self.assertNotIn(sensitive_value, output)
 
     def test_cli_passes_fresh_config_to_preview_status_and_apply_only(self):
         config = {"fresh": "sanitized"}
