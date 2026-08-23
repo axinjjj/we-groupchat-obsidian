@@ -679,7 +679,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.apply:
             return apply_catch_up(config, chats, db, args)
         _print_audit(audit_pending(db, chats, limit=args.audit_limit))
-        print("\n只做了 audit，没有写入。执行补跑：./补跑遗漏笔记.command --apply")
+        print("\n只做了 audit，没有写入。执行补跑：./launchers/补跑遗漏笔记.command --apply")
         return 0
     except Exception as exc:
         print(f"补跑入口不可用: {type(exc).__name__}: {exc}", file=sys.stderr)

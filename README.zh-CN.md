@@ -212,19 +212,22 @@ cd we-groupchat-obsidian
 
 ## 常用命令
 
-这些命令都可以双击运行，也可以在 Terminal 中执行。
+Canonical Finder helper 统一放在 `launchers/`，都可以双击运行或在 Terminal
+执行。根目录只保留一个极薄的 `启动.command` compatibility entrypoint，供已有
+source install 与 LaunchAgent 继续使用。
 
 | 命令 | 用途 |
 | --- | --- |
 | `./启动.command` | 启动菜单栏应用 |
 | `./启动.command --setup-only` | 只检查环境和依赖，不启动 app |
-| `./配置关注推送.command` | 不依赖菜单栏，配置监控群聊、关注描述、AI Key 和 Obsidian 输出 |
-| `./健康检查.command` | 打印 redacted-by-default 状态；只有本地排查时才加 `--sensitive` |
-| `./刷新数据源.command` | 微信更新后刷新数据库 key，不需要找到菜单栏图标 |
-| `./历史总结到Obsidian.command` | 把历史消息按天总结并导出到 Obsidian |
-| `./整理Obsidian输出.command` | 只整理/重导出知识库 Markdown，不调用 AI |
-| `./安装自动启动.command` | 安装 macOS LaunchAgent 登录自启 |
-| `./卸载自动启动.command` | 卸载登录自启 |
+| `./launchers/配置关注推送.command` | 不依赖菜单栏，配置监控群聊、关注描述、AI Key 和 Obsidian 输出 |
+| `./launchers/健康检查.command` | 打印 redacted-by-default 状态；只有本地排查时才加 `--sensitive` |
+| `./launchers/刷新数据源.command` | 微信更新后刷新数据库 key，不需要找到菜单栏图标 |
+| `./launchers/历史总结到Obsidian.command` | 把历史消息按天总结并导出到 Obsidian |
+| `./launchers/整理Obsidian输出.command` | 只整理/重导出知识库 Markdown，不调用 AI |
+| `./launchers/安装自动启动.command` | 安装 macOS LaunchAgent 登录自启 |
+| `./launchers/卸载自动启动.command` | 卸载登录自启 |
+| `./launchers/补跑遗漏笔记.command` | 审计或显式执行 bounded monitor catch-up |
 
 等价 CLI 参数：
 
@@ -329,11 +332,17 @@ Mounted-resource、attachment-archive 与 direct-Drive backfill 默认都是 dry
 mounted handoff、可选 Drive API、完整状态、resolver 规则、存储结构和失败边界见
 [来源可靠性指南](docs/source-reliability.zh-CN.md)。
 
+每轮 resource backup 还会维护一个容易发现的 Obsidian 总入口：
+`<monitor_obsidian_subdir>/00-资源索引.md`。它链接到每个显式选中群聊自己的
+`00-资源索引.md` 与月度页面。这些文件即使名字里没有 `.generated`，也仍然是
+app-owned generated Markdown；只有首选文件名已被猫手写内容占用、程序必须避免覆盖时，
+才会退到 `00-资源索引.generated.md` 或月份 `.generated.md`。
+
 菜单栏的 `关注推送 -> 后台通知：开/关` 是自动 banner 总开关。关闭后，
 后台监控、知识库写入和 Daily Digest 仍会继续运行，只是不再显示自动命中、
 心跳、后台错误和 Digest 通知；手动操作反馈与“测试系统通知”仍会显示。
 
-如果系统级通知一直不出现，先看 `./健康检查.command` 里的
+如果系统级通知一直不出现，先看 `./launchers/健康检查.command` 里的
 `Notification identity`。源码目录 + virtualenv 启动时，进程可能显示为
 `Python / org.python.python`；这种情况下 rumps 可以成功 schedule 通知，但
 macOS 可能不会给项目一个稳定的通知设置入口，也不一定弹 banner。正式 `.app`
@@ -375,14 +384,14 @@ io.github.indeliblevivi.we-groupchat-obsidian
 如果你确认要把旧 label 迁移到 neutral label，可以显式运行：
 
 ```bash
-./安装自动启动.command --migrate-label
+./launchers/安装自动启动.command --migrate-label
 ```
 
 ## 关注推送工作流
 
 关注推送适合盯“不是每条都重要，但错过会可惜”的群聊信息。
 
-1. 运行 `./配置关注推送.command`。
+1. 运行 `./launchers/配置关注推送.command`。
 2. 从最近活跃群聊中选择一个或多个群聊。
 3. 写下关注描述，例如：
 
@@ -518,7 +527,7 @@ MCP 默认偏只读，但 read tools 会把本地 chat-derived data 暴露给 MC
 微信自动更新后，常见情况是签名恢复、数据库新增或 key 失效。先运行：
 
 ```bash
-./健康检查.command
+./launchers/健康检查.command
 ```
 
 如果看到：
@@ -531,13 +540,13 @@ MCP 默认偏只读，但 read tools 会把本地 chat-derived data 暴露给 MC
 运行：
 
 ```bash
-./刷新数据源.command
+./launchers/刷新数据源.command
 ```
 
 完成后再次运行：
 
 ```bash
-./健康检查.command
+./launchers/健康检查.command
 ```
 
 目标是 missing keys 变成 0。
@@ -575,17 +584,18 @@ scripts/
   daily_digest.py        # 手动生成 Daily Digest
   review_queue.py        # 查看/标记 Review Queue
   autostart.py           # LaunchAgent 安装/卸载
+launchers/               # canonical Finder 双击 .command entrypoints
 tests/                   # 可 import 的 unittest package
 c_src/                   # key scanner C 代码
 resources/               # 图标资源
 docs/                    # 用户、运维、架构与 formal contract 文档
-*.command                # 面向普通用户的双击入口
+启动.command             # 已有 source install / LaunchAgent 的 root compatibility stub
 ```
 
 Repo root 只保留 `app.py`、`mcp_server.py` 与 `setup.py` 三个明确的应用/打包 entrypoint，
 不再堆放 domain module 或测试。新的可复用行为应进入 `core/`、`ai/` 或 `ui/`；operator
-orchestration 进入 `scripts/`；测试统一进入 `tests/`。这样既有清晰分层，又不为了形式改名而
-留下两套 import compatibility path。
+orchestration 进入 `scripts/`；Finder helper 进入 `launchers/`；测试统一进入 `tests/`。
+根目录只剩一个有真实 deployed caller 的 start stub，不保留九套重复实现。
 
 ```mermaid
 flowchart LR
@@ -600,6 +610,8 @@ flowchart LR
     UI["ui/<br/>可复用 UI"]
   end
   SCRIPTS["scripts/<br/>one-shot operator"]
+  LAUNCHERS["launchers/<br/>Finder entrypoints"]
+  ROOTSTART["启动.command<br/>compatibility stub"]
   TESTS["tests/<br/>unittest package"]
   AGENTS["LaunchAgents<br/>绝对 checkout path"]
   BUNDLE["Alias app bundle<br/>checkout + .venv"]
@@ -611,6 +623,9 @@ flowchart LR
   MCP --> AI
   MCP --> CORE
   SCRIPTS --> CORE
+  ROOTSTART --> LAUNCHERS
+  LAUNCHERS --> APP
+  LAUNCHERS --> SCRIPTS
   SETUP --> BUNDLE
   AGENTS --> BUNDLE
   AGENTS --> SCRIPTS
@@ -629,8 +644,7 @@ worker 都使用绝对 checkout path。只有当这些表面改为 installed exe
 .venv/bin/python -m unittest discover -s tests -t . -p 'test_*.py'
 .venv/bin/python -m unittest -v tests.test_resource_backup
 .venv/bin/python -m compileall -q app.py mcp_server.py setup.py ai core ui scripts tests
-bash -n 启动.command
-bash -n 刷新数据源.command
+for launcher in 启动.command launchers/*.command; do bash -n "$launcher"; done
 ```
 
 部分测试会 import macOS/AppKit 或加密相关依赖；如果本地环境卡在 import 阶段，先用上面的窄测试确认核心逻辑，再单独排查依赖。
@@ -642,14 +656,15 @@ bash -n 刷新数据源.command
 macOS 菜单栏图标太多、刘海区域或菜单栏管理工具都可能把图标挤掉。配置和维护可以直接走 `.command` 文件：
 
 ```bash
-./配置关注推送.command
-./健康检查.command
-./刷新数据源.command
+./launchers/配置关注推送.command
+./launchers/健康检查.command
+./launchers/刷新数据源.command
 ```
 
 ### 微信更新后读不到新消息怎么办？
 
-先跑 `./健康检查.command`。如果提示 re-sign 或 missing keys，跑 `./刷新数据源.command`。
+先跑 `./launchers/健康检查.command`。如果提示 re-sign 或 missing keys，跑
+`./launchers/刷新数据源.command`。
 
 ### 输入管理员密码时终端没有反应？
 
@@ -680,7 +695,7 @@ macOS 菜单栏图标太多、刘海区域或菜单栏管理工具都可能把�
 这个 fork 没有改变原项目的核心方向：仍然是在用户自己的 Mac 上读取本地微信数据库，用用户自己配置的 AI provider 做群聊总结。这里的大部分改动来自实际使用反馈：菜单栏图标找不到怎么办，微信更新后 key 失效怎么办，LaunchAgent 显示 loaded 但没真的运行怎么办，关注推送如何避免变成噪音，Obsidian 输出怎样才能长期检索和迁移。
 
 - 更完整的本地运维入口：`setup-only`、健康检查、关注推送配置、刷新数据源、历史回填、整理 Obsidian 输出、安装/卸载自启动，都有 CLI 或 `.command` 入口。
-- 微信更新恢复路径更明确：通过 `./健康检查.command` 判断 re-sign、missing keys、monitor、Obsidian、LaunchAgent 状态，再用 `./刷新数据源.command` 修复，不依赖菜单栏图标一定可见。
+- 微信更新恢复路径更明确：通过 `./launchers/健康检查.command` 判断 re-sign、missing keys、monitor、Obsidian、LaunchAgent 状态，再用 `./launchers/刷新数据源.command` 修复，不依赖菜单栏图标一定可见。
 - LaunchAgent 做了 public-safe 兼容：新安装使用 neutral label，旧的项目 plist 会按 `ProgramArguments` / `WorkingDirectory` 自动识别并默认保留，只有显式 `--migrate-label` 才迁移。
 - 关注推送从“有命中就吵人”调成了更 value-first 的工作流：支持多群、provider/model 配置、显式开启的链接预览、转发聊天记录解析、睡眠唤醒补跑、`P1/P2/P3` 通知分层，以及更稳定的摘要 prompt。
 - 资源线索不会因为暂时没有文件/链接而丢掉：`resource_lead` 会把“可以私发 / 晚点发 / repo 还没公开 / 求一份”这类机会作为 `follow_up_resource` 留进 Review Queue。

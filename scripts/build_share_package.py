@@ -57,7 +57,7 @@ SHARE_GUIDE = """# we-groupchat-obsidian 群友使用说明
 ## 第一次运行
 
 1. 解压整个文件夹，不要只拷贝某一个 `.command` 文件。
-2. 右键 `启动.command`，选择“打开”，再在弹窗中确认打开。
+2. 右键根目录的 `启动.command`，选择“打开”，再在弹窗中确认打开。
 3. 脚本需要创建/更新 `.venv` 并安装 dependencies 时会先询问；输入 `y` 才继续，不同意就退出。
 4. 菜单栏出现图标后，进入设置，选择 AI provider 并填写 API Key。
 
@@ -75,19 +75,20 @@ SHARE_GUIDE = """# we-groupchat-obsidian 群友使用说明
 
 ```bash
 ./启动.command
-./配置关注推送.command
-./健康检查.command
-./刷新数据源.command
-./历史总结到Obsidian.command
-./整理Obsidian输出.command
-./安装自动启动.command
-./卸载自动启动.command
+./launchers/配置关注推送.command
+./launchers/健康检查.command
+./launchers/刷新数据源.command
+./launchers/历史总结到Obsidian.command
+./launchers/整理Obsidian输出.command
+./launchers/安装自动启动.command
+./launchers/卸载自动启动.command
+./launchers/补跑遗漏笔记.command
 ```
 
 ## 建议先跑一次健康检查
 
 ```bash
-./健康检查.command
+./launchers/健康检查.command
 ```
 
 默认输出是 redacted 的，适合排查 DB/key、LaunchAgent、通知 identity 和 Obsidian 输出状态。只有本机私下 debug 才考虑加 `--sensitive`。

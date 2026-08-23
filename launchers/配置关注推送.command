@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
 
 if [[ ! -x "$PROJECT_DIR/.venv/bin/python" ]]; then

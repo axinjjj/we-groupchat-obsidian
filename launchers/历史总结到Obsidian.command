@@ -1,9 +1,9 @@
 #!/bin/bash
-# Uninstall the macOS LaunchAgent for we-groupchat-obsidian autostart.
+# Backfill historical group-chat summaries into the Obsidian knowledge store.
 
 set -euo pipefail
 
-PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
 
 if [[ ! -x "$PROJECT_DIR/.venv/bin/python" ]]; then
@@ -11,4 +11,4 @@ if [[ ! -x "$PROJECT_DIR/.venv/bin/python" ]]; then
     "$PROJECT_DIR/启动.command" --setup-only
 fi
 
-exec "$PROJECT_DIR/.venv/bin/python" "$PROJECT_DIR/scripts/autostart.py" uninstall "$@"
+exec "$PROJECT_DIR/.venv/bin/python" "$PROJECT_DIR/scripts/backfill_history.py" "$@"

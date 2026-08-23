@@ -117,12 +117,12 @@ def install(
     if app_bundle:
         print(f"  app:   {Path(app_bundle).expanduser().resolve()}")
     if target.label != DEFAULT_LABEL:
-        print(f"  保留现有 LaunchAgent label；如需迁移到默认 label，运行：./安装自动启动.command --migrate-label")
+        print(f"  保留现有 LaunchAgent label；如需迁移到默认 label，运行：./launchers/安装自动启动.command --migrate-label")
     if load_now:
         print("  LaunchAgent 已加载；下次登录也会自动启动。")
     else:
         print("  已写入 LaunchAgent；下次登录会自动启动。")
-        print("  如需现在立刻加载，运行：./安装自动启动.command --load-now")
+        print("  如需现在立刻加载，运行：./launchers/安装自动启动.command --load-now")
     return 0
 
 

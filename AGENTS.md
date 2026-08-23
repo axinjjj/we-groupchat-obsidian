@@ -11,6 +11,9 @@
 - `ai/` owns provider adapters; `ui/` owns reusable UI components.
 - `scripts/` contains thin operator and LaunchAgent one-shot entrypoints. Put
   reusable behavior in the owning package rather than duplicating it in a CLI.
+- `launchers/` owns the canonical Finder-friendly `.command` entrypoints. The
+  root `启动.command` is a compatibility stub for deployed source-mode
+  LaunchAgents and must not grow a second implementation.
 - `tests/` is an importable unittest package. New tests belong there and use
   `tests.<module>` for focused invocation.
 
@@ -35,8 +38,7 @@ Run from repository root:
 ```bash
 .venv/bin/python -m unittest discover -s tests -t . -p 'test_*.py'
 .venv/bin/python -m compileall -q app.py mcp_server.py setup.py ai core ui scripts tests
-bash -n 启动.command
-bash -n 刷新数据源.command
+for launcher in 启动.command launchers/*.command; do bash -n "$launcher"; done
 ```
 
 Use focused `tests.<module>` runs while iterating, then the full suite for
