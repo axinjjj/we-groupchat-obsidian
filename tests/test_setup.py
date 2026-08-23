@@ -1,11 +1,12 @@
 import ast
-from pathlib import Path
 import unittest
+
+from tests.paths import repo_path
 
 
 class SetupPy2AppTests(unittest.TestCase):
     def _setup_options(self):
-        tree = ast.parse(Path("setup.py").read_text(encoding="utf-8"))
+        tree = ast.parse(repo_path("setup.py").read_text(encoding="utf-8"))
         for node in tree.body:
             if isinstance(node, ast.Assign):
                 for target in node.targets:
@@ -14,7 +15,7 @@ class SetupPy2AppTests(unittest.TestCase):
         return None
 
     def _setup_call_keywords(self):
-        tree = ast.parse(Path("setup.py").read_text(encoding="utf-8"))
+        tree = ast.parse(repo_path("setup.py").read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "setup":
                 return {keyword.arg for keyword in node.keywords}
@@ -36,7 +37,10 @@ class SetupPy2AppTests(unittest.TestCase):
         options = self._setup_options()
 
         self.assertEqual(options["iconfile"], "resources/app_icon.icns")
-        self.assertTrue(Path(options["iconfile"]).is_file())
+        self.assertTrue(repo_path(options["iconfile"]).is_file())
+
+    def test_py2app_does_not_package_repository_tests(self):
+        self.assertNotIn("tests", self._setup_options()["packages"])
 
     def test_setup_py_keeps_dependencies_in_requirements_file(self):
         keywords = self._setup_call_keywords()

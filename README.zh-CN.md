@@ -2,7 +2,10 @@
 
 本地优先的微信群聊总结、关注推送与 Obsidian 知识库工具。
 
-当前状态：source-only developer preview。请先读完数据流和账号安全边界，再在真实聊天数据上使用。
+当前状态：可完整运行的 source-distributed macOS app。它已经拥有菜单栏 app、MCP Server、
+operator CLI、持久化本地状态、recovery/backup workers 和完整 regression suite；请先读完
+数据流和账号安全边界，再在真实聊天数据上使用。当前不分发 bundled Python runtime
+或已签名 installer。
 
 一个本地优先的 macOS 微信群聊总结工具。它读取你电脑上的微信本地数据库，生成群聊摘要、关键词搜索结果，并把值得关注的新消息整理成 Obsidian-friendly Markdown 笔记。
 
@@ -543,8 +546,9 @@ MCP 默认偏只读，但 read tools 会把本地 chat-derived data 暴露给 MC
 
 ```text
 app.py                   # macOS 菜单栏应用入口
-mcp_server.py            # MCP Server
-ai/                      # AI provider 适配层
+mcp_server.py            # FastMCP Server 入口
+setup.py                 # py2app 打包入口
+ai/                      # 可替换 AI provider 适配层
 core/
   wechat_db.py           # 微信数据库读取和消息格式化
   decryptor.py           # SQLCipher 解密
@@ -560,6 +564,7 @@ core/
   google_drive_client.py  # Google Drive v3 REST wrapper
   google_drive_file_sync.py # selected-chat queue、CAS 与 Drive projection
   sender.py              # 微信 UI 发送消息，可选且默认关闭
+ui/                      # 可复用 macOS UI 组件
 scripts/
   configure_monitor.py   # CLI 配置关注推送
   google_drive_file_sync.py # Google Drive 文件同步的显式 one-shot actions
@@ -570,17 +575,60 @@ scripts/
   daily_digest.py        # 手动生成 Daily Digest
   review_queue.py        # 查看/标记 Review Queue
   autostart.py           # LaunchAgent 安装/卸载
+tests/                   # 可 import 的 unittest package
 c_src/                   # key scanner C 代码
 resources/               # 图标资源
-test_*.py                # unittest 测试
+docs/                    # 用户、运维、架构与 formal contract 文档
 *.command                # 面向普通用户的双击入口
 ```
+
+Repo root 只保留 `app.py`、`mcp_server.py` 与 `setup.py` 三个明确的应用/打包 entrypoint，
+不再堆放 domain module 或测试。新的可复用行为应进入 `core/`、`ai/` 或 `ui/`；operator
+orchestration 进入 `scripts/`；测试统一进入 `tests/`。这样既有清晰分层，又不为了形式改名而
+留下两套 import compatibility path。
+
+```mermaid
+flowchart LR
+  subgraph Root["稳定 repo 表面"]
+    APP["app.py<br/>菜单栏 + py2app target"]
+    MCP["mcp_server.py<br/>FastMCP stdio"]
+    SETUP["setup.py<br/>alias-app build"]
+  end
+  subgraph Packages["可复用实现"]
+    AI["ai/<br/>provider 适配"]
+    CORE["core/<br/>状态 + domain contract"]
+    UI["ui/<br/>可复用 UI"]
+  end
+  SCRIPTS["scripts/<br/>one-shot operator"]
+  TESTS["tests/<br/>unittest package"]
+  AGENTS["LaunchAgents<br/>绝对 checkout path"]
+  BUNDLE["Alias app bundle<br/>checkout + .venv"]
+  CLIENTS["MCP clients<br/>绝对 mcp_server.py path"]
+
+  APP --> AI
+  APP --> CORE
+  APP --> UI
+  MCP --> AI
+  MCP --> CORE
+  SCRIPTS --> CORE
+  SETUP --> BUNDLE
+  AGENTS --> BUNDLE
+  AGENTS --> SCRIPTS
+  CLIENTS --> MCP
+  TESTS -. "验证" .-> Root
+  TESTS -. "验证" .-> Packages
+```
+
+当前 source checkout 本身就是 deployment ABI 的一部分：alias bundle、MCP config 与 scheduled
+worker 都使用绝对 checkout path。只有当这些表面改为 installed executable，并且 app 可以成为
+不依赖 source tree 的 standalone bundle 时，全面迁移到 `src/we_groupchat_obsidian/` 才真正值得。
 
 ## 开发与测试
 
 ```bash
-.venv/bin/python -m unittest discover -p 'test_*.py'
-.venv/bin/python -m py_compile app.py mcp_server.py core/launch_agent.py core/monitor.py core/knowledge.py core/config.py core/wechat_db.py core/daily_digest.py core/link_preview.py core/notification_target.py core/notification_identity.py core/review_queue.py core/mcp_send_confirmation.py core/mcp_send_policy.py core/google_drive_auth.py core/google_drive_client.py core/google_drive_file_sync.py scripts/google_drive_file_sync.py scripts/health_check.py scripts/refresh_data_source.py scripts/daily_digest.py scripts/review_queue.py scripts/organize_obsidian.py scripts/autostart.py
+.venv/bin/python -m unittest discover -s tests -t . -p 'test_*.py'
+.venv/bin/python -m unittest -v tests.test_resource_backup
+.venv/bin/python -m compileall -q app.py mcp_server.py setup.py ai core ui scripts tests
 bash -n 启动.command
 bash -n 刷新数据源.command
 ```

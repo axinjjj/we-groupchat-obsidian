@@ -2,7 +2,11 @@
 
 Local-first WeChat group chat summaries, monitor review, and Obsidian knowledge output.
 
-Status: source-only developer preview. Review the data-flow and account-safety notes before using it on real chat data.
+Status: functional, source-distributed macOS application. It has a menu-bar app,
+MCP server, operator CLIs, durable local state, recovery/backup workers and a
+full regression suite; review the data-flow and account-safety notes before
+using it on real chat data. A bundled Python runtime or signed installer is not
+currently distributed.
 
 A local-first macOS tool for reading your own WeChat desktop database, summarizing group chats, searching messages, and turning high-value group-chat updates into an Obsidian-friendly Markdown knowledge base.
 
@@ -543,11 +547,72 @@ The old `mcp_enable_send_message: true` setting is still read as a backward-comp
 
 Real sends use a two-step confirmation flow. First call `prepare_send_message(text, chat_name)` and show the returned nonce, target, text preview, and expiry to the user. Only after the user confirms, call `confirm_send_message(nonce, text, chat_name)` with the exact same target and text. The compatibility `send_message` tool now prepares a nonce in real-send modes instead of sending immediately.
 
+## Repository Layout
+
+```text
+app.py                   # macOS menu-bar application entrypoint
+mcp_server.py            # FastMCP server entrypoint
+setup.py                 # py2app packaging entrypoint
+ai/                      # replaceable AI provider adapters
+core/                    # domain logic, durable state, privacy and reliability contracts
+ui/                      # reusable UI components
+scripts/                 # thin operator and LaunchAgent one-shot entrypoints
+tests/                   # importable unittest package
+c_src/                   # macOS WeChat key scanner
+resources/               # app and menu-bar assets
+docs/                    # user, operator, architecture and formal-contract documentation
+*.command                # Finder-friendly macOS entrypoints
+```
+
+The three root-level Python files are deliberate application/build entrypoints,
+not loose domain modules. New reusable behavior belongs in `core/`, `ai/`, or
+`ui/`; operator orchestration belongs in `scripts/`; tests belong in `tests/`.
+This keeps the current import and py2app contract stable without maintaining a
+second compatibility package around the same implementation.
+
+```mermaid
+flowchart LR
+  subgraph Root["Stable repository surfaces"]
+    APP["app.py<br/>menu bar + py2app target"]
+    MCP["mcp_server.py<br/>FastMCP stdio"]
+    SETUP["setup.py<br/>alias-app build"]
+  end
+  subgraph Packages["Reusable implementation"]
+    AI["ai/<br/>providers"]
+    CORE["core/<br/>state + domain contracts"]
+    UI["ui/<br/>reusable UI"]
+  end
+  SCRIPTS["scripts/<br/>one-shot operators"]
+  TESTS["tests/<br/>unittest package"]
+  AGENTS["LaunchAgents<br/>absolute checkout paths"]
+  BUNDLE["Alias app bundle<br/>checkout + .venv"]
+  CLIENTS["MCP clients<br/>absolute mcp_server.py"]
+
+  APP --> AI
+  APP --> CORE
+  APP --> UI
+  MCP --> AI
+  MCP --> CORE
+  SCRIPTS --> CORE
+  SETUP --> BUNDLE
+  AGENTS --> BUNDLE
+  AGENTS --> SCRIPTS
+  CLIENTS --> MCP
+  TESTS -. "validates" .-> Root
+  TESTS -. "validates" .-> Packages
+```
+
+The source checkout is currently part of the deployment ABI: the alias bundle,
+MCP configuration and scheduled workers resolve absolute checkout paths. A
+future `src/we_groupchat_obsidian/` migration becomes worthwhile when these
+surfaces target installed executables and a standalone bundle instead.
+
 ## Development
 
 ```bash
-.venv/bin/python -m unittest discover -p 'test_*.py'
-.venv/bin/python -m py_compile app.py mcp_server.py core/launch_agent.py core/monitor.py core/knowledge.py core/config.py core/wechat_db.py core/daily_digest.py core/link_preview.py core/notification_target.py core/notification_identity.py core/review_queue.py core/mcp_send_confirmation.py core/mcp_send_policy.py core/google_drive_auth.py core/google_drive_client.py core/google_drive_file_sync.py scripts/google_drive_file_sync.py scripts/health_check.py scripts/refresh_data_source.py scripts/daily_digest.py scripts/review_queue.py scripts/organize_obsidian.py scripts/autostart.py
+.venv/bin/python -m unittest discover -s tests -t . -p 'test_*.py'
+.venv/bin/python -m unittest -v tests.test_resource_backup
+.venv/bin/python -m compileall -q app.py mcp_server.py setup.py ai core ui scripts tests
 bash -n 启动.command
 bash -n 刷新数据源.command
 ```

@@ -35,6 +35,7 @@ from core.relation_markdown_cleanup import (
 )
 from core.knowledge import KnowledgeStore
 from scripts import repair_relation_markdown as cleanup_cli
+from tests.paths import REPO_ROOT, repo_path
 
 
 class RelationMarkdownCleanupTests(unittest.TestCase):
@@ -406,14 +407,10 @@ class RelationMarkdownCleanupTests(unittest.TestCase):
         return subprocess.run(
             [
                 sys.executable,
-                os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)),
-                    "scripts",
-                    "repair_relation_markdown.py",
-                ),
+                repo_path("scripts", "repair_relation_markdown.py"),
                 *map(str, arguments),
             ],
-            cwd=os.path.dirname(os.path.abspath(__file__)),
+            cwd=REPO_ROOT,
             env=environment,
             capture_output=True,
             text=True,
@@ -2874,7 +2871,7 @@ finally:
 '''
         completed = subprocess.run(
             [sys.executable, "-c", script],
-            cwd=os.path.dirname(os.path.abspath(__file__)),
+            cwd=REPO_ROOT,
             capture_output=True,
             text=True,
             timeout=1.0,

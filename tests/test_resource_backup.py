@@ -56,6 +56,12 @@ class FakeSource:
 
 class ResourceBackupTests(unittest.TestCase):
     def setUp(self):
+        self.settings_patcher = patch(
+            "core.resource_backup.load_resource_backup_settings",
+            return_value={"target": "", "link_export_mode": "redacted"},
+        )
+        self.settings_patcher.start()
+        self.addCleanup(self.settings_patcher.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.root = self.tmp.name
         self.db_dir = os.path.join(

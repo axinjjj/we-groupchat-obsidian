@@ -27,6 +27,7 @@ EXCLUDED_PREFIXES = (
     "ai/__pycache__/",
     "core/__pycache__/",
     "scripts/__pycache__/",
+    "tests/__pycache__/",
     "ui/__pycache__/",
     "build/",
     "dist/",

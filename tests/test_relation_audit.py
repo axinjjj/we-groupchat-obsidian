@@ -15,6 +15,7 @@ from core.relation_audit import (
     audit_relations,
     repair_known_invalid_relations,
 )
+from tests.paths import repo_path
 
 
 class RelationAuditTests(unittest.TestCase):
@@ -349,7 +350,7 @@ class RelationAuditTests(unittest.TestCase):
         self.assertFalse(os.path.exists(missing))
 
     def test_audit_cli_is_json_capable_and_apply_mode_is_narrowly_named(self):
-        script = os.path.join(os.path.dirname(__file__), "scripts", "repair_relations.py")
+        script = repo_path("scripts", "repair_relations.py")
 
         result = subprocess.run(
             [sys.executable, script, "audit", "--db", self.db_path, "--json"],
@@ -372,7 +373,7 @@ class RelationAuditTests(unittest.TestCase):
         self.assertIn("audit-only", help_result.stdout)
 
     def test_apply_cli_requires_exact_confirmation(self):
-        script = os.path.join(os.path.dirname(__file__), "scripts", "repair_relations.py")
+        script = repo_path("scripts", "repair_relations.py")
         backup_path = os.path.join(self.tmp.name, "wrong-confirmation.db")
         before = self._digest(self.db_path)
 
@@ -402,7 +403,7 @@ class RelationAuditTests(unittest.TestCase):
         self.assertEqual(before, self._digest(self.db_path))
 
     def test_apply_cli_runs_exact_repair(self):
-        script = os.path.join(os.path.dirname(__file__), "scripts", "repair_relations.py")
+        script = repo_path("scripts", "repair_relations.py")
         backup_path = os.path.join(self.tmp.name, "cli-backup.db")
 
         result = subprocess.run(
