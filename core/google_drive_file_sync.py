@@ -28,6 +28,9 @@ from .google_drive_client import (
 from .wechat_db import WeChatSourceDegraded
 
 
+BACKFILL_PAGE_SIZE = 50_000
+
+
 SCHEMA_VERSION = 1
 FRESH_RESOLVE_STATES = ("queued",)
 RETRY_RESOLVE_STATES = ("waiting_cache", "insufficient_local_space")
@@ -357,7 +360,12 @@ class GoogleDriveFileSync:
         if self.source is None:
             raise DriveSyncError("source_unavailable")
         request_limit = max(1, int(limit)) + len(seen_ids)
-        messages = self.source.get_messages_for_shard(
+        reader = getattr(
+            self.source,
+            "get_cursor_messages_for_shard",
+            self.source.get_messages_for_shard,
+        )
+        messages = reader(
             username,
             source_shard_id,
             since_ts=max(0, int(cursor_timestamp)),
@@ -584,8 +592,16 @@ class GoogleDriveFileSync:
         }
 
     def backfill(self, from_timestamp, *, apply=False):
+        snapshot = getattr(self.source, "source_snapshot", None)
+        if snapshot is not None:
+            with snapshot():
+                return self._backfill(from_timestamp, apply=apply)
+        return self._backfill(from_timestamp, apply=apply)
+
+    def _backfill(self, from_timestamp, *, apply=False):
         chats = self.selected_chats()
         max_messages = max(1, int(self.config.get("google_drive_file_sync_max_messages_per_scan", 500)))
+        max_messages = max(max_messages, BACKFILL_PAGE_SIZE)
         scanned = 0
         discovered = 0
         inserted = 0

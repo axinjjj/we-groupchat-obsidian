@@ -8,37 +8,32 @@
 4. 可选 advanced selected-chat Drive API sync；
 5. 面向更广 attachment archive 的 provider-neutral filesystem snapshot target。
 
-它们不是一个永不退出的“大守护进程”。`TopicMonitor` 负责读消息与 checkpoint，
-不 import、也不调用 source guard。Knowledge transaction 负责登记 attachment mention；
+它们仍是彼此独立的 domain responsibility，只是需要 protected-data access 的 timer 共享一个长驻菜单 app
+进程。`TopicMonitor` 负责读消息与 checkpoint，不 import、也不调用 source guard。Knowledge transaction 负责登记 attachment mention；
 commit 之后的 worker 才负责找 bytes 和复制。Mounted backup 只读本机 immutable archive object，
 并且只写自己的 configured filesystem target。两条 selected-chat scanner 各有独立 cursor/selection；
 即使消息没有 Knowledge hit，也可以复用同一个本地 CAS。
 
 ## 1. 可选 WeChat source guard
 
-Source guard 默认关闭。开启 policy、安装 LaunchAgent plist、加载 LaunchAgent 是三个分开的动作：
+Source guard 默认关闭。它的 timer 位于长驻菜单 app 内；开启 policy 就是唯一 activation：
 
 ```bash
 .venv/bin/python scripts/wechat_source_guard.py status
 .venv/bin/python scripts/wechat_source_guard.py enable
-.venv/bin/python scripts/wechat_source_guard.py install-agent
-.venv/bin/python scripts/wechat_source_guard.py install-agent --load-now
+.venv/bin/python scripts/wechat_source_guard.py uninstall-agent  # 清理旧 agent
 ```
 
-`install-agent` 写入一个独立的 one-shot `StartInterval` job，plist 没有 `KeepAlive`。
-不加 `--load-now` 就不会 bootstrap。每一次调用只做一次 check：尝试获取 non-blocking lock，
-写入很小的私有 state，然后退出。构建 plist 时如果设置了
-`WE_GROUPCHAT_OBSIDIAN_DATA_DIR`，LaunchAgent 会显式保留这个 override。
-
-如果 `dist/WeGroupchatObsidian.app` 已存在，plist 会调用它的
-`--source-guard-run` one-shot mode，让 macOS 把 protected-folder access 归到稳定的项目 app
-identity。纯 source 安装继续使用 `.venv/bin/python scripts/wechat_source_guard_agent.py`
-fallback。
+旧版本会调度独立的 one-shot `StartInterval` job。macOS App Data consent 绑定正在运行的 process；helper
+退出后，下一次 wake 可能再次弹窗。新版本因此拒绝 `install-agent`；历史
+`--source-guard-run` 会在读取 protected data 之前返回 `long_lived_app_required`，而
+`uninstall-agent` 保持幂等清理。普通 autostart LaunchAgent 只负责一只长驻菜单 app；source guard 在其中
+使用 timer 与 non-blocking lock。
 
 Process-list availability 通过读取 guard 当前进程自身来证明，不依赖普通用户 session
 能否看见系统级 `launchd`。Source freshness 只对 cached key inventory 中已知的
 `message/` shard 路径及其 WAL/SHM siblings 做 exact stat；它不会递归遍历 DB root 或
-微信 hardlink/cache tree，因此 one-shot 在 LaunchAgent context 下仍然有界。
+微信 hardlink/cache tree，因此每轮 in-process check 仍然有界。
 
 只有 process lookup 明确确认微信不在运行时，guard 才会先进入 grace。Grace 结束后，
 还必须同时满足 restart budget 与 exponential backoff，唯一可能发出的启动请求等价于：
@@ -243,21 +238,28 @@ worker 不会在 mount 缺失时把那个路径重新创建成普通本地目录
 .venv/bin/python scripts/resource_backup.py set-target "<已经存在的挂载目录>"
 .venv/bin/python scripts/resource_backup.py set-link-export-mode redacted
 .venv/bin/python scripts/resource_backup.py init
+.venv/bin/python scripts/resource_backup.py backfill-links --all
+.venv/bin/python scripts/resource_backup.py backfill-links --all --apply
+.venv/bin/python scripts/resource_backup.py backfill-links --from YYYY-MM-DD
+.venv/bin/python scripts/resource_backup.py backfill-links --from YYYY-MM-DD --apply
 .venv/bin/python scripts/resource_backup.py backfill --all
 .venv/bin/python scripts/resource_backup.py backfill --all --apply
 .venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD
 .venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply
 .venv/bin/python scripts/resource_backup.py status
 .venv/bin/python scripts/resource_backup.py plan
-.venv/bin/python scripts/resource_backup.py run --resolve-limit 10
+.venv/bin/python scripts/resource_backup.py run
+.venv/bin/python scripts/resource_backup.py run --resolve-files --resolve-limit 10
 .venv/bin/python scripts/resource_backup.py verify
 ```
 
 `init` 只初始化 from-now cursors。停选后重新选择会建立新的 private selection epoch，不会吞回停选 gap；
 历史 backfill 是独立 dry-plan/apply 命令，也不会移动 live cursor。`backfill --all` 从 timestamp zero
 开始，表示扫描 known local WeChat message shards 中仍然可读的全部历史，并不保证 provider 远端仍保留
-更早内容。`run` 捕获 deterministic occurrences、把 due files resolve 到共享
-CAS、即使 target 不可用也继续刷新本地 Obsidian index，然后才尝试 mounted handoff。
+更早内容。`backfill-links` 是安全的 links-only 入口：只扫描 shard-complete page，不读取附件 bytes；
+任一 known shard degraded 时写入 0 rows；完整 apply 才在一个 SQLite transaction 中提交。普通 `run`
+捕获 deterministic metadata occurrence、默认跳过 file-byte resolution、即使 target 不可用也继续刷新
+本地 Obsidian index，然后才尝试 mounted handoff。`--resolve-files` 是显式授权。
 
 ```text
 <target>/wgo-resource-backup/v3/
@@ -279,21 +281,20 @@ upload 或 remote checksum verification。如果仍有 eligible file unresolved�
 
 Ordinary status 只有在 current catalog、target objects、有效 latest `COMPLETE`、link mode 与 manifest
 全部一致时才报告 `sync_delegated`。Snapshot 缺失或 object pending 时报告 `pending`，file unresolved 时报告
-`pending_resources`。WeChat source unavailable 时，one-shot CLI 仍会继续处理已有 ledger/CAS 的 resolve、index
-与 mounted handoff，输出 structured JSON，并因 source outage 返回非零。
+`pending_resources`。WeChat source unavailable 时，显式 CLI 仍可投影并 handoff 已有 ledger/CAS state，
+输出 structured JSON，并因 source outage 返回非零。
 
-一个 manual canary 从另一 Drive surface 验证以后，才显式安装短命 scheduler：
+后台捕获与 projection 在长驻菜单 app 中开启：
 
 ```bash
-.venv/bin/python scripts/resource_backup.py install-agent --interval-seconds 300
+.venv/bin/python scripts/resource_backup.py enable
+.venv/bin/python scripts/resource_backup.py disable
 .venv/bin/python scripts/resource_backup.py agent-status
-.venv/bin/python scripts/resource_backup.py uninstall-agent
+.venv/bin/python scripts/resource_backup.py uninstall-agent  # 清理旧 agent
 ```
 
-Agent 使用 `RunAtLoad + StartInterval`、`ProcessType=Background`、`LowPriorityIO`，没有 `KeepAlive`；
-每次 wake 只运行一个 bounded process 然后退出。本地 app bundle 存在时调用它的
-`--resource-backup-run` mode；纯 source 安装保留 Python CLI fallback。安装是 activation action，
-merge source 不会自动安装。
+File-byte resolution 默认关闭，必须经菜单确认，或显式执行 `enable-file-resolution` / `--resolve-files`。
+旧 resource LaunchAgent 可被检测和移除，但新安装会因同一 process-lifetime consent 原因被拒绝。
 
 ## 5. 可选 advanced selected-chat Google Drive API 直传
 
@@ -348,7 +349,7 @@ cursor 保存 timestamp 和该 timestamp 已见过的完整 message identity set
 `drive_scan_state` 保存 enable-time chat seed；canonical 增量位置保存在 `drive_scan_shards`。其余主要表是
 `drive_sync_items`、`drive_objects`、`drive_placements`、`drive_folders` 和 content-free
 `drive_sync_runs`。Menu timer、CLI 与 app startup recovery 都调用同一个
-带 non-blocking process lock 的 one-shot worker，不新增 infinite loop。Disable/pause 后不开始新的 scan/upload；
+带 non-blocking process lock 的 bounded worker，不新增 infinite loop。Disable/pause 后不开始新的 scan/upload；
 如果开关在一个文件处理中改变，当前单文件安全结束，worker 不再取下一项。
 
 `attempt_count` 只计算 retry failure；`uploading -> shortcut_pending -> complete` 等成功状态转换不再增加
@@ -507,7 +508,7 @@ snapshot 与 privacy-safe optional direct-Drive state。Mounted resource backup 
 4. 先跑 `plan`，然后在 from-now cursor 之后发送一个无敏感 link 与一个 small file；
 5. 显式运行一次 `run` 与 `verify`，检查 occurrence/CAS、Obsidian index、mounted object 与 catalog snapshot；
 6. 从另一个 Drive surface 确认 provider-side arrival，因为 `sync_delegated` 不是 remote verification；
-7. 最后才安装 300 秒短命 resource-backup agent。
+7. 最后才开启长驻 resource timer；除非明确需要附件 bytes，否则保持 file resolution 关闭。
 
 可选 advanced Direct Drive API rollout 仍然独立：
 
@@ -522,7 +523,7 @@ snapshot 与 privacy-safe optional direct-Drive state。Mounted resource backup 
 Source guard 与更广 attachment filesystem snapshot 各有自己的 rollout：先看 status/plan，未单独审查前
 保持 disabled 或 unconfigured。
 
-安装/加载 source guard、选择 mounted-backup chats、写真实 mounted target、安装 resource agent、为可选
+开启 source guard、选择 mounted-backup chats、写真实 mounted target、开启 resource timer 或附件 bytes 解析、为可选
 API lane 做 Google auth/选群/enable、执行任何历史 backfill、清理微信 cache 与删除 Drive 文件，始终是
 分开的 operational actions。Source availability、本机保存、mounted target-byte verification、File
 Provider upload state 与已验证的 Drive API object/shortcut state 也是不同事实。

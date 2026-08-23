@@ -9,12 +9,13 @@
 - `core/` owns domain behavior, durable state, privacy boundaries, recovery,
   backup and projection contracts.
 - `ai/` owns provider adapters; `ui/` owns reusable UI components.
-- `scripts/` contains thin operator and LaunchAgent one-shot entrypoints. Put
+- `scripts/` contains thin operator entrypoints and compatibility cleanup
+  commands. Put
   reusable behavior in the owning package rather than duplicating it in a CLI.
-- Scheduled source-guard and mounted-resource jobs prefer one-shot modes of the
-  local py2app executable when it exists, preserving the stable macOS app/TCC
-  identity. The source Python path is a compatibility fallback, not the
-  preferred installed runtime.
+- Source-guard and mounted-resource timers run inside the long-lived py2app
+  menu-bar process. macOS App Data consent is process-lifetime access, so their
+  retired short-lived LaunchAgent modes must remain no-op cleanup surfaces and
+  must not be reintroduced as Python or app-bundle interval workers.
 - `launchers/` owns the canonical Finder-friendly `.command` entrypoints. The
   root `启动.command` is a compatibility stub for deployed source-mode
   LaunchAgents and must not grow a second implementation.

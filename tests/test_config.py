@@ -127,6 +127,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(DEFAULT_CONFIG["attachment_archive_min_free_bytes"], 1024 * 1024 * 1024)
         self.assertEqual(DEFAULT_CONFIG["attachment_backup_target"], "")
         self.assertEqual(DEFAULT_CONFIG["resource_backup_selected_chats"], [])
+        self.assertFalse(DEFAULT_CONFIG["resource_backup_enabled"])
+        self.assertFalse(DEFAULT_CONFIG["resource_backup_file_resolution_enabled"])
         self.assertEqual(DEFAULT_CONFIG["resource_backup_interval_seconds"], 300)
         self.assertEqual(DEFAULT_CONFIG["resource_backup_max_messages_per_scan"], 500)
         self.assertEqual(
@@ -153,6 +155,8 @@ class ConfigTests(unittest.TestCase):
             "attachment_archive_retry_base_seconds": 15,
             "attachment_archive_retry_max_seconds": 300,
             "attachment_backup_target": "~/Google Drive/WeChat backup",
+            "resource_backup_enabled": True,
+            "resource_backup_file_resolution_enabled": True,
         })
 
         self.assertTrue(cfg["wechat_source_guard_enabled"])
@@ -171,6 +175,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg["attachment_archive_retry_base_seconds"], 15)
         self.assertEqual(cfg["attachment_archive_retry_max_seconds"], 300)
         self.assertTrue(cfg["attachment_backup_target"].endswith("Google Drive/WeChat backup"))
+        self.assertTrue(cfg["resource_backup_enabled"])
+        self.assertTrue(cfg["resource_backup_file_resolution_enabled"])
 
     def test_google_drive_file_sync_config_is_private_opt_in_and_sanitized(self):
         cfg = _sanitize_config({

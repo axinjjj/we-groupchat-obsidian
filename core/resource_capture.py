@@ -29,6 +29,7 @@ from .wechat_db import WeChatSourceDegraded
 
 
 SCHEMA_VERSION = 1
+BACKFILL_PAGE_SIZE = 50_000
 LINK_ID_DOMAIN = b"we-groupchat-resource-link-v1\0"
 CHAT_ID_DOMAIN = "we-groupchat-resource-chat-v1\0"
 RETRYABLE_FILE_STATES = (
@@ -494,7 +495,12 @@ class SelectedResourceCapture:
         if self.source is None:
             raise ResourceCaptureError("source_unavailable")
         request_limit = max(1, int(limit)) + len(seen_ids)
-        messages = self.source.get_messages_for_shard(
+        reader = getattr(
+            self.source,
+            "get_cursor_messages_for_shard",
+            self.source.get_messages_for_shard,
+        )
+        messages = reader(
             username,
             source_shard_id,
             since_ts=max(0, int(cursor_timestamp)),
@@ -536,7 +542,16 @@ class SelectedResourceCapture:
     def _inserted(cursor):
         return max(0, int(cursor.rowcount or 0))
 
-    def _insert_occurrences(self, conn, chat, messages, now):
+    def _insert_occurrences(
+        self,
+        conn,
+        chat,
+        messages,
+        now,
+        *,
+        include_links=True,
+        include_files=True,
+    ):
         captured_links = 0
         captured_files = 0
         for message in messages:
@@ -549,7 +564,7 @@ class SelectedResourceCapture:
             month = _month(timestamp)
             text = str(message.get("text") or message.get("content") or "")
 
-            for index, url in enumerate(_exact_links(text)):
+            for index, url in enumerate(_exact_links(text) if include_links else ()):
                 cursor = conn.execute(
                     """
                     INSERT OR IGNORE INTO resource_occurrences(
@@ -568,7 +583,8 @@ class SelectedResourceCapture:
                 )
                 captured_links += self._inserted(cursor)
 
-            for fallback_index, resource in enumerate(message.get("resources") or []):
+            resources = (message.get("resources") or []) if include_files else ()
+            for fallback_index, resource in enumerate(resources):
                 if not isinstance(resource, dict) or str(resource.get("kind") or "") != "file":
                     continue
                 try:
@@ -710,10 +726,67 @@ class SelectedResourceCapture:
 
     def backfill(self, from_timestamp, *, apply=False):
         """Plan or explicitly apply historical occurrences without moving live cursors."""
+        return self._run_backfill(
+            from_timestamp,
+            apply=apply,
+            include_links=True,
+            include_files=True,
+            mode="links_and_files",
+        )
+
+    def backfill_links(self, from_timestamp, *, apply=False):
+        """Plan or apply exact historical links without touching attachment cache."""
+        return self._run_backfill(
+            from_timestamp,
+            apply=apply,
+            include_links=True,
+            include_files=False,
+            mode="links_only",
+        )
+
+    def _run_backfill(
+        self,
+        from_timestamp,
+        *,
+        apply,
+        include_links,
+        include_files,
+        mode,
+    ):
+        snapshot = getattr(self.source, "source_snapshot", None)
+        if snapshot is not None:
+            with snapshot():
+                return self._backfill(
+                    from_timestamp,
+                    apply=apply,
+                    include_links=include_links,
+                    include_files=include_files,
+                    mode=mode,
+                )
+        return self._backfill(
+            from_timestamp,
+            apply=apply,
+            include_links=include_links,
+            include_files=include_files,
+            mode=mode,
+        )
+
+    def _backfill(
+        self,
+        from_timestamp,
+        *,
+        apply=False,
+        include_links=True,
+        include_files=True,
+        mode="links_and_files",
+    ):
         chats = self.selected_chats()
         if not chats:
             return {
                 "state": "no_selected_chats",
+                "mode": mode,
+                "from_timestamp": max(0, int(from_timestamp)),
+                "source_complete": False,
                 "scanned": 0,
                 "discovered_links": 0,
                 "discovered_files": 0,
@@ -723,6 +796,9 @@ class SelectedResourceCapture:
         if self.source is None:
             return {
                 "state": "source_unavailable",
+                "mode": mode,
+                "from_timestamp": max(0, int(from_timestamp)),
+                "source_complete": False,
                 "scanned": 0,
                 "discovered_links": 0,
                 "discovered_files": 0,
@@ -734,6 +810,7 @@ class SelectedResourceCapture:
         max_messages = max(1, int(
             self.config.get("resource_backup_max_messages_per_scan", 500)
         ))
+        max_messages = max(max_messages, BACKFILL_PAGE_SIZE)
         scanned = 0
         discovered_links = 0
         discovered_files = 0
@@ -741,6 +818,7 @@ class SelectedResourceCapture:
         inserted_files = 0
         degraded_shards = 0
         source_error_code = ""
+        pending_batches = []
         for chat in chats:
             try:
                 source_shards = list(self.source.get_message_shards(chat["username"]))
@@ -771,36 +849,57 @@ class SelectedResourceCapture:
                     page_links = sum(
                         len(_exact_links(str(message.get("text") or message.get("content") or "")))
                         for message in page
-                    )
+                    ) if include_links else 0
                     page_files = sum(
                         1
                         for message in page
                         for resource in (message.get("resources") or [])
                         if isinstance(resource, dict)
                         and str(resource.get("kind") or "") == "file"
-                    )
+                    ) if include_files else 0
                     discovered_links += page_links
                     discovered_files += page_files
                     if apply and (page_links or page_files):
-                        conn = self._connect()
-                        try:
-                            conn.execute("BEGIN IMMEDIATE")
-                            links, files = self._insert_occurrences(
-                                conn, chat, page, self.now_func()
+                        relevant = []
+                        for message in page:
+                            has_links = include_links and bool(_exact_links(str(
+                                message.get("text") or message.get("content") or ""
+                            )))
+                            has_files = include_files and any(
+                                isinstance(resource, dict)
+                                and str(resource.get("kind") or "") == "file"
+                                for resource in (message.get("resources") or [])
                             )
-                            inserted_links += links
-                            inserted_files += files
-                            conn.commit()
-                        except Exception:
-                            conn.rollback()
-                            raise
-                        finally:
-                            conn.close()
+                            if has_links or has_files:
+                                relevant.append(message)
+                        if relevant:
+                            pending_batches.append((chat, relevant))
                     cursor_timestamp, seen_ids = self._cursor_after(
                         page, cursor_timestamp, seen_ids
                     )
                     if len(page) < max_messages:
                         break
+        if apply and not degraded_shards and pending_batches:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                for chat, messages in pending_batches:
+                    links, files = self._insert_occurrences(
+                        conn,
+                        chat,
+                        messages,
+                        self.now_func(),
+                        include_links=include_links,
+                        include_files=include_files,
+                    )
+                    inserted_links += links
+                    inserted_files += files
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
         return {
             "state": (
                 "source_degraded"
@@ -814,6 +913,9 @@ class SelectedResourceCapture:
             "inserted_files": inserted_files,
             "degraded_shards": degraded_shards,
             "error_code": source_error_code,
+            "mode": mode,
+            "from_timestamp": max(0, int(from_timestamp)),
+            "source_complete": degraded_shards == 0,
         }
 
     def _retry_delay(self, attempt_count):
@@ -1001,9 +1103,19 @@ class SelectedResourceCapture:
             "error_code": self._meta_get("source_error_code", ""),
         }
 
-    def run(self, resolve_limit=50):
+    def run(self, resolve_limit=50, *, resolve_files=True):
         scan = self.scan()
-        resolve = self.resolve_pending_files(limit=resolve_limit)
+        resolve = (
+            self.resolve_pending_files(limit=resolve_limit)
+            if resolve_files
+            else {
+                "state": "skipped",
+                "reason": "file_resolution_disabled",
+                "processed": 0,
+                "ready_local": 0,
+                "failed": 0,
+            }
+        )
         scan_state = str(scan.get("state") or "")
         resolve_state = str(resolve.get("state") or "")
         if scan_state in {"no_selected_chats", "source_unavailable"}:

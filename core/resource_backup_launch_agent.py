@@ -1,19 +1,18 @@
-"""Install a short-lived LaunchAgent for mounted selected-chat resource backup."""
+"""Remove/inspect the retired short-lived mounted-resource LaunchAgent.
+
+macOS App Data consent is process-lifetime access.  A worker that exits after
+every interval therefore re-prompts on the next wake.  New installs run mounted
+resource work inside the long-lived menu-bar app; this module remains only so
+older installations can be detected and removed cleanly.
+"""
 from __future__ import annotations
 
 import os
 import plistlib
 import subprocess
-import sys
-import tempfile
 from pathlib import Path
 
-from .background_jobs import (
-    RESOURCE_BACKUP_MODE,
-    background_program_arguments,
-    runtime_identity,
-)
-from .config import DATA_DIR
+from .background_jobs import runtime_identity
 
 
 RESOURCE_BACKUP_LAUNCH_AGENT_LABEL = (
@@ -52,82 +51,15 @@ def _run(*args: str) -> subprocess.CompletedProcess:
         )
 
 
-def _atomic_plist(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_path = tempfile.mkstemp(prefix=".partial-", dir=path.parent)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "wb") as handle:
-            fd = -1
-            plistlib.dump(payload, handle, sort_keys=True)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, path)
-        temp_path = ""
-        os.chmod(path, 0o600)
-    finally:
-        if fd >= 0:
-            os.close(fd)
-        if temp_path:
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
-
-
 def install(project_dir: str | os.PathLike[str], interval_seconds: int = 300) -> dict:
-    project = Path(project_dir).resolve()
-    script = project / "scripts" / "resource_backup.py"
-    if not script.is_file():
-        return {"state": "script_missing", "installed": False, "loaded": False}
-    interval = max(60, int(interval_seconds))
-    logs = Path(DATA_DIR) / "logs"
-    logs.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(logs, 0o700)
-    except OSError:
-        pass
-    path = plist_path()
-    environment = {"PYTHONUNBUFFERED": "1"}
-    if os.environ.get("WE_GROUPCHAT_OBSIDIAN_DATA_DIR"):
-        environment["WE_GROUPCHAT_OBSIDIAN_DATA_DIR"] = os.environ[
-            "WE_GROUPCHAT_OBSIDIAN_DATA_DIR"
-        ]
-    program_arguments, runtime_identity = background_program_arguments(
-        project,
-        RESOURCE_BACKUP_MODE,
-        [sys.executable, str(script), "run"],
-    )
-    payload = {
-        "Label": RESOURCE_BACKUP_LAUNCH_AGENT_LABEL,
-        "ProgramArguments": program_arguments,
-        "WorkingDirectory": str(project),
-        "RunAtLoad": True,
-        "StartInterval": interval,
-        "ProcessType": "Background",
-        "LowPriorityIO": True,
-        "ThrottleInterval": 30,
-        "StandardOutPath": str(logs / "resource-backup.out.log"),
-        "StandardErrorPath": str(logs / "resource-backup.err.log"),
-        "EnvironmentVariables": environment,
-    }
-    _run("launchctl", "bootout", _domain(), str(path))
-    _atomic_plist(path, payload)
-    loaded = _run("launchctl", "bootstrap", _domain(), str(path))
-    if loaded.returncode != 0:
-        return {
-            "state": "install_failed",
-            "installed": path.is_file(),
-            "loaded": False,
-            "runtime_identity": runtime_identity,
-            "error": (loaded.stderr or loaded.stdout).strip()[:240],
-        }
+    del project_dir, interval_seconds
+    existing = status()
     return {
-        "state": "installed",
-        "installed": True,
-        "loaded": True,
-        "interval_seconds": interval,
-        "runtime_identity": runtime_identity,
+        "state": "long_lived_app_required",
+        "installed": existing["installed"],
+        "loaded": existing["loaded"],
+        "runtime_identity": existing["runtime_identity"],
+        "reason": "app_data_permission_is_process_lifetime",
     }
 
 

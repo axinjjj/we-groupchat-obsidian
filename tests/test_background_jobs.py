@@ -1,4 +1,7 @@
+import io
+import json
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 from core.background_jobs import dispatch_background_job, runtime_identity
@@ -15,19 +18,35 @@ class BackgroundJobDispatchTests(unittest.TestCase):
     def test_non_background_invocation_leaves_menu_app_startup_alone(self):
         self.assertIsNone(dispatch_background_job(["--autostart"]))
 
-    def test_resource_backup_mode_runs_one_shot_without_menu_app(self):
-        with patch("scripts.resource_backup.main", return_value=7) as main:
+    def test_retired_resource_backup_mode_does_not_touch_app_data(self):
+        output = io.StringIO()
+        with (
+            patch("scripts.resource_backup.main") as main,
+            redirect_stdout(output),
+        ):
             result = dispatch_background_job(["--resource-backup-run"])
 
-        self.assertEqual(result, 7)
-        main.assert_called_once_with(["run"])
+        self.assertEqual(result, 2)
+        main.assert_not_called()
+        self.assertEqual(
+            json.loads(output.getvalue())["state"],
+            "long_lived_app_required",
+        )
 
-    def test_source_guard_mode_runs_one_shot_without_menu_app(self):
-        with patch("scripts.wechat_source_guard_agent.main", return_value=3) as main:
+    def test_retired_source_guard_mode_does_not_touch_app_data(self):
+        output = io.StringIO()
+        with (
+            patch("core.wechat_source_guard.WeChatSourceGuard") as guard,
+            redirect_stdout(output),
+        ):
             result = dispatch_background_job(["--source-guard-run"])
 
-        self.assertEqual(result, 3)
-        main.assert_called_once_with()
+        self.assertEqual(result, 2)
+        guard.assert_not_called()
+        self.assertEqual(
+            json.loads(output.getvalue())["state"],
+            "long_lived_app_required",
+        )
 
 
 if __name__ == "__main__":

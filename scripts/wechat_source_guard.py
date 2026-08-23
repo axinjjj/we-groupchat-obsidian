@@ -9,18 +9,13 @@ from pathlib import Path
 import plistlib
 import subprocess
 import sys
-import tempfile
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from core.config import DATA_DIR, load_config, save_config
-from core.background_jobs import (
-    SOURCE_GUARD_MODE,
-    background_program_arguments,
-    runtime_identity,
-)
+from core.config import load_config, save_config
+from core.background_jobs import runtime_identity
 from core.launch_agent import launch_agent_status
 from core.project_identity import SOURCE_GUARD_LAUNCH_AGENT_LABEL
 from core.wechat_source_guard import (
@@ -36,75 +31,21 @@ def agent_plist_path(home: str | os.PathLike[str] | None = None) -> Path:
     return root / "Library" / "LaunchAgents" / f"{SOURCE_GUARD_LAUNCH_AGENT_LABEL}.plist"
 
 
-def build_agent_plist(config: dict, project_dir: Path = PROJECT_DIR) -> dict:
-    interval = int(config.get("wechat_source_guard_interval_seconds", 300) or 300)
-    python = project_dir / ".venv" / "bin" / "python"
-    entrypoint = project_dir / "scripts" / "wechat_source_guard_agent.py"
-    program_arguments, _runtime_identity = background_program_arguments(
-        project_dir,
-        SOURCE_GUARD_MODE,
-        [str(python), str(entrypoint)],
-    )
-    payload = {
-        "Label": SOURCE_GUARD_LAUNCH_AGENT_LABEL,
-        "ProgramArguments": program_arguments,
-        "WorkingDirectory": str(project_dir),
-        "RunAtLoad": True,
-        "StartInterval": interval,
-        "ProcessType": "Background",
-        "StandardOutPath": str(Path(DATA_DIR) / "logs" / "source-guard.out.log"),
-        "StandardErrorPath": str(Path(DATA_DIR) / "logs" / "source-guard.err.log"),
-    }
-    data_dir_override = os.environ.get("WE_GROUPCHAT_OBSIDIAN_DATA_DIR")
-    if data_dir_override:
-        payload["EnvironmentVariables"] = {
-            "WE_GROUPCHAT_OBSIDIAN_DATA_DIR": data_dir_override,
-        }
-    return payload
-
-
-def _write_plist(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    temp = Path(temp_name)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            plistlib.dump(payload, handle)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp, path)
-        path.chmod(0o644)
-    finally:
-        try:
-            temp.unlink()
-        except FileNotFoundError:
-            pass
-
-
 def _run(argv: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(argv, capture_output=True, text=True)
 
 
 def install_agent(config: dict, *, load_now: bool = False, path: Path | None = None, runner=_run) -> int:
+    del config, load_now, runner
     path = path or agent_plist_path()
-    plist = build_agent_plist(config)
-    python = Path(plist["ProgramArguments"][0])
-    if not python.is_file():
-        raise SystemExit(f"项目 venv Python 不存在: {python}")
-    (Path(DATA_DIR) / "logs").mkdir(parents=True, exist_ok=True)
-    _write_plist(path, plist)
-    print(f"Source guard LaunchAgent plist installed: {path}")
-    if load_now:
-        domain = f"gui/{os.getuid()}"
-        runner(["launchctl", "bootout", domain, str(path)])
-        result = runner(["launchctl", "bootstrap", domain, str(path)])
-        if result.returncode != 0:
-            raise SystemExit(result.stderr.strip() or "launchctl bootstrap failed")
-        runner(["launchctl", "enable", f"{domain}/{SOURCE_GUARD_LAUNCH_AGENT_LABEL}"])
-        print("Source guard LaunchAgent loaded.")
-    else:
-        print("Not loaded. Re-run with --load-now to activate the schedule.")
-    return 0
+    print(
+        "Source guard LaunchAgent installation is retired: macOS App Data "
+        "consent is tied to the running process. Enable the policy and keep "
+        "the menu-bar app running instead."
+    )
+    if path.exists():
+        print(f"Legacy plist still exists; remove it with uninstall-agent: {path}")
+    return 2
 
 
 def uninstall_agent(*, path: Path | None = None, runner=_run) -> int:
@@ -150,6 +91,7 @@ def print_status(config: dict) -> int:
     print(f"  restart budget remaining: {report['restart_budget_remaining']}")
     print(f"  backoff until: {report.get('backoff_until') or '-'}")
     print(f"  source freshness: {report.get('source_freshness') or 'unknown'}")
+    print("  runtime: long_lived_app")
     print(f"  agent installed: {plist.exists()}")
     print(f"  agent loaded: {agent.loaded}")
     print(f"  agent runtime identity: {agent_identity}")
@@ -177,11 +119,11 @@ def main(argv: list[str] | None = None) -> int:
         return print_status(load_config())
     if args.command == "enable":
         _set_config("wechat_source_guard_enabled", True)
-        print("Source guard enabled. This does not install or load the LaunchAgent.")
+        print("Source guard enabled for the long-lived menu-bar app.")
         return 0
     if args.command == "disable":
         _set_config("wechat_source_guard_enabled", False)
-        print("Source guard disabled. The LaunchAgent installation state is unchanged.")
+        print("Source guard disabled. Remove any legacy LaunchAgent separately.")
         return 0
     if args.command == "pause":
         if args.indefinite:

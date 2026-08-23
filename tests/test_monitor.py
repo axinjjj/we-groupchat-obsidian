@@ -1370,6 +1370,32 @@ class WeChatMessageCleanTests(unittest.TestCase):
 
         self.assertIn("https://example.com/codex?x=1&y=2", cleaned)
 
+    def test_appmsg_link_without_title_keeps_exact_url(self):
+        raw = (
+            "<msg><appmsg><type>5</type><title></title>"
+            "<url><![CDATA[https://example.com/titleless?x=1&y=2]]></url>"
+            "</appmsg></msg>"
+        )
+
+        cleaned = _clean_msg_text(raw)
+
+        self.assertEqual(
+            cleaned,
+            "[链接] https://example.com/titleless?x=1&y=2",
+        )
+
+    def test_forwarded_record_shell_is_not_presented_as_a_resource_link(self):
+        raw = (
+            "<msg><appmsg><type>19</type><title>聊天记录</title>"
+            "<url>https://support.weixin.qq.com/cgi-bin/mmsupport-bin/readtemplate"
+            "?t=page/favorite_record__w_unsupport</url></appmsg></msg>"
+        )
+
+        cleaned = _clean_msg_text(raw)
+
+        self.assertEqual(cleaned, "[聊天记录] 聊天记录")
+        self.assertNotIn("https://", cleaned)
+
     def test_forwarded_chat_record_extracts_embedded_items(self):
         raw = """<msg><appmsg>
 <title>群聊的聊天记录</title>

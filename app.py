@@ -95,6 +95,7 @@ from core.key_extractor import (
     check_new_databases,
 )
 from core.wechat_db import WeChatDB
+from core.wechat_source_guard import WeChatSourceGuard
 from core.bookmark import get_bookmark, set_bookmark, get_summary_time, clear_all_bookmarks
 from core.chat_groups import (
     load_groups, save_groups, create_group, delete_group,
@@ -109,6 +110,11 @@ from core.knowledge import (
     safe_obsidian_subdir,
 )
 from core.attachment_archive import process_pending_from_config
+from core.resource_backup import MountedResourceBackup
+from core.resource_capture import (
+    SelectedResourceCapture,
+    resource_backup_chat_candidates,
+)
 from core.google_drive_auth import GoogleDriveAuthError, GoogleDriveOAuth
 from core.google_drive_client import GoogleDriveClient
 from core.google_drive_file_sync import GoogleDriveFileSync
@@ -295,6 +301,10 @@ class WeGroupchatObsidianApp(rumps.App):
         self._daily_digest_lock = threading.Lock()
         self._drive_sync_timer = None
         self._drive_sync_lock = threading.Lock()
+        self._resource_backup_timer = None
+        self._resource_backup_lock = threading.Lock()
+        self._source_guard_timer = None
+        self._source_guard_lock = threading.Lock()
 
         # Build menu
         self.menu = [
@@ -310,6 +320,7 @@ class WeGroupchatObsidianApp(rumps.App):
             rumps.separator,
             self._build_mcp_menu(),
             self._build_monitor_menu(),
+            self._build_resource_backup_menu(),
             self._build_drive_sync_menu(),
             self._build_settings_menu(),
             rumps.MenuItem("🔄 刷新数据源", callback=self.reextract_keys),
@@ -330,7 +341,9 @@ class WeGroupchatObsidianApp(rumps.App):
 
         self._configure_monitor_timer()
         self._configure_daily_digest_timer()
+        self._configure_resource_backup_timer()
         self._configure_drive_sync_timer()
+        self._configure_source_guard_timer()
 
         # Background initialization
         threading.Thread(target=self._init_background, daemon=True).start()
@@ -454,6 +467,450 @@ class WeGroupchatObsidianApp(rumps.App):
             del self.menu["🔔 关注推送"]
         self.menu.insert_after("🔌 MCP 服务", self._build_monitor_menu())
 
+    # ── Mounted selected-resource backup ─────────────────────
+
+    def _configure_source_guard_timer(self):
+        if self._source_guard_timer:
+            try:
+                self._source_guard_timer.stop()
+            except Exception:
+                pass
+            self._source_guard_timer = None
+        interval = max(
+            60,
+            int(self.config.get("wechat_source_guard_interval_seconds", 300)),
+        )
+        self._source_guard_timer = rumps.Timer(
+            self._on_source_guard_timer,
+            interval,
+        )
+        self._source_guard_timer.start()
+        print(f"[source-guard] long-lived timer started: every {interval} seconds")
+
+    def _on_source_guard_timer(self, _):
+        self._start_source_guard_consumer()
+
+    def _start_source_guard_consumer(self):
+        threading.Thread(
+            target=self._run_source_guard_consumer,
+            daemon=True,
+        ).start()
+
+    def _run_source_guard_consumer(self):
+        if not self._source_guard_lock.acquire(blocking=False):
+            return
+        try:
+            result = WeChatSourceGuard(load_config()).check()
+            print(
+                "[source-guard] "
+                f"state={result.get('state')} result={result.get('last_result')}"
+            )
+        except Exception as exc:
+            print(f"[source-guard] check failed: {type(exc).__name__}")
+        finally:
+            self._source_guard_lock.release()
+
+    def _resource_capture_service(self, *, source=False, config=None):
+        config = dict(config or self.config)
+        return SelectedResourceCapture.from_config(
+            config,
+            source=self.db if source else None,
+        )
+
+    def _build_resource_backup_menu(self):
+        menu = rumps.MenuItem("🔗 资源索引与本地备份")
+        try:
+            status = self._resource_capture_service().status()
+            counts = status.get("counts") or {}
+            links = sum(
+                int(count or 0)
+                for key, count in counts.items()
+                if str(key).startswith("link:")
+            )
+            files = sum(
+                int(count or 0)
+                for key, count in counts.items()
+                if str(key).startswith("file:")
+            )
+            pending = int(status.get("pending_files") or 0)
+            selected = int(status.get("selected_chats") or 0)
+        except Exception:
+            links = files = pending = selected = 0
+        enabled = bool(self.config.get("resource_backup_enabled", False))
+        resolve_files = bool(
+            self.config.get("resource_backup_file_resolution_enabled", False)
+        )
+        menu.add(rumps.MenuItem(
+            f"状态: {'后台更新已开启' if enabled else '后台更新已关闭'}"
+        ))
+        menu.add(rumps.MenuItem(
+            f"群聊: {selected} · 链接: {links} · 文件: {files} · 待解析: {pending}"
+        ))
+        menu.add(rumps.separator)
+        menu.add(rumps.MenuItem(
+            "⏹ 关闭后台更新" if enabled else "▶️ 开启后台更新",
+            callback=self._toggle_resource_backup,
+        ))
+        menu.add(rumps.MenuItem(
+            "✅ 自动解析微信附件（本次 app 会话）"
+            if resolve_files
+            else "⬜ 自动解析微信附件（需显式授权）",
+            callback=self._toggle_resource_file_resolution,
+        ))
+        menu.add(rumps.MenuItem(
+            "🔄 立即更新资源索引",
+            callback=self._run_resource_backup_now,
+        ))
+        menu.add(rumps.MenuItem(
+            "📚 补历史链接...",
+            callback=self._request_link_backfill,
+        ))
+        menu.add(rumps.MenuItem(
+            "🎯 选择群聊...",
+            callback=self._select_resource_backup_chats,
+        ))
+        return menu
+
+    def _rebuild_resource_backup_menu(self):
+        if "🔗 资源索引与本地备份" in self.menu:
+            del self.menu["🔗 资源索引与本地备份"]
+        anchor = "🔔 关注推送" if "🔔 关注推送" in self.menu else "🔌 MCP 服务"
+        self.menu.insert_after(anchor, self._build_resource_backup_menu())
+
+    def _configure_resource_backup_timer(self):
+        if self._resource_backup_timer:
+            try:
+                self._resource_backup_timer.stop()
+            except Exception:
+                pass
+            self._resource_backup_timer = None
+        if not self.config.get("resource_backup_enabled", False):
+            return
+        interval = max(
+            60,
+            int(self.config.get("resource_backup_interval_seconds", 300)),
+        )
+        self._resource_backup_timer = rumps.Timer(
+            self._on_resource_backup_timer,
+            interval,
+        )
+        self._resource_backup_timer.start()
+        print(f"[resource-backup] long-lived timer started: every {interval} seconds")
+
+    def _on_resource_backup_timer(self, _):
+        if self.db:
+            self._start_resource_backup_consumer(manual=False)
+
+    def _toggle_resource_backup(self, _):
+        enabled = not bool(self.config.get("resource_backup_enabled", False))
+        self.config["resource_backup_enabled"] = enabled
+        save_config(self.config)
+        if enabled:
+            self._resource_capture_service().initialize_selected_chat_cursors()
+        self._configure_resource_backup_timer()
+        self._rebuild_resource_backup_menu()
+        _notify(
+            "资源索引与本地备份",
+            "后台更新已开启" if enabled else "后台更新已关闭",
+            (
+                "在长驻菜单栏进程内更新；文件解析仍由独立开关控制。"
+                if enabled
+                else "不会再开始新的扫描；ledger、CAS 与已生成索引全部保留。"
+            ),
+        )
+
+    def _toggle_resource_file_resolution(self, _):
+        self._delayed_run(self._show_resource_file_resolution_dialog)
+
+    def _show_resource_file_resolution_dialog(self):
+        enabled = not bool(
+            self.config.get("resource_backup_file_resolution_enabled", False)
+        )
+        if enabled:
+            self._bring_to_front()
+            try:
+                confirmed = self._confirm_dialog(
+                    "允许本次 app 会话解析微信附件？",
+                    "macOS 可能显示一次“访问其他 App 数据”提示。授权仅用于显式选中群聊的微信附件 cache；补链接不需要此权限。关闭本开关会立即停止新的文件解析。",
+                    ok="开启",
+                )
+            finally:
+                self._release_front()
+            if not confirmed:
+                return
+        self.config["resource_backup_file_resolution_enabled"] = enabled
+        save_config(self.config)
+        self._rebuild_resource_backup_menu()
+        if enabled and self.db:
+            self._start_resource_backup_consumer(manual=True)
+        else:
+            _notify(
+                "资源索引与本地备份",
+                "自动文件解析已关闭",
+                "链接与 metadata 索引仍会更新；不会再读取微信附件 bytes。",
+            )
+
+    def _run_resource_backup_now(self, _):
+        if not self.db:
+            _notify("资源索引与本地备份", "数据源未就绪", "请稍后再试。")
+            return
+        self._start_resource_backup_consumer(manual=True)
+
+    def _start_resource_backup_consumer(self, *, manual):
+        threading.Thread(
+            target=self._run_resource_backup_consumer,
+            kwargs={"manual": manual},
+            daemon=True,
+        ).start()
+
+    def _run_resource_backup_consumer(self, *, manual):
+        if not self._resource_backup_lock.acquire(blocking=False):
+            if manual:
+                _notify("资源索引与本地备份", "正在运行", "当前更新尚未结束。")
+            return
+        try:
+            config = load_config()
+            capture = self._resource_capture_service(source=True, config=config)
+            capture_result = capture.run(
+                resolve_limit=50,
+                resolve_files=bool(
+                    config.get("resource_backup_file_resolution_enabled", False)
+                ),
+            )
+            backup_result = MountedResourceBackup.from_config(
+                config,
+                capture=capture,
+            ).run()
+            result = {"capture": capture_result, "backup": backup_result}
+            print(
+                "[resource-backup] "
+                f"capture={capture_result.get('state')} "
+                f"backup={backup_result.get('state')} "
+                f"resolve={capture_result.get('resolve', {}).get('state')}"
+            )
+        except Exception as exc:
+            print(f"[resource-backup] worker failed: {type(exc).__name__}")
+            result = {
+                "capture": {"state": "failed"},
+                "backup": {"state": "failed", "error_code": type(exc).__name__},
+            }
+        finally:
+            self._resource_backup_lock.release()
+        self._run_on_main(self._finish_resource_backup_run, result, manual)
+
+    def _finish_resource_backup_run(self, result, manual):
+        self.config = load_config()
+        self._rebuild_resource_backup_menu()
+        if not manual:
+            return
+        capture = result.get("capture") or {}
+        backup = result.get("backup") or {}
+        scan = capture.get("scan") or {}
+        resolve = capture.get("resolve") or {}
+        _notify(
+            "资源索引与本地备份",
+            "更新完成" if capture.get("state") not in {"failed", "source_degraded"} else "本轮未完成",
+            f"新增链接 {int(scan.get('captured_links') or 0)} · "
+            f"新增文件 {int(scan.get('captured_files') or 0)} · "
+            f"本地文件 {int(resolve.get('ready_local') or 0)} · "
+            f"handoff={backup.get('state') or 'unknown'}",
+        )
+
+    def _request_link_backfill(self, _):
+        self._delayed_run(self._show_link_backfill_dialog)
+
+    def _show_link_backfill_dialog(self):
+        self._bring_to_front()
+        try:
+            clicked, value = self._input_dialog(
+                "补历史链接",
+                "输入起始日期 YYYY-MM-DD，或输入 all 扫描本地仍可读的全部历史。先生成 plan，确认后才写入；不会读取附件 bytes。",
+                default_text=datetime.now().strftime("%Y-%m-01"),
+                ok="生成计划",
+                width=420,
+            )
+        finally:
+            self._release_front()
+        if not clicked:
+            return
+        value = value.strip().lower()
+        if value == "all":
+            from_timestamp = 0
+            scope = "all"
+        else:
+            try:
+                from_timestamp = int(datetime.strptime(value, "%Y-%m-%d").timestamp())
+            except ValueError:
+                _notify("资源索引与本地备份", "日期格式错误", "请输入 YYYY-MM-DD 或 all。")
+                return
+            scope = value
+        self._begin_task("补历史链接计划")
+        threading.Thread(
+            target=self._plan_link_backfill,
+            args=(from_timestamp, scope),
+            daemon=True,
+        ).start()
+
+    def _plan_link_backfill(self, from_timestamp, scope):
+        if not self._resource_backup_lock.acquire(blocking=False):
+            self._run_on_main(
+                self._confirm_link_backfill_plan,
+                from_timestamp,
+                scope,
+                {"state": "busy", "source_complete": False},
+            )
+            return
+        try:
+            if not self.db:
+                result = {"state": "source_unavailable", "source_complete": False}
+            else:
+                result = self._resource_capture_service(
+                    source=True,
+                    config=load_config(),
+                ).backfill_links(from_timestamp, apply=False)
+        except Exception as exc:
+            result = {
+                "state": "failed",
+                "source_complete": False,
+                "error_code": type(exc).__name__,
+            }
+        finally:
+            self._resource_backup_lock.release()
+        self._run_on_main(
+            self._confirm_link_backfill_plan,
+            from_timestamp,
+            scope,
+            result,
+        )
+
+    def _confirm_link_backfill_plan(self, from_timestamp, scope, result):
+        self._finish_task()
+        if not result.get("source_complete"):
+            _notify(
+                "资源索引与本地备份",
+                "历史链接计划未完成",
+                f"state={result.get('state') or 'failed'} · error={result.get('error_code') or 'none'}；没有写入。",
+            )
+            return
+        self._bring_to_front()
+        try:
+            confirmed = self._confirm_dialog(
+                "确认补历史链接？",
+                f"范围: {scope}\n已完整扫描 {int(result.get('scanned') or 0)} 条 source rows\n发现 {int(result.get('discovered_links') or 0)} 个 exact link occurrences\n\n确认后写入本地 ledger 并重建 Obsidian/挂载目录索引；不会读取附件 bytes。",
+                ok="写入",
+            )
+        finally:
+            self._release_front()
+        if not confirmed:
+            return
+        self._begin_task("补历史链接")
+        threading.Thread(
+            target=self._apply_link_backfill,
+            args=(from_timestamp,),
+            daemon=True,
+        ).start()
+
+    def _apply_link_backfill(self, from_timestamp):
+        if not self._resource_backup_lock.acquire(blocking=False):
+            self._run_on_main(
+                self._finish_link_backfill,
+                {"state": "busy", "source_complete": False},
+                {"state": "not_run"},
+            )
+            return
+        try:
+            config = load_config()
+            capture = self._resource_capture_service(source=True, config=config)
+            result = capture.backfill_links(from_timestamp, apply=True)
+            if result.get("source_complete"):
+                projection = MountedResourceBackup.from_config(
+                    config,
+                    capture=capture,
+                ).run()
+            else:
+                projection = {"state": "not_run"}
+        except Exception as exc:
+            result = {
+                "state": "failed",
+                "source_complete": False,
+                "error_code": type(exc).__name__,
+            }
+            projection = {"state": "not_run"}
+        finally:
+            self._resource_backup_lock.release()
+        self._run_on_main(self._finish_link_backfill, result, projection)
+
+    def _finish_link_backfill(self, result, projection):
+        self._finish_task()
+        self.config = load_config()
+        self._rebuild_resource_backup_menu()
+        if result.get("source_complete"):
+            _notify(
+                "资源索引与本地备份",
+                "历史链接已补齐",
+                f"发现 {int(result.get('discovered_links') or 0)} · "
+                f"新增 {int(result.get('inserted_links') or 0)} · "
+                f"projection={projection.get('state') or 'unknown'}",
+            )
+        else:
+            _notify(
+                "资源索引与本地备份",
+                "历史链接未写完",
+                f"state={result.get('state') or 'failed'} · error={result.get('error_code') or 'none'}",
+            )
+
+    def _select_resource_backup_chats(self, _):
+        self._delayed_run(self._show_resource_backup_chat_dialog)
+
+    def _show_resource_backup_chat_dialog(self):
+        choices = resource_backup_chat_candidates(self.config)
+        if not choices:
+            _notify("资源索引与本地备份", "没有候选群聊", "请先在关注推送中选择群聊。")
+            return
+        selected = {
+            chat.get("username"): chat
+            for chat in self.config.get("resource_backup_selected_chats") or []
+        }
+        lines = [f"{index}. {chat['alias']}" for index, chat in enumerate(choices, 1)]
+        self._bring_to_front()
+        try:
+            clicked, text = self._input_dialog(
+                "选择资源备份群聊",
+                "只有同时处于关注推送且在这里显式选中的群才会进入索引/备份。多个编号用逗号分隔。\n\n"
+                + "\n".join(lines),
+                default_text=",".join(
+                    str(index)
+                    for index, chat in enumerate(choices, 1)
+                    if chat["username"] in selected
+                ),
+                ok="保存",
+                width=520,
+            )
+        finally:
+            self._release_front()
+        if not clicked:
+            return
+        try:
+            indexes = self._parse_monitor_chat_selection(text, len(choices)) if text.strip() else []
+        except ValueError:
+            _notify("资源索引与本地备份", "输入错误", "请输入列表里的数字编号。")
+            return
+        now = int(time.time())
+        self.config["resource_backup_selected_chats"] = [
+            {
+                **choices[index - 1],
+                "selected_since": int(
+                    (selected.get(choices[index - 1]["username"]) or {}).get("selected_since")
+                    or now
+                ),
+            }
+            for index in indexes
+        ]
+        save_config(self.config)
+        self._resource_capture_service().initialize_selected_chat_cursors()
+        self._rebuild_resource_backup_menu()
+        _notify("资源索引与本地备份", "群聊选择已保存", f"当前选择 {len(indexes)} 个群。")
+
     # ── Selected-chat Google Drive file sync ─────────────────
 
     def _drive_sync_service(self, *, remote=False, config=None):
@@ -533,7 +990,13 @@ class WeGroupchatObsidianApp(rumps.App):
     def _rebuild_drive_sync_menu(self):
         if "☁️ Google Drive 群文件备份" in self.menu:
             del self.menu["☁️ Google Drive 群文件备份"]
-        anchor = "🔔 关注推送" if "🔔 关注推送" in self.menu else "🔌 MCP 服务"
+        anchor = (
+            "🔗 资源索引与本地备份"
+            if "🔗 资源索引与本地备份" in self.menu
+            else "🔔 关注推送"
+            if "🔔 关注推送" in self.menu
+            else "🔌 MCP 服务"
+        )
         self.menu.insert_after(anchor, self._build_drive_sync_menu())
 
     def _configure_drive_sync_timer(self):
@@ -2100,6 +2563,9 @@ class WeGroupchatObsidianApp(rumps.App):
         self.db = WeChatDB(self.config["db_dir"], keys)
         if self.config.get("attachment_archive_enabled", False):
             self._start_attachment_archive_consumer()
+        if self.config.get("resource_backup_enabled", False):
+            self._start_resource_backup_consumer(manual=False)
+        self._start_source_guard_consumer()
         if (
             self.config.get("google_drive_file_sync_enabled", False)
             and not self.config.get("google_drive_file_sync_paused", False)

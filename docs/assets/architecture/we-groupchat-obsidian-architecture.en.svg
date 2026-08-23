@@ -191,18 +191,18 @@
   <text x="960" y="1864" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="11.5" font-weight="550" font-style="italic" letter-spacing="0" fill="#475569" opacity="1.0">Logical responsibility boundaries inside one local application; boxes do not represent independently deployed microservices. &#xB7; &#x903B;&#x8F91;&#x8D23;&#x4EFB;&#x8FB9;&#x754C;&#x4F4D;&#x4E8E;&#x4E00;&#x4E2A;&#x672C;&#x5730;&#x5E94;&#x7528;&#x5185;&#xFF1B;&#x56FE;&#x4E2D;&#x65B9;&#x6846;&#x4E0D;&#x4EE3;&#x8868;&#x72EC;&#x7ACB;&#x90E8;&#x7F72;&#x7684;&#x5FAE;&#x670D;&#x52A1;&#x3002;</text>
   <rect x="100" y="1210" width="1460" height="270" rx="22" fill="#F0FDFA" stroke="#0F766E" stroke-width="2.2"/>
   <text x="124" y="1245" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="18" font-weight="780" fill="#0F172A">Source reliability plane &#xB7; &#x6765;&#x6E90;&#x53EF;&#x9760;&#x6027;&#x5E73;&#x9762;</text>
-  <text x="1525" y="1244" text-anchor="end" font-family="Noto Sans CJK SC, sans-serif" font-size="10.5" font-weight="520" fill="#475569">Control and data stay separate: source guard is not TopicMonitor; attachment copying starts only after Knowledge commit.</text>
+  <text x="1525" y="1244" text-anchor="end" font-family="Noto Sans CJK SC, sans-serif" font-size="10.5" font-weight="520" fill="#475569">Protected WeChat access stays in one long-lived app process; source guard is still separate from TopicMonitor.</text>
   <polyline points="350,1340 400,1340" fill="none" stroke="#0F766E" stroke-width="2.4" stroke-dasharray="7 5" marker-end="url(#arrowTeal)"/>
   <polyline points="630,1340 680,1340" fill="none" stroke="#2563EB" stroke-width="2.4" marker-end="url(#arrowBlue)"/>
   <polyline points="910,1340 960,1340" fill="none" stroke="#2563EB" stroke-width="2.4" marker-end="url(#arrowBlue)"/>
   <polyline points="1210,1340 1260,1340" fill="none" stroke="#EA580C" stroke-width="2.4" marker-end="url(#arrowOrange)"/>
   <polyline points="1530,1340 1690,1340" fill="none" stroke="#7C3AED" stroke-width="2.4" stroke-dasharray="7 5" marker-end="url(#arrowPurple)"/>
   <rect x="120" y="1280" width="230" height="125" rx="17" fill="#ECFDF5" stroke="#0F766E" stroke-width="2"/>
-  <text x="134" y="1310" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="13.2" font-weight="750" fill="#0F172A">Optional Source Guard</text>
+  <text x="134" y="1310" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="13.2" font-weight="750" fill="#0F172A">Long-lived Source Guard</text>
   <text x="134" y="1338" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="10.2" font-weight="500" fill="#475569">
-    <tspan x="134" dy="0">one-shot StartInterval</tspan>
+    <tspan x="134" dy="0">menu app timer</tspan>
     <tspan x="134" dy="14.075999999999999">grace &#xB7; budget &#xB7; backoff</tspan>
-    <tspan x="134" dy="14.075999999999999">normal background launch only</tspan>
+    <tspan x="134" dy="14.075999999999999">single App Data process</tspan>
   </text>
   <rect x="400" y="1280" width="230" height="125" rx="17" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
   <text x="414" y="1310" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="13.2" font-weight="750" fill="#0F172A">WeChat process &amp; local cache</text>
@@ -256,8 +256,8 @@
   <text x="134" y="1610" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="13.2" font-weight="750" fill="#0F172A">Selected-resource scanner</text>
   <text x="134" y="1638" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="10.2" font-weight="500" fill="#475569">
     <tspan x="134" dy="0">active monitor &#x2229; explicit selection</tspan>
-    <tspan x="134" dy="14.1">per-chat &#xD7; shard cursor + IDs</tspan>
-    <tspan x="134" dy="14.1">exact links + file occurrences</tspan>
+    <tspan x="134" dy="14.1">shard-complete exact-link scan</tspan>
+    <tspan x="134" dy="14.1">atomic links-only backfill</tspan>
   </text>
   <rect x="410" y="1580" width="240" height="125" rx="17" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
   <text x="424" y="1610" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="13.2" font-weight="750" fill="#0F172A">Resource occurrence ledger</text>
@@ -274,11 +274,11 @@
     <tspan x="714" dy="14.1">no KnowledgeStore gate</tspan>
   </text>
   <rect x="1000" y="1580" width="250" height="125" rx="17" fill="#FFF7ED" stroke="#EA580C" stroke-width="2"/>
-  <text x="1014" y="1610" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="13.2" font-weight="750" fill="#0F172A">One-shot mounted worker</text>
+  <text x="1014" y="1610" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="13.2" font-weight="750" fill="#0F172A">Long-lived mounted worker</text>
   <text x="1014" y="1638" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="10.2" font-weight="500" fill="#475569">
-    <tspan x="1014" dy="0">CLI &#xB7; short-lived LaunchAgent</tspan>
-    <tspan x="1014" dy="14.1">no OAuth &#xB7; target/free-space checks</tspan>
-    <tspan x="1014" dy="14.1">copy + readback &#xB7; never delete</tspan>
+    <tspan x="1014" dy="0">menu app timer &#xB7; explicit CLI</tspan>
+    <tspan x="1014" dy="14.1">file bytes are opt-in only</tspan>
+    <tspan x="1014" dy="14.1">target checks &#xB7; copy + readback</tspan>
   </text>
   <rect x="1290" y="1580" width="240" height="125" rx="17" fill="#EEF2FF" stroke="#4F46E5" stroke-width="2"/>
   <text x="1304" y="1610" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="13.2" font-weight="750" fill="#0F172A">Catalog snapshot + views</text>

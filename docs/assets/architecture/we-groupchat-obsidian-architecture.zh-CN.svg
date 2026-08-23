@@ -191,18 +191,18 @@
   <text x="960" y="1864" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="11.5" font-weight="550" font-style="italic" letter-spacing="0" fill="#475569" opacity="1.0">&#x903B;&#x8F91;&#x8D23;&#x4EFB;&#x8FB9;&#x754C;&#x4F4D;&#x4E8E;&#x4E00;&#x4E2A;&#x672C;&#x5730;&#x5E94;&#x7528;&#x5185;&#xFF1B;&#x56FE;&#x4E2D;&#x65B9;&#x6846;&#x4E0D;&#x4EE3;&#x8868;&#x72EC;&#x7ACB;&#x90E8;&#x7F72;&#x7684;&#x5FAE;&#x670D;&#x52A1;&#x3002; &#xB7; Logical responsibility boundaries inside one local application; boxes do not represent independently deployed microservices.</text>
   <rect x="100" y="1210" width="1460" height="270" rx="22" fill="#F0FDFA" stroke="#0F766E" stroke-width="2.2"/>
   <text x="124" y="1245" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="18" font-weight="780" fill="#0F172A">&#x6765;&#x6E90;&#x53EF;&#x9760;&#x6027;&#x5E73;&#x9762; &#xB7; Source reliability plane</text>
-  <text x="1525" y="1244" text-anchor="end" font-family="Noto Sans CJK SC, sans-serif" font-size="10.5" font-weight="520" fill="#475569">&#x63A7;&#x5236;&#x4E0E;&#x6570;&#x636E;&#x5206;&#x79BB;&#xFF1A;source guard &#x4E0D;&#x5C5E;&#x4E8E; TopicMonitor&#xFF1B;&#x9644;&#x4EF6;&#x590D;&#x5236;&#x53D1;&#x751F;&#x5728; Knowledge commit &#x4E4B;&#x540E;&#x3002;</text>
+  <text x="1525" y="1244" text-anchor="end" font-family="Noto Sans CJK SC, sans-serif" font-size="10.5" font-weight="520" fill="#475569">&#x53D7;&#x4FDD;&#x62A4;&#x7684;&#x5FAE;&#x4FE1;&#x8BBF;&#x95EE;&#x53EA;&#x7559;&#x5728;&#x4E00;&#x4E2A;&#x957F;&#x9A7B; app &#x8FDB;&#x7A0B;&#xFF1B;source guard &#x4ECD;&#x4E0E; TopicMonitor &#x5206;&#x79BB;&#x3002;</text>
   <polyline points="350,1340 400,1340" fill="none" stroke="#0F766E" stroke-width="2.4" stroke-dasharray="7 5" marker-end="url(#arrowTeal)"/>
   <polyline points="630,1340 680,1340" fill="none" stroke="#2563EB" stroke-width="2.4" marker-end="url(#arrowBlue)"/>
   <polyline points="910,1340 960,1340" fill="none" stroke="#2563EB" stroke-width="2.4" marker-end="url(#arrowBlue)"/>
   <polyline points="1210,1340 1260,1340" fill="none" stroke="#EA580C" stroke-width="2.4" marker-end="url(#arrowOrange)"/>
   <polyline points="1530,1340 1690,1340" fill="none" stroke="#7C3AED" stroke-width="2.4" stroke-dasharray="7 5" marker-end="url(#arrowPurple)"/>
   <rect x="120" y="1280" width="230" height="125" rx="17" fill="#ECFDF5" stroke="#0F766E" stroke-width="2"/>
-  <text x="134" y="1310" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="13.2" font-weight="750" fill="#0F172A">&#x53EF;&#x9009; Source Guard</text>
+  <text x="134" y="1310" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="13.2" font-weight="750" fill="#0F172A">&#x957F;&#x9A7B; Source Guard</text>
   <text x="134" y="1338" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="10.2" font-weight="500" fill="#475569">
-    <tspan x="134" dy="0">one-shot StartInterval</tspan>
+    <tspan x="134" dy="0">&#x83DC;&#x5355; app &#x5185;&#x5B9A;&#x65F6;</tspan>
     <tspan x="134" dy="14.075999999999999">grace &#xB7; budget &#xB7; backoff</tspan>
-    <tspan x="134" dy="14.075999999999999">&#x53EA;&#x8BF7;&#x6C42;&#x6B63;&#x5E38;&#x540E;&#x53F0;&#x542F;&#x52A8;</tspan>
+    <tspan x="134" dy="14.075999999999999">&#x5355;&#x4E00; App Data &#x8FDB;&#x7A0B;</tspan>
   </text>
   <rect x="400" y="1280" width="230" height="125" rx="17" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
   <text x="414" y="1310" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="13.2" font-weight="750" fill="#0F172A">WeChat &#x8FDB;&#x7A0B;&#x4E0E;&#x672C;&#x5730; cache</text>
@@ -256,8 +256,8 @@
   <text x="134" y="1610" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="13.2" font-weight="750" fill="#0F172A">Selected-resource scanner</text>
   <text x="134" y="1638" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="10.2" font-weight="500" fill="#475569">
     <tspan x="134" dy="0">active monitor &#x2229; &#x663E;&#x5F0F;&#x9009;&#x62E9;</tspan>
-    <tspan x="134" dy="14.1">&#x6BCF;&#x7FA4; &#xD7; shard cursor + IDs</tspan>
-    <tspan x="134" dy="14.1">exact link + file occurrence</tspan>
+    <tspan x="134" dy="14.1">shard-complete exact-link scan</tspan>
+    <tspan x="134" dy="14.1">&#x539F;&#x5B50; links-only backfill</tspan>
   </text>
   <rect x="410" y="1580" width="240" height="125" rx="17" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
   <text x="424" y="1610" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="13.2" font-weight="750" fill="#0F172A">Resource occurrence ledger</text>
@@ -274,11 +274,11 @@
     <tspan x="714" dy="14.1">&#x4E0D;&#x53D7; KnowledgeStore gate</tspan>
   </text>
   <rect x="1000" y="1580" width="250" height="125" rx="17" fill="#FFF7ED" stroke="#EA580C" stroke-width="2"/>
-  <text x="1014" y="1610" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="13.2" font-weight="750" fill="#0F172A">One-shot mounted worker</text>
+  <text x="1014" y="1610" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="13.2" font-weight="750" fill="#0F172A">&#x957F;&#x9A7B; mounted worker</text>
   <text x="1014" y="1638" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="10.2" font-weight="500" fill="#475569">
-    <tspan x="1014" dy="0">CLI &#xB7; &#x77ED;&#x547D; LaunchAgent</tspan>
-    <tspan x="1014" dy="14.1">&#x65E0; OAuth &#xB7; target / &#x7A7A;&#x95F4;&#x68C0;&#x67E5;</tspan>
-    <tspan x="1014" dy="14.1">copy + readback &#xB7; &#x4ECE;&#x4E0D;&#x5220;&#x9664;</tspan>
+    <tspan x="1014" dy="0">&#x83DC;&#x5355; app timer &#xB7; &#x663E;&#x5F0F; CLI</tspan>
+    <tspan x="1014" dy="14.1">&#x9644;&#x4EF6; bytes &#x4EC5;&#x663E;&#x5F0F; opt-in</tspan>
+    <tspan x="1014" dy="14.1">target &#x68C0;&#x67E5; &#xB7; copy + readback</tspan>
   </text>
   <rect x="1290" y="1580" width="240" height="125" rx="17" fill="#EEF2FF" stroke="#4F46E5" stroke-width="2"/>
   <text x="1304" y="1610" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="13.2" font-weight="750" fill="#0F172A">Catalog snapshot + views</text>

@@ -58,8 +58,8 @@ The implementation must:
 - hand eligible CAS objects and eligible occurrence metadata to a mounted filesystem target;
 - avoid re-reading streamed cloud placeholders during ordinary scheduled runs;
 - expose honest `sync_delegated` semantics rather than claiming remote verification;
-- support a short-lived background LaunchAgent that wakes on an interval and
-  exits after one bounded run;
+- run bounded source-guard and mounted-resource timer work inside the long-lived
+  menu app so process-lifetime App Data consent is not repeatedly lost;
 - retain the existing direct Google Drive API implementation as an optional advanced lane.
 
 ## 4. Non-goals
@@ -283,26 +283,20 @@ complete snapshot is published.
 
 ### 10.1 Background scheduling
 
-The optional macOS LaunchAgent is deliberately short-lived:
+The ordinary autostart LaunchAgent owns one long-lived menu-bar app. Within that
+process, separate bounded timers trigger source-guard checks and mounted-resource
+capture/projection; non-blocking locks coalesce overlaps.
 
-```text
-RunAtLoad: true
-StartInterval: configurable, minimum 60 seconds
-KeepAlive: absent
-ProcessType: Background
-LowPriorityIO: true
-```
+macOS App Data consent is process-lifetime access. The former short-lived
+`StartInterval` helpers could therefore prompt again after every exit/relaunch.
+New source/resource `install-agent` paths are retired and refuse installation;
+their old command modes return `long_lived_app_required` before touching
+protected data. Status/uninstall remain only to detect and remove legacy plists.
 
-If the local py2app bundle exists, both the mounted-resource worker and source
-guard use short-lived command modes of its executable. This preserves the
-stable macOS app/TCC identity instead of launching a new bare Python identity on
-every interval. Source-only distributions retain the Python script fallback.
-
-Each wake executes `scripts/resource_backup.py run` once. The process captures
-new occurrences, resolves a bounded number of pending files, refreshes local
-indexes, attempts mounted handoff, writes receipts/snapshots when appropriate,
-and exits. Installation, status, and removal are explicit CLI actions. Merely
-merging this code does not install or load the agent.
+Resource background work captures occurrences, refreshes indexes, attempts
+mounted handoff, and writes receipts/snapshots when appropriate. File-byte
+resolution is disabled by default and requires a separate explicit menu
+confirmation or CLI opt-in. Link-only backfill never reads attachment bytes.
 
 ## 11. Status vocabulary
 
@@ -421,7 +415,7 @@ The first live rollout is bounded:
 10. confirm the remote copy manually from another Drive surface;
 11. run a second ordinary handoff and confirm it uses local receipts without
     rehashing streamed target objects;
-12. only after the canary passes, explicitly install the short-lived LaunchAgent;
+12. only after the canary passes, enable the long-lived resource timer;
 13. keep historical backfill as a separate explicit dry-plan/apply decision.
 
 The intended operator sequence is:
@@ -432,22 +426,28 @@ python scripts/resource_backup.py set-selected-chats 1
 python scripts/resource_backup.py set-target "/path/chosen/in/Finder"
 python scripts/resource_backup.py set-link-export-mode redacted
 python scripts/resource_backup.py init
+python scripts/resource_backup.py backfill-links --all
+python scripts/resource_backup.py backfill-links --all --apply
 python scripts/resource_backup.py backfill --all
 python scripts/resource_backup.py backfill --all --apply
 python scripts/resource_backup.py backfill --from YYYY-MM-DD
 python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply
-python scripts/resource_backup.py run --resolve-limit 10
+python scripts/resource_backup.py run
+python scripts/resource_backup.py run --resolve-files --resolve-limit 10
 python scripts/resource_backup.py verify
-python scripts/resource_backup.py install-agent --interval-seconds 300
+python scripts/resource_backup.py enable
 ```
 
 `init` is from-now only. Re-selection also starts a new from-now epoch. Explicit
 `backfill --apply` does not move that live cursor. `backfill --all` means all
-history still locally readable from known WeChat shards. `run` remains safe before the target is available: it
-captures eligible occurrences and refreshes the local Obsidian index, then
-reports the target state without fabricating a remote success. The final
-`install-agent` step is intentionally separate so code review and canary testing
-cannot accidentally enable scheduled handoff.
+history still locally readable from known WeChat shards. `backfill-links`
+requires a complete known-shard scan and atomically writes only exact link
+occurrences; it never resolves files. Ordinary `run` remains safe before the
+target is available and skips attachment bytes unless `--resolve-files` is
+explicit: it captures eligible metadata occurrences and refreshes the local
+Obsidian index, then reports the target state without fabricating a remote
+success. The final `enable` step activates only the long-lived timer; file-byte
+resolution remains a separate choice.
 
 ## 17. Acceptance tests
 
@@ -463,6 +463,8 @@ At minimum, automated tests must prove:
 - two same-name files with different bytes become two CAS objects;
 - source cursor and occurrence inserts commit atomically;
 - a degraded shard does not advance;
+- links-only backfill writes no rows unless every known shard completes, then
+  commits all new link occurrences atomically;
 - shard A may fail while shard B advances; after A recovers its unseen file is
   captured exactly once;
 - mixed link/file occurrence groups do not create semantic edges;
@@ -480,5 +482,6 @@ At minimum, automated tests must prove:
 - unresolved files may appear in a catalog-complete snapshot but never produce a
   `sync_delegated` run state;
 - Obsidian indexes reference CAS files but do not duplicate bytes.
-- the LaunchAgent plist has interval scheduling, background/low-I/O hints, and
-  no `KeepAlive`, and install/uninstall are idempotent under mocked `launchctl`.
+- long-lived app timers use non-blocking overlap guards; retired source/resource
+  command modes do not touch protected data, installation is refused, and
+  legacy-agent removal is idempotent under mocked `launchctl`.

@@ -1,4 +1,3 @@
-import os
 import plistlib
 import subprocess
 import tempfile
@@ -15,26 +14,11 @@ class ResourceBackupLaunchAgentTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.home = self.root / "home"
         self.project = self.root / "project"
-        self.data_dir = self.root / "data"
         (self.project / "scripts").mkdir(parents=True)
         (self.project / "scripts" / "resource_backup.py").write_text(
             "#!/usr/bin/env python3\n",
             encoding="utf-8",
         )
-
-    def make_app(self):
-        executable = (
-            self.project
-            / "dist"
-            / "WeGroupchatObsidian.app"
-            / "Contents"
-            / "MacOS"
-            / "WeGroupchatObsidian"
-        )
-        executable.parent.mkdir(parents=True)
-        executable.write_text("#!/bin/sh\n", encoding="utf-8")
-        executable.chmod(0o755)
-        return executable
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -43,98 +27,39 @@ class ResourceBackupLaunchAgentTests(unittest.TestCase):
     def completed(returncode=0, stderr=""):
         return subprocess.CompletedProcess([], returncode, stdout="", stderr=stderr)
 
-    def test_install_writes_short_lived_background_agent_without_keepalive(self):
-        executable = self.make_app()
+    def test_install_refuses_short_lived_worker_without_writing_plist(self):
         with (
             patch.object(launch_agent.Path, "home", return_value=self.home),
-            patch.object(launch_agent, "DATA_DIR", str(self.data_dir)),
-            patch.object(launch_agent, "_run", return_value=self.completed()) as run,
-            patch.dict(
-                os.environ,
-                {"WE_GROUPCHAT_OBSIDIAN_DATA_DIR": str(self.data_dir)},
-                clear=False,
-            ),
+            patch.object(launch_agent, "_run", return_value=self.completed(1)),
         ):
             result = launch_agent.install(self.project, interval_seconds=30)
             plist_path = launch_agent.plist_path()
 
-        self.assertEqual(result["state"], "installed")
-        self.assertEqual(result["interval_seconds"], 60)
-        self.assertEqual(result["runtime_identity"], "app_bundle")
-        self.assertTrue(plist_path.is_file())
-        with plist_path.open("rb") as handle:
-            payload = plistlib.load(handle)
-        self.assertEqual(
-            payload["Label"],
-            launch_agent.RESOURCE_BACKUP_LAUNCH_AGENT_LABEL,
-        )
-        self.assertEqual(
-            payload["ProgramArguments"],
-            [str(executable.resolve()), "--resource-backup-run"],
-        )
-        self.assertEqual(payload["WorkingDirectory"], str(self.project.resolve()))
-        self.assertTrue(payload["RunAtLoad"])
-        self.assertEqual(payload["StartInterval"], 60)
-        self.assertEqual(payload["ProcessType"], "Background")
-        self.assertTrue(payload["LowPriorityIO"])
-        self.assertNotIn("KeepAlive", payload)
-        self.assertEqual(
-            payload["EnvironmentVariables"]["WE_GROUPCHAT_OBSIDIAN_DATA_DIR"],
-            str(self.data_dir),
-        )
-        self.assertEqual(run.call_count, 2)
-        self.assertEqual(run.call_args_list[0].args[0], "launchctl")
-        self.assertEqual(run.call_args_list[0].args[1], "bootout")
-        self.assertEqual(run.call_args_list[1].args[1], "bootstrap")
-
-    def test_install_falls_back_to_source_python_when_no_app_bundle_exists(self):
-        with (
-            patch.object(launch_agent.Path, "home", return_value=self.home),
-            patch.object(launch_agent, "DATA_DIR", str(self.data_dir)),
-            patch.object(launch_agent, "_run", return_value=self.completed()),
-        ):
-            result = launch_agent.install(self.project, interval_seconds=300)
-            with launch_agent.plist_path().open("rb") as handle:
-                payload = plistlib.load(handle)
-
-        self.assertEqual(result["runtime_identity"], "python")
-        self.assertTrue(payload["ProgramArguments"][0].endswith("/python"))
-        self.assertTrue(
-            payload["ProgramArguments"][1].endswith("scripts/resource_backup.py")
-        )
-        self.assertEqual(payload["ProgramArguments"][2], "run")
-
-    def test_install_fails_without_publishing_a_loaded_state(self):
-        responses = [self.completed(), self.completed(1, "bootstrap failed")]
-        with (
-            patch.object(launch_agent.Path, "home", return_value=self.home),
-            patch.object(launch_agent, "DATA_DIR", str(self.data_dir)),
-            patch.object(launch_agent, "_run", side_effect=responses),
-        ):
-            result = launch_agent.install(self.project, interval_seconds=300)
-
-        self.assertEqual(result["state"], "install_failed")
-        self.assertTrue(result["installed"])
+        self.assertEqual(result["state"], "long_lived_app_required")
+        self.assertFalse(result["installed"])
         self.assertFalse(result["loaded"])
-        self.assertIn("bootstrap failed", result["error"])
+        self.assertFalse(plist_path.exists())
 
     def test_status_and_uninstall_are_idempotent(self):
         with (
             patch.object(launch_agent.Path, "home", return_value=self.home),
-            patch.object(launch_agent, "DATA_DIR", str(self.data_dir)),
             patch.object(launch_agent, "_run", return_value=self.completed()),
         ):
-            installed = launch_agent.install(self.project, interval_seconds=300)
+            path = launch_agent.plist_path()
+            path.parent.mkdir(parents=True)
+            with path.open("wb") as handle:
+                plistlib.dump({
+                    "ProgramArguments": ["/tmp/App.app/Contents/MacOS/App", "--resource-backup-run"],
+                }, handle)
             status = launch_agent.status()
             removed = launch_agent.uninstall()
             removed_again = launch_agent.uninstall()
             plist_path = launch_agent.plist_path()
 
-        self.assertEqual(installed["state"], "installed")
         self.assertEqual(status["state"], "loaded")
         self.assertTrue(status["installed"])
         self.assertTrue(status["loaded"])
-        self.assertEqual(status["runtime_identity"], "python")
+        self.assertEqual(status["runtime_identity"], "app_bundle")
         self.assertEqual(removed["state"], "uninstalled")
         self.assertEqual(removed_again["state"], "uninstalled")
         self.assertFalse(plist_path.exists())

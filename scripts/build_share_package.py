@@ -61,6 +61,10 @@ SHARE_GUIDE = """# we-groupchat-obsidian 群友使用说明
 3. 脚本需要创建/更新 `.venv` 并安装 dependencies 时会先询问；输入 `y` 才继续，不同意就退出。
 4. 菜单栏出现图标后，进入设置，选择 AI provider 并填写 API Key。
 
+macOS 可能在菜单 app 启动后询问一次 WeChat App Data 访问。请确认发起者是本项目 app；
+source guard 和资源索引都在这只长驻 app 内运行，不会每 300 秒启动一只新 Python 来重复询问。
+历史补链接不读取附件 bytes；附件解析仍需在资源菜单里单独显式开启。
+
 这是 source-only CLI 分发，不包含 `.dmg` 或 bundled Python runtime。
 
 如果微信更新后需要重新授权，普通启动不会偷偷重签名。确认要继续时再运行：
