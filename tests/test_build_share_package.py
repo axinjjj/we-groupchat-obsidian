@@ -22,6 +22,7 @@ class SharePackageTests(unittest.TestCase):
 
     def test_share_source_inventory_contains_packaged_tests_only(self):
         inventory = set(share.source_files())
+        self.assertNotIn(share.GUIDE_NAME, inventory)
         expected = {
             path.relative_to(REPO_ROOT).as_posix()
             for path in (REPO_ROOT / "tests").glob("test_*.py")

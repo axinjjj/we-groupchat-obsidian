@@ -27,6 +27,7 @@ GUIDE_NAME = "群友使用说明.md"
 
 EXCLUDED_PATHS = {
     "docs/working-continuity.md",
+    GUIDE_NAME,
 }
 
 EXCLUDED_PREFIXES = (
