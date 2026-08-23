@@ -56,7 +56,7 @@ fork 说明，请优先阅读 README.zh-CN.md。
   输入 y 才会继续安装；不同意就退出，不会偷偷改环境。
   * .venv 是项目自己的运行环境，不会污染你电脑里别的 Python。
   * 如果需要重新提取数据库 key 或重新授权，脚本会明确提示你使用
-    「刷新数据源.command」或带 --allow-wechat-resign 的命令，不会在普通启动时偷偷重签名。
+    「launchers/刷新数据源.command」或带 --allow-wechat-resign 的命令，不会在普通启动时偷偷重签名。
 
 
 ---------------------------------------------
@@ -114,7 +114,7 @@ A：这是因为 macOS 没有授权终端修改应用。
    2. 打开「系统设置」→「隐私与安全性」
    3. 往下滚，找到「App 管理」
    4. 打开「终端」的开关（需要输入密码）
-   5. 重新运行「刷新数据源.command」或刚才带 --allow-wechat-resign 的命令
+   5. 重新运行「launchers/刷新数据源.command」或刚才带 --allow-wechat-resign 的命令
    如果找不到「App 管理」，就找「完全磁盘访问权限」，打开「终端」的开关。
 
 Q：终端提示输入密码，但打字看不见，是不是卡住了？
@@ -122,8 +122,8 @@ A：不是。macOS 的 sudo 输入密码时本来就不会显示字符，也不�
    直接输入电脑登录密码，然后按回车即可。
 
 Q：微信更新后读不到记录了？
-A：先双击「健康检查.command」查看 DB/key、re-sign、missing keys 和 LaunchAgent 状态。
-   如果提示需要刷新，运行「刷新数据源.command」。
+A：先双击「launchers/健康检查.command」查看 DB/key、re-sign、missing keys 和 LaunchAgent 状态。
+   如果提示需要刷新，运行「launchers/刷新数据源.command」。
    这一步可能会要求输入 Mac 登录密码，也可能会退出微信，请先读终端提示。
 
 Q：关闭终端窗口会怎样？

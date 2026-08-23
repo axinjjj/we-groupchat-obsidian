@@ -236,18 +236,21 @@ If WeChat was updated or key extraction needs a fresh authorization:
 
 ## Useful Commands
 
-All of these can be double-clicked in Finder or run from Terminal.
+The canonical Finder helpers live in `launchers/` and can be double-clicked or
+run from Terminal. The root `启动.command` remains as the single compatibility
+entrypoint for existing source installs and LaunchAgents.
 
 | Command | Purpose |
 | --- | --- |
 | `./启动.command` | Start the menu bar app |
-| `./配置关注推送.command` | Configure topic monitoring without using the menu bar UI |
-| `./健康检查.command` | Redacted-by-default health check; use `--sensitive` only for local debugging |
-| `./刷新数据源.command` | Refresh WeChat database keys after updates |
-| `./历史总结到Obsidian.command` | Backfill historical summaries into Markdown |
-| `./整理Obsidian输出.command` | Re-export and organize Markdown notes |
-| `./安装自动启动.command` | Install LaunchAgent autostart |
-| `./卸载自动启动.command` | Remove LaunchAgent autostart |
+| `./launchers/配置关注推送.command` | Configure topic monitoring without using the menu bar UI |
+| `./launchers/健康检查.command` | Redacted-by-default health check; use `--sensitive` only for local debugging |
+| `./launchers/刷新数据源.command` | Refresh WeChat database keys after updates |
+| `./launchers/历史总结到Obsidian.command` | Backfill historical summaries into Markdown |
+| `./launchers/整理Obsidian输出.command` | Re-export and organize Markdown notes |
+| `./launchers/安装自动启动.command` | Install LaunchAgent autostart |
+| `./launchers/卸载自动启动.command` | Remove LaunchAgent autostart |
+| `./launchers/补跑遗漏笔记.command` | Audit or apply bounded monitor catch-up |
 
 Equivalent CLI flags:
 
@@ -358,6 +361,12 @@ and deliberately makes no claim about provider-side upload. See the
 [source reliability guide](docs/source-reliability.md) for mounted handoff,
 optional Drive API, states, resolver rules, storage layout, and failure boundaries.
 
+Each run also maintains a discoverable Obsidian entrypoint at
+`<monitor_obsidian_subdir>/00-资源索引.md`. It links to each selected chat's own
+`00-资源索引.md` and monthly pages. These are generated, app-owned Markdown files
+even when their names do not contain `.generated`; that suffix is used only when
+the preferred filename already belongs to the user and must not be overwritten.
+
 ### Guarded exact relation Markdown cleanup
 
 This one-time repair is manifest-bound and has no implicit config lookup. Use
@@ -409,7 +418,7 @@ them off does not stop monitoring, knowledge writes, or Daily Digest generation;
 manual action feedback and the explicit notification test remain available.
 
 If system notifications do not appear, check the `Notification identity` line
-in `./健康检查.command`. Source installs launched through a virtualenv can run as
+in `./launchers/健康检查.command`. Source installs launched through a virtualenv can run as
 `Python / org.python.python`, which may schedule notifications without showing a
 stable app entry in macOS notification settings. A bundled `.app` build should
 use `io.github.indeliblevivi.we-groupchat-obsidian` as its notification bundle
@@ -446,7 +455,7 @@ The current project/repository name is `we-groupchat-obsidian`. Older local mach
 To opt in to a label migration after reviewing the impact:
 
 ```bash
-./安装自动启动.command --migrate-label
+./launchers/安装自动启动.command --migrate-label
 ```
 
 ## Monitor, Digest, and Obsidian Workflow
@@ -456,8 +465,8 @@ The topic monitor is designed to preserve useful signal without turning every in
 If WeChat or the provider was unavailable and the monitor has a checkpointed backlog, use the guarded catch-up entry instead of advancing state by hand:
 
 ```bash
-./补跑遗漏笔记.command          # read-only pending audit
-./补跑遗漏笔记.command --apply  # pause, back up, drain, rebuild, validate, restore
+./launchers/补跑遗漏笔记.command          # read-only pending audit
+./launchers/补跑遗漏笔记.command --apply  # pause, back up, drain, rebuild, validate, restore
 ```
 
 Write mode requires the explicit `--apply` flag. It refuses chats without a recoverable checkpoint, uses the normal paginated `TopicMonitor` path, keeps AI failures from advancing state, stores a private partial-recovery backup under `~/.we-groupchat-obsidian/backups/monitor-catch-up/`, rebuilds affected source-date indexes and historical Daily Digests, validates SQLite/FTS/hash parity, and restores a previously loaded LaunchAgent in `finally`.
@@ -467,7 +476,7 @@ The catch-up backup currently contains only canonical SQLite plus per-chat check
 Catch-up uses a page-level partial-commit contract. Every `--apply` invocation writes a private, content-free JSON receipt under `~/.we-groupchat-obsidian/catch_up_receipts/`:
 
 - `complete / drained`: every selected chat reached `no_messages`, projections and canonical validation passed, and the previously loaded LaunchAgent was restored.
-- `partial / resume_required`: at least one page or managed projection committed, but a chat was blocked or a later operation failed. When `resume_supported` is `true`, rerun `./补跑遗漏笔记.command --apply`; each chat continues from its committed checkpoint.
+- `partial / resume_required`: at least one page or managed projection committed, but a chat was blocked or a later operation failed. When `resume_supported` is `true`, rerun `./launchers/补跑遗漏笔记.command --apply`; each chat continues from its committed checkpoint.
 - `failed / no_progress`: no monitor page committed. Inspect the receipt's error type/status and runtime state before retrying.
 - `complete / no_op`: the audit found zero pending messages, so no backup, write, or LaunchAgent switch occurred.
 
@@ -557,18 +566,20 @@ ai/                      # replaceable AI provider adapters
 core/                    # domain logic, durable state, privacy and reliability contracts
 ui/                      # reusable UI components
 scripts/                 # thin operator and LaunchAgent one-shot entrypoints
+launchers/               # canonical Finder-friendly .command entrypoints
 tests/                   # importable unittest package
 c_src/                   # macOS WeChat key scanner
 resources/               # app and menu-bar assets
 docs/                    # user, operator, architecture and formal-contract documentation
-*.command                # Finder-friendly macOS entrypoints
+启动.command             # root compatibility stub for existing installs/LaunchAgents
 ```
 
 The three root-level Python files are deliberate application/build entrypoints,
 not loose domain modules. New reusable behavior belongs in `core/`, `ai/`, or
 `ui/`; operator orchestration belongs in `scripts/`; tests belong in `tests/`.
-This keeps the current import and py2app contract stable without maintaining a
-second compatibility package around the same implementation.
+Finder helpers belong in `launchers/`; only the root start stub remains for the
+evidenced deployed compatibility path. This keeps the current import, py2app and
+LaunchAgent contract stable without maintaining duplicate implementations.
 
 ```mermaid
 flowchart LR
@@ -583,6 +594,8 @@ flowchart LR
     UI["ui/<br/>reusable UI"]
   end
   SCRIPTS["scripts/<br/>one-shot operators"]
+  LAUNCHERS["launchers/<br/>Finder entrypoints"]
+  ROOTSTART["启动.command<br/>compatibility stub"]
   TESTS["tests/<br/>unittest package"]
   AGENTS["LaunchAgents<br/>absolute checkout paths"]
   BUNDLE["Alias app bundle<br/>checkout + .venv"]
@@ -594,6 +607,9 @@ flowchart LR
   MCP --> AI
   MCP --> CORE
   SCRIPTS --> CORE
+  ROOTSTART --> LAUNCHERS
+  LAUNCHERS --> APP
+  LAUNCHERS --> SCRIPTS
   SETUP --> BUNDLE
   AGENTS --> BUNDLE
   AGENTS --> SCRIPTS
@@ -613,16 +629,15 @@ surfaces target installed executables and a standalone bundle instead.
 .venv/bin/python -m unittest discover -s tests -t . -p 'test_*.py'
 .venv/bin/python -m unittest -v tests.test_resource_backup
 .venv/bin/python -m compileall -q app.py mcp_server.py setup.py ai core ui scripts tests
-bash -n 启动.command
-bash -n 刷新数据源.command
+for launcher in 启动.command launchers/*.command; do bash -n "$launcher"; done
 ```
 
 ## What Changed in This Fork
 
 This fork started from the same core idea as the upstream project: read the user's own local WeChat database on macOS and turn group chat history into useful AI summaries. The changes here are mostly practical adaptations from running the tool every day, especially when the menu bar app is hidden, WeChat updates break keys, or monitor output needs to become a durable local knowledge workflow.
 
-- Local operations are more explicit: setup-only, health check, monitor configuration, data-source refresh, historical backfill, Obsidian re-export, and autostart install/uninstall all have CLI or `.command` entrypoints.
-- WeChat update recovery is documented and scriptable through `./健康检查.command` and `./刷新数据源.command`, instead of depending on the menu bar UI being reachable.
+- Local operations are more explicit: setup-only, health check, monitor configuration, data-source refresh, historical backfill, Obsidian re-export, and autostart install/uninstall all have CLI or `launchers/*.command` entrypoints.
+- WeChat update recovery is documented and scriptable through `./launchers/健康检查.command` and `./launchers/刷新数据源.command`, instead of depending on the menu bar UI being reachable.
 - LaunchAgent handling is public-safe and compatible: new installs use a neutral label, while older project-managed plists are discovered by path and preserved unless migration is explicitly requested.
 - Topic monitoring has been tuned toward high-signal, value-first summaries, with support for multiple chats, provider/model configuration, opt-in link preview context, forwarded-record parsing, local wake-from-sleep catch-up, and `P1/P2/P3` notification gating.
 - Resource-lead handling keeps "can private-share / will share later / repo not public yet" opportunities visible even before a file or link appears.

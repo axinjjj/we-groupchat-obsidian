@@ -316,6 +316,25 @@ class ResourceBackupTests(unittest.TestCase):
         ]
         self.assertTrue(all(path.endswith(".md") for path in vault_files))
 
+    def test_resource_indexes_have_a_discoverable_scope_root(self):
+        capture = self._ready_capture()
+        backup = self._backup(capture)
+
+        result = backup.render_obsidian_indexes()
+
+        self.assertEqual(result["state"], "written")
+        scope_root = os.path.join(
+            self.obsidian_root,
+            "微信群聊",
+            "关注推送",
+            "00-资源索引.md",
+        )
+        with open(scope_root, encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn("<!-- we-groupchat-obsidian:resource-index v1 -->", text)
+        self.assertIn("[[猫猫研究群/00-资源索引|猫猫研究群]]", text)
+        self.assertIn("2 个链接 · 2 个文件", text)
+
     def test_ordinary_rerun_trusts_delivery_receipt_and_does_not_rehash_target_objects(self):
         capture = self._ready_capture()
         backup = self._backup(capture)
@@ -774,10 +793,18 @@ class ResourceBackupTests(unittest.TestCase):
         os.makedirs(month_root, exist_ok=True)
         root_path = os.path.join(chat_root, "00-资源索引.md")
         month_path = os.path.join(month_root, month + ".md")
+        scope_root = os.path.join(
+            self.obsidian_root,
+            "微信群聊",
+            "关注推送",
+            "00-资源索引.md",
+        )
         with open(root_path, "w", encoding="utf-8") as handle:
             handle.write("# user-owned root\n")
         with open(month_path, "w", encoding="utf-8") as handle:
             handle.write("# user-owned month\n")
+        with open(scope_root, "w", encoding="utf-8") as handle:
+            handle.write("# user-owned scope root\n")
 
         result = backup.render_obsidian_indexes()
 
@@ -786,13 +813,28 @@ class ResourceBackupTests(unittest.TestCase):
             self.assertEqual(handle.read(), "# user-owned root\n")
         with open(month_path, encoding="utf-8") as handle:
             self.assertEqual(handle.read(), "# user-owned month\n")
+        with open(scope_root, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "# user-owned scope root\n")
         generated_root = os.path.join(chat_root, "00-资源索引.generated.md")
         generated_month = os.path.join(month_root, month + ".generated.md")
+        generated_scope_root = os.path.join(
+            self.obsidian_root,
+            "微信群聊",
+            "关注推送",
+            "00-资源索引.generated.md",
+        )
         self.assertTrue(os.path.isfile(generated_root))
         self.assertTrue(os.path.isfile(generated_month))
+        self.assertTrue(os.path.isfile(generated_scope_root))
         with open(generated_root, encoding="utf-8") as handle:
             root_text = handle.read()
         self.assertIn(f"[[资源索引/{month}.generated|{month}]]", root_text)
+        with open(generated_scope_root, encoding="utf-8") as handle:
+            scope_text = handle.read()
+        self.assertIn(
+            "[[猫猫研究群/00-资源索引.generated|猫猫研究群]]",
+            scope_text,
+        )
 
     def test_delivery_receipt_does_not_trust_a_symlink_replacement(self):
         capture = self._ready_capture()

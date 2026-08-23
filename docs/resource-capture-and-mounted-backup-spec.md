@@ -206,6 +206,7 @@ Recommended layout:
 
 ```text
 <monitor_obsidian_subdir>/
+  00-资源索引.md
   <chat>/
     00-资源索引.md
     资源索引/
@@ -213,6 +214,8 @@ Recommended layout:
       2026-09.md
 ```
 
+The scope-root `00-资源索引.md` links to every selected chat that currently has
+captured occurrences and shows link/file/month counts. Each chat-level
 `00-资源索引.md` contains month links and counts. Monthly notes group resources by source message and show:
 
 - time;
@@ -229,12 +232,13 @@ The index contains references only. It does not copy file bytes into the Obsidia
 
 If two selected chats have the same human alias, their generated directories must remain distinct by adding a stable short chat-key suffix.
 
-Every generated index contains an app ownership marker. If the preferred path
-already contains a user-authored file without that marker, the worker preserves
-it and writes a sibling such as `00-资源索引.generated.md` or
-`2026-08.generated.md`. Parent navigation must point to the actual generated
-filename. Two unmanaged collisions fail closed rather than overwriting either
-file.
+Every generated index contains an app ownership marker. A managed file normally
+uses the clean preferred name without a `.generated` suffix. If the preferred
+scope-root, chat-root, or monthly path already contains a user-authored file
+without that marker, the worker preserves it and writes a sibling such as
+`00-资源索引.generated.md` or `2026-08.generated.md`. Parent navigation must
+point to the actual generated filename. Two unmanaged collisions fail closed
+rather than overwriting either file.
 
 ## 10. Mounted-filesystem handoff
 

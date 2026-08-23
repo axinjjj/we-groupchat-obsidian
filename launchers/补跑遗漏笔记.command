@@ -1,9 +1,9 @@
 #!/bin/bash
-# Print a privacy-safe health check for we-groupchat-obsidian.
+# Audit or safely drain missed monitor notes into Obsidian.
 
 set -euo pipefail
 
-PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
 
 if [[ ! -x "$PROJECT_DIR/.venv/bin/python" ]]; then
@@ -11,4 +11,4 @@ if [[ ! -x "$PROJECT_DIR/.venv/bin/python" ]]; then
     "$PROJECT_DIR/启动.command" --setup-only
 fi
 
-exec "$PROJECT_DIR/.venv/bin/python" "$PROJECT_DIR/scripts/health_check.py" "$@"
+exec "$PROJECT_DIR/.venv/bin/python" "$PROJECT_DIR/scripts/catch_up_monitor.py" "$@"

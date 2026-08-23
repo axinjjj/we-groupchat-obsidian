@@ -62,7 +62,7 @@ class StartupHelperTests(unittest.TestCase):
                 )
 
     def test_launcher_confirms_before_environment_changes(self):
-        launcher = repo_path("启动.command")
+        launcher = repo_path("launchers", "启动.command")
         with open(launcher, encoding="utf-8") as handle:
             contents = handle.read()
 

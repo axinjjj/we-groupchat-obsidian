@@ -1197,6 +1197,7 @@ class MountedResourceBackup:
         chat_parts = self._chat_path_parts(occurrences)
         delivery_map = self._delivery_map()
         written = 0
+        chat_summaries = []
         for (chat_key, chat_alias), months in grouped.items():
             chat_part = chat_parts[(chat_key, chat_alias)]
             chat_root = os.path.join(base_root, chat_part)
@@ -1258,6 +1259,55 @@ class MountedResourceBackup:
                 target_view=target_view,
             )
             if index_changed:
+                written += 1
+            chat_summaries.append({
+                "alias": _single_line(chat_alias, "未命名群聊", 120),
+                "path": os.path.relpath(_actual_index_path, base_root).replace(
+                    os.sep, "/"
+                ),
+                "months": len(months),
+                "links": sum(
+                    1
+                    for rows in months.values()
+                    for row in rows
+                    if row.get("kind") == "link"
+                ),
+                "files": sum(
+                    1
+                    for rows in months.values()
+                    for row in rows
+                    if row.get("kind") == "file"
+                ),
+            })
+        if chat_summaries:
+            scope_lines = [
+                INDEX_MARKER,
+                "# 资源索引",
+                "",
+                "> 这里汇总显式选中资源备份的群聊入口；每个群聊页面再按月份列出链接与文件。",
+                "",
+            ]
+            for summary in sorted(
+                chat_summaries,
+                key=lambda item: (item["alias"].casefold(), item["path"]),
+            ):
+                label = _markdown_label(summary["alias"], "未命名群聊")
+                if target_view:
+                    target = _markdown_url(summary["path"])
+                    link = f"[{label}](<{target}>)"
+                else:
+                    target = os.path.splitext(summary["path"])[0]
+                    link = f"[[{target}|{label}]]"
+                scope_lines.append(
+                    f"- {link} · {summary['links']} 个链接 · "
+                    f"{summary['files']} 个文件 · {summary['months']} 个月份"
+                )
+            _, scope_changed = self._write_managed_text(
+                os.path.join(base_root, "00-资源索引.md"),
+                "\n".join(scope_lines),
+                target_view=target_view,
+            )
+            if scope_changed:
                 written += 1
         return written
 
