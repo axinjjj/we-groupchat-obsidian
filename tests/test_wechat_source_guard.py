@@ -269,14 +269,39 @@ class SourceGuardLaunchAgentTests(unittest.TestCase):
     def test_plist_is_one_shot_start_interval_without_keepalive(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
+            executable = (
+                project
+                / "dist"
+                / "WeGroupchatObsidian.app"
+                / "Contents"
+                / "MacOS"
+                / "WeGroupchatObsidian"
+            )
+            executable.parent.mkdir(parents=True)
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o755)
             payload = build_agent_plist(
                 {"wechat_source_guard_interval_seconds": 420},
                 project_dir=project,
             )
         self.assertEqual(payload["StartInterval"], 420)
         self.assertNotIn("KeepAlive", payload)
+        self.assertEqual(
+            payload["ProgramArguments"],
+            [str(executable.resolve()), "--source-guard-run"],
+        )
+
+    def test_plist_falls_back_to_source_python_without_app_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            payload = build_agent_plist({}, project_dir=project)
+
         self.assertTrue(payload["ProgramArguments"][0].endswith("/.venv/bin/python"))
-        self.assertTrue(payload["ProgramArguments"][1].endswith("/scripts/wechat_source_guard_agent.py"))
+        self.assertTrue(
+            payload["ProgramArguments"][1].endswith(
+                "/scripts/wechat_source_guard_agent.py"
+            )
+        )
 
     def test_plist_preserves_explicit_data_dir_override(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -30,6 +30,11 @@ Source guard 默认关闭。开启 policy、安装 LaunchAgent plist、加载 La
 写入很小的私有 state，然后退出。构建 plist 时如果设置了
 `WE_GROUPCHAT_OBSIDIAN_DATA_DIR`，LaunchAgent 会显式保留这个 override。
 
+如果 `dist/WeGroupchatObsidian.app` 已存在，plist 会调用它的
+`--source-guard-run` one-shot mode，让 macOS 把 protected-folder access 归到稳定的项目 app
+identity。纯 source 安装继续使用 `.venv/bin/python scripts/wechat_source_guard_agent.py`
+fallback。
+
 Process-list availability 通过读取 guard 当前进程自身来证明，不依赖普通用户 session
 能否看见系统级 `launchd`。Source freshness 只对 cached key inventory 中已知的
 `message/` shard 路径及其 WAL/SHM siblings 做 exact stat；它不会递归遍历 DB root 或
@@ -238,6 +243,8 @@ worker 不会在 mount 缺失时把那个路径重新创建成普通本地目录
 .venv/bin/python scripts/resource_backup.py set-target "<已经存在的挂载目录>"
 .venv/bin/python scripts/resource_backup.py set-link-export-mode redacted
 .venv/bin/python scripts/resource_backup.py init
+.venv/bin/python scripts/resource_backup.py backfill --all
+.venv/bin/python scripts/resource_backup.py backfill --all --apply
 .venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD
 .venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply
 .venv/bin/python scripts/resource_backup.py status
@@ -247,7 +254,9 @@ worker 不会在 mount 缺失时把那个路径重新创建成普通本地目录
 ```
 
 `init` 只初始化 from-now cursors。停选后重新选择会建立新的 private selection epoch，不会吞回停选 gap；
-历史 backfill 是独立 dry-plan/apply 命令，也不会移动 live cursor。`run` 捕获 deterministic occurrences、把 due files resolve 到共享
+历史 backfill 是独立 dry-plan/apply 命令，也不会移动 live cursor。`backfill --all` 从 timestamp zero
+开始，表示扫描 known local WeChat message shards 中仍然可读的全部历史，并不保证 provider 远端仍保留
+更早内容。`run` 捕获 deterministic occurrences、把 due files resolve 到共享
 CAS、即使 target 不可用也继续刷新本地 Obsidian index，然后才尝试 mounted handoff。
 
 ```text
@@ -282,7 +291,9 @@ Ordinary status 只有在 current catalog、target objects、有效 latest `COMP
 ```
 
 Agent 使用 `RunAtLoad + StartInterval`、`ProcessType=Background`、`LowPriorityIO`，没有 `KeepAlive`；
-每次 wake 只运行一个 bounded process 然后退出。安装是 activation action，merge source 不会自动安装。
+每次 wake 只运行一个 bounded process 然后退出。本地 app bundle 存在时调用它的
+`--resource-backup-run` mode；纯 source 安装保留 Python CLI fallback。安装是 activation action，
+merge source 不会自动安装。
 
 ## 5. 可选 advanced selected-chat Google Drive API 直传
 

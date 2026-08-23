@@ -19,6 +19,7 @@ OPTIONS = {
         "anthropic",
         "openai",
         "requests",
+        "scripts",
         "objc",
         "ai",
         "core",

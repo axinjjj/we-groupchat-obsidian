@@ -16,6 +16,11 @@ if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
 from core.config import DATA_DIR, load_config, save_config
+from core.background_jobs import (
+    SOURCE_GUARD_MODE,
+    background_program_arguments,
+    runtime_identity,
+)
 from core.launch_agent import launch_agent_status
 from core.project_identity import SOURCE_GUARD_LAUNCH_AGENT_LABEL
 from core.wechat_source_guard import (
@@ -35,9 +40,14 @@ def build_agent_plist(config: dict, project_dir: Path = PROJECT_DIR) -> dict:
     interval = int(config.get("wechat_source_guard_interval_seconds", 300) or 300)
     python = project_dir / ".venv" / "bin" / "python"
     entrypoint = project_dir / "scripts" / "wechat_source_guard_agent.py"
+    program_arguments, _runtime_identity = background_program_arguments(
+        project_dir,
+        SOURCE_GUARD_MODE,
+        [str(python), str(entrypoint)],
+    )
     payload = {
         "Label": SOURCE_GUARD_LAUNCH_AGENT_LABEL,
-        "ProgramArguments": [str(python), str(entrypoint)],
+        "ProgramArguments": program_arguments,
         "WorkingDirectory": str(project_dir),
         "RunAtLoad": True,
         "StartInterval": interval,
@@ -122,6 +132,14 @@ def print_status(config: dict) -> int:
     process_state = "unknown" if process is None else "running" if process else "absent"
     plist = agent_plist_path()
     agent = launch_agent_status(SOURCE_GUARD_LAUNCH_AGENT_LABEL)
+    agent_identity = "not_installed"
+    try:
+        with plist.open("rb") as handle:
+            payload = plistlib.load(handle)
+        agent_identity = runtime_identity(payload.get("ProgramArguments") or [])
+    except (OSError, plistlib.InvalidFileException, TypeError, ValueError):
+        if plist.is_file():
+            agent_identity = "unknown"
     print("WeChat source guard")
     print(f"  enabled: {report['enabled']}")
     print(f"  state: {report['state']}")
@@ -134,6 +152,7 @@ def print_status(config: dict) -> int:
     print(f"  source freshness: {report.get('source_freshness') or 'unknown'}")
     print(f"  agent installed: {plist.exists()}")
     print(f"  agent loaded: {agent.loaded}")
+    print(f"  agent runtime identity: {agent_identity}")
     return 0
 
 

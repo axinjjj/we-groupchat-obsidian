@@ -155,7 +155,7 @@ independently deployed microservices. Editable sources:
 - Opt-in attachment cataloging plus a private local content-addressed archive that deduplicates identical bytes; file and image kinds are selected explicitly.
 - Optional, separately installed WeChat source guard with grace, pause, restart budget, exponential backoff, content-free receipts, and no `KeepAlive` loop.
 - Provider-neutral filesystem snapshots for the attachment archive, including plan, run, verify, and read-only restore planning.
-- Default no-OAuth selected-resource backup through an existing mounted filesystem such as Google Drive for Desktop, with exact link occurrences, shared-CAS files, Obsidian indexes, catalog snapshots, and honest `sync_delegated` receipts.
+- Default no-OAuth selected-resource backup through an existing mounted filesystem such as Google Drive for Desktop, with exact link occurrences, shared-CAS files, lightweight Obsidian indexes, catalog snapshots, and honest `sync_delegated` receipts.
 - Optional advanced selected-chat file sync through the Google Drive API, with a separate selection/control plane, durable queue, chat/month shortcuts, retry/reconcile, and no automatic deletion.
 - Optional link preview context for public URLs; it is off by default and must be enabled explicitly.
 - CLI and `.command` maintenance entrypoints for users whose menu bar icon is hidden.
@@ -316,6 +316,8 @@ Source reliability helpers:
 .venv/bin/python scripts/resource_backup.py set-target "<existing-mounted-directory>"
 .venv/bin/python scripts/resource_backup.py set-link-export-mode redacted
 .venv/bin/python scripts/resource_backup.py init
+.venv/bin/python scripts/resource_backup.py backfill --all
+.venv/bin/python scripts/resource_backup.py backfill --all --apply
 .venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD
 .venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply
 .venv/bin/python scripts/resource_backup.py status
@@ -355,15 +357,21 @@ but does not load it; `--load-now` is the separate activation step.
 `resource_backup.py install-agent` installs and loads its short-lived scheduled
 worker and therefore belongs only after the manual canary. Mounted-resource,
 attachment-archive, and direct-Drive backfills are dry plans unless `--apply`
-is present. Drive `enable` does not authenticate, select chats, backfill, or run an
-upload. Backup `verify` checks bytes visible at the configured filesystem target
+is present. Mounted-resource `backfill --all` scans all history still available
+in the selected chats' local WeChat shards; it remains idempotent and does not
+move live cursors. Drive `enable` does not authenticate, select chats, backfill,
+or run an upload. Backup `verify` checks bytes visible at the configured filesystem target
 and deliberately makes no claim about provider-side upload. See the
 [source reliability guide](docs/source-reliability.md) for mounted handoff,
 optional Drive API, states, resolver rules, storage layout, and failure boundaries.
 
 Each run also maintains a discoverable Obsidian entrypoint at
 `<monitor_obsidian_subdir>/00-资源索引.md`. It links to each selected chat's own
-`00-资源索引.md` and monthly pages. These are generated, app-owned Markdown files
+`00-资源索引.md` and monthly pages. Monthly pages are deliberately light: day,
+time, and a clickable link/file only. An observed WeChat link title is used when
+available; otherwise the full exact URL is the visible label. Sender, hashes,
+source-message identity, and handoff details remain in private catalogs instead
+of the reading surface. These are generated, app-owned Markdown files
 even when their names do not contain `.generated`; that suffix is used only when
 the preferred filename already belongs to the user and must not be overwritten.
 
@@ -437,7 +445,11 @@ For a local app-bundle LaunchAgent identity:
 
 The `--alias` app points back to this source checkout and its `.venv`; it is
 useful for local autostart notification identity, not as a standalone
-distributable build.
+distributable build. When that app bundle exists, the optional source-guard and
+mounted-resource LaunchAgents also invoke short-lived modes of the same app
+executable. This keeps scheduled folder access under the project app identity
+instead of presenting a new bare `Python` process every interval. A source-only
+install without the bundle retains the explicit `.venv/bin/python` fallback.
 
 ## Runtime Data Migration
 
@@ -597,7 +609,7 @@ flowchart LR
   LAUNCHERS["launchers/<br/>Finder entrypoints"]
   ROOTSTART["启动.command<br/>compatibility stub"]
   TESTS["tests/<br/>unittest package"]
-  AGENTS["LaunchAgents<br/>absolute checkout paths"]
+  AGENTS["LaunchAgents<br/>app identity preferred<br/>source Python fallback"]
   BUNDLE["Alias app bundle<br/>checkout + .venv"]
   CLIENTS["MCP clients<br/>absolute mcp_server.py"]
 
@@ -612,7 +624,7 @@ flowchart LR
   LAUNCHERS --> SCRIPTS
   SETUP --> BUNDLE
   AGENTS --> BUNDLE
-  AGENTS --> SCRIPTS
+  AGENTS -. "source-only fallback" .-> SCRIPTS
   CLIENTS --> MCP
   TESTS -. "validates" .-> Root
   TESTS -. "validates" .-> Packages
