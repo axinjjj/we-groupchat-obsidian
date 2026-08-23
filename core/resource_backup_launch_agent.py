@@ -8,6 +8,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+from .background_jobs import (
+    RESOURCE_BACKUP_MODE,
+    background_program_arguments,
+    runtime_identity,
+)
 from .config import DATA_DIR
 
 
@@ -88,9 +93,14 @@ def install(project_dir: str | os.PathLike[str], interval_seconds: int = 300) ->
         environment["WE_GROUPCHAT_OBSIDIAN_DATA_DIR"] = os.environ[
             "WE_GROUPCHAT_OBSIDIAN_DATA_DIR"
         ]
+    program_arguments, runtime_identity = background_program_arguments(
+        project,
+        RESOURCE_BACKUP_MODE,
+        [sys.executable, str(script), "run"],
+    )
     payload = {
         "Label": RESOURCE_BACKUP_LAUNCH_AGENT_LABEL,
-        "ProgramArguments": [sys.executable, str(script), "run"],
+        "ProgramArguments": program_arguments,
         "WorkingDirectory": str(project),
         "RunAtLoad": True,
         "StartInterval": interval,
@@ -109,6 +119,7 @@ def install(project_dir: str | os.PathLike[str], interval_seconds: int = 300) ->
             "state": "install_failed",
             "installed": path.is_file(),
             "loaded": False,
+            "runtime_identity": runtime_identity,
             "error": (loaded.stderr or loaded.stdout).strip()[:240],
         }
     return {
@@ -116,6 +127,7 @@ def install(project_dir: str | os.PathLike[str], interval_seconds: int = 300) ->
         "installed": True,
         "loaded": True,
         "interval_seconds": interval,
+        "runtime_identity": runtime_identity,
     }
 
 
@@ -143,8 +155,17 @@ def status() -> dict:
         "print",
         f"{_domain()}/{RESOURCE_BACKUP_LAUNCH_AGENT_LABEL}",
     )
+    identity = "not_installed"
+    try:
+        with path.open("rb") as handle:
+            payload = plistlib.load(handle)
+        identity = runtime_identity(payload.get("ProgramArguments") or [])
+    except (OSError, plistlib.InvalidFileException, TypeError, ValueError):
+        if path.is_file():
+            identity = "unknown"
     return {
         "state": "loaded" if report.returncode == 0 else "not_loaded",
         "installed": path.is_file(),
         "loaded": report.returncode == 0,
+        "runtime_identity": identity,
     }

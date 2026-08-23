@@ -11,6 +11,12 @@ import time
 import traceback
 from datetime import datetime
 
+from core.background_jobs import dispatch_background_job
+
+_BACKGROUND_EXIT_CODE = dispatch_background_job(sys.argv[1:])
+if _BACKGROUND_EXIT_CODE is not None:
+    raise SystemExit(_BACKGROUND_EXIT_CODE)
+
 import rumps
 
 # --- For dialog top-most + custom dialogs ---

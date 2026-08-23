@@ -129,7 +129,7 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
 - 附件 catalog 与本地 content-addressed archive：archive 默认关闭；启用后相同 bytes 自动 dedup，图片仍需单独 opt-in。
 - 可选、单独安装的微信 source guard：grace、pause、restart budget、exponential backoff、content-free receipts，且没有 `KeepAlive` busy loop。
 - Provider-neutral filesystem snapshot：支持 attachment archive 的 plan、run、verify 和只读 restore plan。
-- 默认 no-OAuth selected-resource mounted backup：把 exact links 与共享 CAS files 交给现有 Google Drive for Desktop 等挂载目录，同时生成 Obsidian index、catalog snapshot 和诚实的 `sync_delegated` receipt。
+- 默认 no-OAuth selected-resource mounted backup：把 exact links 与共享 CAS files 交给现有 Google Drive for Desktop 等挂载目录，同时生成轻量 Obsidian index、catalog snapshot 和诚实的 `sync_delegated` receipt。
 - 可选 advanced Google Drive API lane：拥有独立 selection/control plane、durable queue、群聊/月 shortcut 与 retry/reconcile，不自动删除。
 - 链接和转发展开：可选择补充公开网页标题/摘要；远程链接预览默认关闭。本地微信 XML 里可见的转发聊天记录会尽量解析。
 - MCP Server：让 Claude Desktop、Claude Code、Cursor、OpenClaw 等 MCP 客户端只读查询群聊、搜索、总结、查看图片；发送消息默认关闭。
@@ -289,6 +289,8 @@ Source reliability 运维脚本：
 .venv/bin/python scripts/resource_backup.py set-target "<已经存在的挂载目录>"
 .venv/bin/python scripts/resource_backup.py set-link-export-mode redacted
 .venv/bin/python scripts/resource_backup.py init
+.venv/bin/python scripts/resource_backup.py backfill --all
+.venv/bin/python scripts/resource_backup.py backfill --all --apply
 .venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD
 .venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply
 .venv/bin/python scripts/resource_backup.py status
@@ -327,14 +329,19 @@ Source reliability 运维脚本：
 才是单独的 activation。`resource_backup.py install-agent` 会安装并加载短命 scheduled worker，必须放在
 manual canary 通过之后。
 Mounted-resource、attachment-archive 与 direct-Drive backfill 默认都是 dry plan，只有显式
-`--apply` 才登记历史 item。Drive `enable` 不会顺手 auth、选群、backfill 或 upload。Backup `verify`
+`--apply` 才登记历史 item。Mounted-resource `backfill --all` 会扫描被选群聊在本地 WeChat shards
+里仍然可读的全部历史；它保持 idempotent，且不移动 live cursor。Drive `enable` 不会顺手 auth、
+选群、backfill 或 upload。Backup `verify`
 只验证 configured filesystem target 上看得到的 bytes，绝不宣称 provider-side upload 已完成。Drive
 mounted handoff、可选 Drive API、完整状态、resolver 规则、存储结构和失败边界见
 [来源可靠性指南](docs/source-reliability.zh-CN.md)。
 
 每轮 resource backup 还会维护一个容易发现的 Obsidian 总入口：
 `<monitor_obsidian_subdir>/00-资源索引.md`。它链接到每个显式选中群聊自己的
-`00-资源索引.md` 与月度页面。这些文件即使名字里没有 `.generated`，也仍然是
+`00-资源索引.md` 与月度页面。月度页面刻意保持轻量，只显示日期、时间和可点击的链接/文件：
+WeChat 有 observed title 时使用 title；没有 title 时直接把完整 exact URL 作为可见 label。
+sender、hash、source-message identity 和 handoff 详情继续留在私有 catalog，不挤进阅读层。
+这些文件即使名字里没有 `.generated`，也仍然是
 app-owned generated Markdown；只有首选文件名已被猫手写内容占用、程序必须避免覆盖时，
 才会退到 `00-资源索引.generated.md` 或月份 `.generated.md`。
 
@@ -361,7 +368,10 @@ identity，并使用仓库里的 `resources/app_icon.icns`，避免通知中心�
 ```
 
 这里的 `--alias` app 依赖当前源码目录和 `.venv`，适合本机 LaunchAgent /
-系统通知 identity，不是 standalone distributable build。
+系统通知 identity，不是 standalone distributable build。只要这个 app bundle 存在，可选的
+source-guard 与 mounted-resource LaunchAgent 也会调用同一个 app executable 的短命 one-shot
+mode，让定时文件访问归在项目 app identity 下，而不是每 300 秒出现一只新的裸 `Python`。
+纯 source 安装没有 bundle 时，仍保留显式 `.venv/bin/python` fallback。
 
 ## Runtime Data Migration
 
@@ -613,7 +623,7 @@ flowchart LR
   LAUNCHERS["launchers/<br/>Finder entrypoints"]
   ROOTSTART["启动.command<br/>compatibility stub"]
   TESTS["tests/<br/>unittest package"]
-  AGENTS["LaunchAgents<br/>绝对 checkout path"]
+  AGENTS["LaunchAgents<br/>优先 app identity<br/>source Python fallback"]
   BUNDLE["Alias app bundle<br/>checkout + .venv"]
   CLIENTS["MCP clients<br/>绝对 mcp_server.py path"]
 
@@ -628,7 +638,7 @@ flowchart LR
   LAUNCHERS --> SCRIPTS
   SETUP --> BUNDLE
   AGENTS --> BUNDLE
-  AGENTS --> SCRIPTS
+  AGENTS -. "source-only fallback" .-> SCRIPTS
   CLIENTS --> MCP
   TESTS -. "验证" .-> Root
   TESTS -. "验证" .-> Packages

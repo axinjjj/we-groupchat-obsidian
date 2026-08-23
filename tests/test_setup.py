@@ -42,6 +42,9 @@ class SetupPy2AppTests(unittest.TestCase):
     def test_py2app_does_not_package_repository_tests(self):
         self.assertNotIn("tests", self._setup_options()["packages"])
 
+    def test_py2app_packages_background_cli_dispatch_targets(self):
+        self.assertIn("scripts", self._setup_options()["packages"])
+
     def test_setup_py_keeps_dependencies_in_requirements_file(self):
         keywords = self._setup_call_keywords()
 

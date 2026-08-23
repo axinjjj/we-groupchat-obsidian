@@ -190,11 +190,10 @@ Files use structured `message.resources` entries with `kind=file`. The occurrenc
 
 Links and files in the same message share `source_message_id`. This is sufficient to query and display co-occurrence.
 
-No direct link-to-file semantic edge is created in v1. User interfaces must label mixed-message groups as:
-
-```text
-同条消息共同出现，内容关联未确认
-```
+No direct link-to-file semantic edge is created in v1. The durable catalog may
+expose co-occurrence for audit or later confirmation, but the lightweight
+resource-finding index does not need to display sender or a co-occurrence
+disclaimer.
 
 A future explicit relation requires independent evidence such as user confirmation, an evidence span, or byte-identical materialization.
 
@@ -216,17 +215,18 @@ Recommended layout:
 
 The scope-root `00-资源索引.md` links to every selected chat that currently has
 captured occurrences and shows link/file/month counts. Each chat-level
-`00-资源索引.md` contains month links and counts. Monthly notes group resources by source message and show:
+`00-资源索引.md` contains month links and counts. Monthly notes are a lightweight
+reading surface grouped by day and show:
 
 - time;
-- sender;
-- exact link and link identity;
-- file name;
-- local archive state;
-- file SHA-256;
-- local CAS link when available;
-- mounted handoff state;
-- an explicit co-occurrence disclaimer for mixed groups.
+- a clickable observed title when present;
+- otherwise the full exact URL as the visible clickable label;
+- a clickable file name when the CAS or mounted object is available;
+- one short unavailable state only when a file cannot be opened.
+
+Sender, source-message identity, URL identity, hashes, resolution state,
+co-occurrence, and mounted handoff details remain in the private durable
+catalogs and receipts rather than the reading projection.
 
 The index contains references only. It does not copy file bytes into the Obsidian vault.
 
@@ -292,6 +292,11 @@ KeepAlive: absent
 ProcessType: Background
 LowPriorityIO: true
 ```
+
+If the local py2app bundle exists, both the mounted-resource worker and source
+guard use short-lived command modes of its executable. This preserves the
+stable macOS app/TCC identity instead of launching a new bare Python identity on
+every interval. Source-only distributions retain the Python script fallback.
 
 Each wake executes `scripts/resource_backup.py run` once. The process captures
 new occurrences, resolves a bounded number of pending files, refreshes local
@@ -427,6 +432,8 @@ python scripts/resource_backup.py set-selected-chats 1
 python scripts/resource_backup.py set-target "/path/chosen/in/Finder"
 python scripts/resource_backup.py set-link-export-mode redacted
 python scripts/resource_backup.py init
+python scripts/resource_backup.py backfill --all
+python scripts/resource_backup.py backfill --all --apply
 python scripts/resource_backup.py backfill --from YYYY-MM-DD
 python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply
 python scripts/resource_backup.py run --resolve-limit 10
@@ -435,7 +442,8 @@ python scripts/resource_backup.py install-agent --interval-seconds 300
 ```
 
 `init` is from-now only. Re-selection also starts a new from-now epoch. Explicit
-`backfill --apply` does not move that live cursor. `run` remains safe before the target is available: it
+`backfill --apply` does not move that live cursor. `backfill --all` means all
+history still locally readable from known WeChat shards. `run` remains safe before the target is available: it
 captures eligible occurrences and refreshes the local Obsidian index, then
 reports the target state without fabricating a remote success. The final
 `install-agent` step is intentionally separate so code review and canary testing

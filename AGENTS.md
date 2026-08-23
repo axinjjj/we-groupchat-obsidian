@@ -11,6 +11,10 @@
 - `ai/` owns provider adapters; `ui/` owns reusable UI components.
 - `scripts/` contains thin operator and LaunchAgent one-shot entrypoints. Put
   reusable behavior in the owning package rather than duplicating it in a CLI.
+- Scheduled source-guard and mounted-resource jobs prefer one-shot modes of the
+  local py2app executable when it exists, preserving the stable macOS app/TCC
+  identity. The source Python path is a compatibility fallback, not the
+  preferred installed runtime.
 - `launchers/` owns the canonical Finder-friendly `.command` entrypoints. The
   root `启动.command` is a compatibility stub for deployed source-mode
   LaunchAgents and must not grow a second implementation.

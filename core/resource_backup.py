@@ -223,21 +223,12 @@ def _single_line(value, fallback="", limit=240):
     return (text[:limit] or fallback)
 
 
-def _markdown_label(value, fallback="链接"):
-    return (
-        _single_line(value, fallback, 240)
-        .replace("\\", "\\\\")
-        .replace("[", "\\[")
-        .replace("]", "\\]")
-    )
-
-
-def _markdown_inline_code(value, fallback="attachment"):
-    text = _single_line(value, fallback, 240)
-    longest = max((len(match.group(0)) for match in re.finditer(r"`+", text)), default=0)
-    fence = "`" * (longest + 1)
-    padding = " " if text.startswith("`") or text.endswith("`") else ""
-    return f"{fence}{padding}{text}{padding}{fence}"
+def _markdown_label(value, fallback="链接", *, limit=240):
+    text = "".join(" " if ord(char) < 32 else char for char in str(value or ""))
+    text = re.sub(r"\s+", " ", text).strip() or fallback
+    if limit is not None:
+        text = text[:limit]
+    return text.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
 
 
 def _frontmatter_scalar(value):
@@ -1066,20 +1057,6 @@ class MountedResourceBackup:
             "unresolved_files": unresolved_files,
         }
 
-    @staticmethod
-    def _message_groups(rows):
-        groups = []
-        current_key = None
-        current = None
-        for row in rows:
-            key = (row.get("source_message_id"), row.get("source_timestamp"))
-            if key != current_key:
-                current_key = key
-                current = []
-                groups.append(current)
-            current.append(row)
-        return groups
-
     def _render_month(
         self, chat_alias, month, rows, delivery_map, *, target_view=False
     ):
@@ -1089,7 +1066,7 @@ class MountedResourceBackup:
             "---",
             "source_app: we-groupchat-obsidian",
             "source_kind: resource_index",
-            "source_schema_version: 1",
+            "source_schema_version: 2",
             f"source_chat: {_frontmatter_scalar(display_chat)}",
             f"month: {_frontmatter_scalar(display_month)}",
             "---",
@@ -1097,74 +1074,81 @@ class MountedResourceBackup:
             INDEX_MARKER,
             f"# {display_chat} · {display_month} 资源索引",
             "",
-            "> 文件与链接在同一消息块中出现，只表示共同出现；除非另有证据，不代表内容关联。",
+            "> 点击即可打开；详细来源与归档记录保留在本地 catalog。",
             "",
         ]
-        for group in self._message_groups(rows):
-            first = group[0]
-            when = str(first.get("source_time") or "")
-            if not when and first.get("source_timestamp"):
-                when = datetime.fromtimestamp(int(first["source_timestamp"])).strftime("%Y-%m-%d %H:%M")
-            sender = _single_line(
-                first.get("source_sender"), "未知发送者", 80
-            )
-            heading_time = _single_line(
-                when[5:] if len(when) >= 16 else when,
+        current_day = ""
+        for item in rows:
+            when = str(item.get("source_time") or "")
+            if not when and item.get("source_timestamp"):
+                when = datetime.fromtimestamp(
+                    int(item["source_timestamp"])
+                ).strftime("%Y-%m-%d %H:%M")
+            day = _single_line(
+                when[5:10] if len(when) >= 10 else display_month,
                 display_month,
-                40,
+                20,
             )
-            lines.append(f"### {heading_time} · {sender}")
-            lines.append("")
-            kinds = {str(item.get("kind") or "") for item in group}
-            for item in group:
-                if item.get("kind") == "link":
-                    url = (
-                        self._export_url(item.get("observed_url") or "")
-                        if target_view else str(item.get("observed_url") or "")
+            clock = _single_line(
+                when[11:16] if len(when) >= 16 else "",
+                "--:--",
+                10,
+            )
+            if day != current_day:
+                if current_day:
+                    lines.append("")
+                lines.extend([f"## {day}", ""])
+                current_day = day
+
+            if item.get("kind") == "link":
+                url = (
+                    self._export_url(item.get("observed_url") or "")
+                    if target_view else str(item.get("observed_url") or "")
+                )
+                title = str(item.get("original_name") or "").strip()
+                if url:
+                    label_source = title or url
+                    label = _markdown_label(
+                        label_source,
+                        "链接",
+                        limit=240 if title else None,
                     )
-                    label = _markdown_label(item.get("original_name"), "链接")
-                    if url:
-                        lines.append(f"- 链接：[{label}](<{_markdown_url(url)}>)")
-                    else:
-                        lines.append(f"- 链接：{label}（URL 未导出）")
-                    lines.append(f"  - URL identity：`{str(item.get('url_sha256') or '')[:16]}`")
+                    lines.append(
+                        f"- {clock} · 🔗 [{label}](<{_markdown_url(url)}>)"
+                    )
                 else:
-                    name = _markdown_inline_code(
-                        item.get("original_name"), "attachment"
+                    label = _markdown_label(title, "链接")
+                    lines.append(f"- {clock} · 🔗 {label}（URL 未导出）")
+                continue
+
+            name = _markdown_label(item.get("original_name"), "attachment")
+            digest = str(item.get("object_sha256") or "")
+            delivery = delivery_map.get(digest) if digest else None
+            link = ""
+            unavailable = ""
+            if target_view:
+                relpath = str(delivery.get("target_relpath") or "") if delivery else ""
+                if relpath:
+                    link = os.path.join("..", "..", "..", relpath).replace(
+                        os.sep,
+                        "/",
                     )
-                    lines.append(f"- 文件：{name}")
-                    status = str(item.get("status") or "unknown")
-                    lines.append(f"  - 本地归档状态：{status}")
-                    digest = str(item.get("object_sha256") or "")
-                    if digest:
-                        lines.append(f"  - SHA-256：`{digest}`")
-                    delivery = delivery_map.get(digest) if digest else None
-                    if target_view:
-                        relpath = str(delivery.get("target_relpath") or "") if delivery else ""
-                        if relpath:
-                            relative = os.path.join(
-                                "..", "..", "..", relpath
-                            ).replace(os.sep, "/")
-                            lines.append(
-                                f"  - 备份对象：[打开](<{_markdown_url(relative)}>)"
-                            )
-                        lines.append(
-                            "  - Handoff："
-                            + (str(delivery.get("status")) if delivery else "pending")
-                        )
-                    else:
-                        if digest and item.get("object_relpath"):
-                            local_path = os.path.join(
-                                self.archive_root, str(item["object_relpath"])
-                            )
-                            lines.append(f"  - 本地文件：[打开]({_file_url(local_path)})")
-                        lines.append(
-                            "  - Drive handoff："
-                            + (str(delivery.get("status")) if delivery else "pending")
-                        )
-            if len(group) > 1 and len(kinds) > 1:
-                lines.append("- 关系说明：同条消息共同出现，内容关联未确认。")
-            lines.extend(["", f"<!-- source_message_id: {first.get('source_message_id', '')} -->", ""])
+                else:
+                    unavailable = "（待同步）"
+            elif digest and item.get("object_relpath"):
+                local_path = os.path.join(
+                    self.archive_root,
+                    str(item["object_relpath"]),
+                )
+                link = _file_url(local_path)
+            else:
+                unavailable = "（等待本地文件）"
+            if link:
+                lines.append(
+                    f"- {clock} · 📎 [{name}](<{_markdown_url(link)}>)"
+                )
+            else:
+                lines.append(f"- {clock} · 📎 {name}{unavailable}")
         return "\n".join(lines).rstrip() + "\n"
 
     @staticmethod
@@ -1210,7 +1194,7 @@ class MountedResourceBackup:
                 INDEX_MARKER,
                 f"# {_single_line(chat_alias, '未命名群聊', 120)} · 资源索引",
                 "",
-                "> 这里收录显式选中监控群中的链接与文件 occurrence。主题笔记负责解释，资源索引负责寻找。",
+                "> 按月份查看链接与文件。",
                 "",
             ]
             for month in sorted(months, reverse=True):
@@ -1284,7 +1268,7 @@ class MountedResourceBackup:
                 INDEX_MARKER,
                 "# 资源索引",
                 "",
-                "> 这里汇总显式选中资源备份的群聊入口；每个群聊页面再按月份列出链接与文件。",
+                "> 按群聊进入链接与文件清单。",
                 "",
             ]
             for summary in sorted(

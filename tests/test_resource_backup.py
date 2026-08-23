@@ -282,7 +282,7 @@ class ResourceBackupTests(unittest.TestCase):
         self.assertEqual(len(copied_files), 2)
         self.assertFalse(any(unselected_digest in path for path in copied_files))
 
-    def test_resource_index_groups_coobserved_links_and_files_without_copying_bytes(self):
+    def test_resource_index_is_a_light_resource_list_without_sender_or_ledger_details(self):
         capture = self._ready_capture()
         backup = self._backup(capture)
         backup.run()
@@ -305,16 +305,50 @@ class ResourceBackupTests(unittest.TestCase):
         self.assertEqual(len(month_files), 1)
         with open(month_files[0], encoding="utf-8") as handle:
             text = handle.read()
-        self.assertIn("同条消息共同出现，内容关联未确认", text)
-        self.assertIn("https://example.com/A?token=secret-value", text)
-        self.assertIn("report.pdf", text)
-        self.assertIn("Drive handoff：sync_delegated", text)
+        self.assertIn(
+            "[https://example.com/A?token=secret-value]"
+            "(<https://example.com/A?token=secret-value>)",
+            text,
+        )
+        self.assertIn("📎 [report.pdf]", text)
+        self.assertNotIn("Faye", text)
+        self.assertNotIn("URL identity", text)
+        self.assertNotIn("SHA-256", text)
+        self.assertNotIn("Drive handoff", text)
+        self.assertNotIn("同条消息共同出现", text)
+        self.assertNotIn("source_message_id", text)
         vault_files = [
             os.path.join(dirpath, filename)
             for dirpath, _dirs, filenames in os.walk(self.obsidian_root)
             for filename in filenames
         ]
         self.assertTrue(all(path.endswith(".md") for path in vault_files))
+
+    def test_resource_index_prefers_observed_title_and_uses_exact_url_as_fallback(self):
+        capture = self._ready_capture()
+        rows = capture.occurrences()
+        links = [row for row in rows if row["kind"] == "link"]
+        links[0]["original_name"] = "Observed title"
+        links[1]["original_name"] = ""
+        backup = self._backup(capture)
+
+        text = backup._render_month(
+            "猫猫研究群",
+            "2026-08",
+            links,
+            {},
+            target_view=False,
+        )
+
+        self.assertIn(
+            "[Observed title](<https://example.com/A?token=secret-value>)",
+            text,
+        )
+        self.assertIn(
+            "[https://example.com/a?x=1](<https://example.com/a?x=1>)",
+            text,
+        )
+        self.assertNotIn("[链接]", text)
 
     def test_resource_indexes_have_a_discoverable_scope_root(self):
         capture = self._ready_capture()
@@ -1256,6 +1290,25 @@ class ResourceBackupCliTests(unittest.TestCase):
     def test_source_unavailable_is_a_local_state_not_system_exit(self):
         with patch.object(resource_backup_cli, "get_cached_keys", return_value={}):
             self.assertIsNone(resource_backup_cli._source({"db_dir": ""}))
+
+    def test_backfill_all_is_an_explicit_all_history_plan(self):
+        output = io.StringIO()
+        capture = unittest.mock.Mock()
+        capture.backfill.return_value = {
+            "state": "planned",
+            "discovered_links": 3,
+            "inserted_links": 0,
+        }
+        with (
+            patch.object(resource_backup_cli, "load_config", return_value=self.config),
+            patch.object(resource_backup_cli, "_capture", return_value=capture),
+            redirect_stdout(output),
+        ):
+            result = resource_backup_cli.main(["backfill", "--all"])
+
+        self.assertEqual(result, 0)
+        capture.backfill.assert_called_once_with(0, apply=False)
+        self.assertEqual(json.loads(output.getvalue())["state"], "planned")
 
     def test_cli_run_with_source_unavailable_still_handoffs(self):
         output = io.StringIO()

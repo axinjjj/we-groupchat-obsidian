@@ -22,6 +22,20 @@ class ResourceBackupLaunchAgentTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def make_app(self):
+        executable = (
+            self.project
+            / "dist"
+            / "WeGroupchatObsidian.app"
+            / "Contents"
+            / "MacOS"
+            / "WeGroupchatObsidian"
+        )
+        executable.parent.mkdir(parents=True)
+        executable.write_text("#!/bin/sh\n", encoding="utf-8")
+        executable.chmod(0o755)
+        return executable
+
     def tearDown(self):
         self.tmp.cleanup()
 
@@ -30,6 +44,7 @@ class ResourceBackupLaunchAgentTests(unittest.TestCase):
         return subprocess.CompletedProcess([], returncode, stdout="", stderr=stderr)
 
     def test_install_writes_short_lived_background_agent_without_keepalive(self):
+        executable = self.make_app()
         with (
             patch.object(launch_agent.Path, "home", return_value=self.home),
             patch.object(launch_agent, "DATA_DIR", str(self.data_dir)),
@@ -45,6 +60,7 @@ class ResourceBackupLaunchAgentTests(unittest.TestCase):
 
         self.assertEqual(result["state"], "installed")
         self.assertEqual(result["interval_seconds"], 60)
+        self.assertEqual(result["runtime_identity"], "app_bundle")
         self.assertTrue(plist_path.is_file())
         with plist_path.open("rb") as handle:
             payload = plistlib.load(handle)
@@ -52,7 +68,10 @@ class ResourceBackupLaunchAgentTests(unittest.TestCase):
             payload["Label"],
             launch_agent.RESOURCE_BACKUP_LAUNCH_AGENT_LABEL,
         )
-        self.assertEqual(payload["ProgramArguments"][-1], "run")
+        self.assertEqual(
+            payload["ProgramArguments"],
+            [str(executable.resolve()), "--resource-backup-run"],
+        )
         self.assertEqual(payload["WorkingDirectory"], str(self.project.resolve()))
         self.assertTrue(payload["RunAtLoad"])
         self.assertEqual(payload["StartInterval"], 60)
@@ -67,6 +86,23 @@ class ResourceBackupLaunchAgentTests(unittest.TestCase):
         self.assertEqual(run.call_args_list[0].args[0], "launchctl")
         self.assertEqual(run.call_args_list[0].args[1], "bootout")
         self.assertEqual(run.call_args_list[1].args[1], "bootstrap")
+
+    def test_install_falls_back_to_source_python_when_no_app_bundle_exists(self):
+        with (
+            patch.object(launch_agent.Path, "home", return_value=self.home),
+            patch.object(launch_agent, "DATA_DIR", str(self.data_dir)),
+            patch.object(launch_agent, "_run", return_value=self.completed()),
+        ):
+            result = launch_agent.install(self.project, interval_seconds=300)
+            with launch_agent.plist_path().open("rb") as handle:
+                payload = plistlib.load(handle)
+
+        self.assertEqual(result["runtime_identity"], "python")
+        self.assertTrue(payload["ProgramArguments"][0].endswith("/python"))
+        self.assertTrue(
+            payload["ProgramArguments"][1].endswith("scripts/resource_backup.py")
+        )
+        self.assertEqual(payload["ProgramArguments"][2], "run")
 
     def test_install_fails_without_publishing_a_loaded_state(self):
         responses = [self.completed(), self.completed(1, "bootstrap failed")]
@@ -98,6 +134,7 @@ class ResourceBackupLaunchAgentTests(unittest.TestCase):
         self.assertEqual(status["state"], "loaded")
         self.assertTrue(status["installed"])
         self.assertTrue(status["loaded"])
+        self.assertEqual(status["runtime_identity"], "python")
         self.assertEqual(removed["state"], "uninstalled")
         self.assertEqual(removed_again["state"], "uninstalled")
         self.assertFalse(plist_path.exists())

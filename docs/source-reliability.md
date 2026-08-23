@@ -34,6 +34,11 @@ runs one check, takes a non-blocking lock, persists a small private state file,
 and exits. If `WE_GROUPCHAT_OBSIDIAN_DATA_DIR` is set when the plist is built,
 the LaunchAgent preserves that override explicitly.
 
+When `dist/WeGroupchatObsidian.app` exists, the plist invokes its
+`--source-guard-run` one-shot mode so macOS attributes protected-folder access
+to the stable project app identity. Source-only installations retain the
+`.venv/bin/python scripts/wechat_source_guard_agent.py` fallback.
+
 Process-list availability is proven by inspecting the guard process itself; it
 does not depend on whether a normal user session can see the system `launchd`.
 Source freshness uses exact stats for cached known `message/` shard paths and
@@ -271,6 +276,8 @@ the worker never recreates a missing mount path.
 .venv/bin/python scripts/resource_backup.py set-target "<existing-mounted-directory>"
 .venv/bin/python scripts/resource_backup.py set-link-export-mode redacted
 .venv/bin/python scripts/resource_backup.py init
+.venv/bin/python scripts/resource_backup.py backfill --all
+.venv/bin/python scripts/resource_backup.py backfill --all --apply
 .venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD
 .venv/bin/python scripts/resource_backup.py backfill --from YYYY-MM-DD --apply
 .venv/bin/python scripts/resource_backup.py status
@@ -281,7 +288,10 @@ the worker never recreates a missing mount path.
 
 `init` seeds from-now cursors only. Re-selecting a removed chat creates a new
 private selection epoch and skips the unselected gap. Historical backfill is a
-separate dry-plan/apply command and does not move live cursors. `run` captures deterministic occurrences,
+separate dry-plan/apply command and does not move live cursors. `backfill --all`
+starts at timestamp zero and therefore means all history still available in the
+known local WeChat message shards, not an assurance about provider-retained
+remote history. `run` captures deterministic occurrences,
 resolves due files into the shared CAS, refreshes local Obsidian indexes even
 when the target is unavailable, and then attempts mounted handoff.
 
@@ -328,7 +338,9 @@ short-lived scheduler can be installed explicitly:
 
 The agent uses `RunAtLoad` plus `StartInterval`, `ProcessType=Background`, and
 `LowPriorityIO`, with no `KeepAlive`. Each wake runs one bounded process and
-exits. Installing it is an activation action; merging source does not install it.
+exits. When the local app bundle exists it invokes `--resource-backup-run`
+through that executable; source-only installs retain the Python CLI fallback.
+Installing it is an activation action; merging source does not install it.
 
 ## 5. Optional advanced direct selected-chat Google Drive API sync
 

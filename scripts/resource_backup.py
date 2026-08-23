@@ -113,7 +113,13 @@ def build_parser():
     sub.add_parser("init")
     sub.add_parser("scan")
     backfill = sub.add_parser("backfill")
-    backfill.add_argument("--from", dest="from_date", required=True)
+    backfill_scope = backfill.add_mutually_exclusive_group(required=True)
+    backfill_scope.add_argument("--from", dest="from_date")
+    backfill_scope.add_argument(
+        "--all",
+        action="store_true",
+        help="Scan all locally available history for the selected chats.",
+    )
     backfill.add_argument("--apply", action="store_true")
     resolve = sub.add_parser("resolve")
     resolve.add_argument("--limit", type=int, default=50)
@@ -231,7 +237,8 @@ def main(argv=None):
         result = _capture(config, source=True).scan()
     elif args.command == "backfill":
         result = _capture(config, source=True).backfill(
-            _from_timestamp(args.from_date), apply=args.apply
+            0 if args.all else _from_timestamp(args.from_date),
+            apply=args.apply,
         )
     elif args.command == "resolve":
         result = _capture(config).resolve_pending_files(limit=max(1, args.limit))
