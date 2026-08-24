@@ -608,7 +608,8 @@ class WeGroupchatObsidianApp(rumps.App):
     def _build_resource_backup_menu(self):
         menu = rumps.MenuItem("🔗 资源索引与本地备份")
         try:
-            status = self._resource_capture_service().status()
+            capture_service = self._resource_capture_service()
+            status = capture_service.status()
             counts = status.get("counts") or {}
             links = sum(
                 int(count or 0)
@@ -622,15 +623,35 @@ class WeGroupchatObsidianApp(rumps.App):
             )
             pending = int(status.get("pending_files") or 0)
             selected = int(status.get("selected_chats") or 0)
+            backup_status = MountedResourceBackup.from_config(
+                self.config,
+                capture=capture_service,
+            ).status()
+            coverage = backup_status.get("coverage") or {}
+            delivered_objects = int(coverage.get("delivered_objects") or 0)
+            delivered_occurrences = int(
+                coverage.get("delivered_occurrences") or 0
+            )
+            if "non_delivered_occurrences" in coverage:
+                pending = int(coverage.get("non_delivered_occurrences") or 0)
         except Exception:
             links = files = pending = selected = 0
+            delivered_objects = delivered_occurrences = 0
         enabled = bool(self.config.get("resource_backup_enabled", False))
         resolve_files = bool(self._resource_file_resolution_session_enabled)
         menu.add(rumps.MenuItem(
             f"状态: {'后台更新已开启' if enabled else '后台更新已关闭'}"
         ))
         menu.add(rumps.MenuItem(
-            f"群聊: {selected} · 链接: {links} · 文件: {files} · 待解析: {pending}"
+            f"群聊: {selected} · 链接: {links} · 附件记录: {files}"
+        ))
+        menu.add(rumps.MenuItem(
+            f"已备份: {delivered_objects} 个文件 · "
+            f"{delivered_occurrences} 次出现 · 待补齐: {pending} 条"
+        ))
+        menu.add(rumps.MenuItem(
+            "附件解析: 本次会话已允许" if resolve_files
+            else "附件解析: 本次会话未允许"
         ))
         menu.add(rumps.separator)
         menu.add(rumps.MenuItem(
@@ -842,13 +863,26 @@ class WeGroupchatObsidianApp(rumps.App):
             (backup.get("obsidian") or {}).get("state") or "unknown"
         )
         handoff_state = str(backup.get("state") or "unknown")
-        completed = evaluate_resource_backup_outcome(capture, backup)["completed"]
+        outcome = evaluate_resource_backup_outcome(capture, backup)
+        coverage = outcome.get("coverage") or {}
+        backlog = int(coverage.get("non_delivered_occurrences") or 0)
+        if not outcome["operational_success"]:
+            title = "本轮未完成"
+        elif outcome["coverage_complete"]:
+            title = "更新完成"
+        elif int(backup.get("copied") or 0) or int(resolve.get("ready_local") or 0):
+            title = "附件备份有进展"
+        else:
+            title = "索引已更新，附件仍待补齐"
         _notify(
             "资源索引与本地备份",
-            "更新完成" if completed else "本轮未完成",
+            title,
             f"新增链接 {int(scan.get('captured_links') or 0)} · "
             f"新增文件 {int(scan.get('captured_files') or 0)} · "
             f"本地文件 {int(resolve.get('ready_local') or 0)} · "
+            f"已备份 {int(coverage.get('delivered_objects') or 0)} 个文件 / "
+            f"{int(coverage.get('delivered_occurrences') or 0)} 次出现 · "
+            f"待补齐 {backlog} 条 · "
             f"capture={capture_state} · projection={projection_state} · "
             f"handoff={handoff_state}",
         )

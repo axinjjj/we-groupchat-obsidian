@@ -85,10 +85,26 @@ class AppResourceBackupTests(unittest.TestCase):
             "selected_chats": 1,
         }
         app._resource_capture_service = Mock(return_value=capture)
+        backup = Mock()
+        backup.status.return_value = {
+            "coverage": {
+                "delivered_objects": 5,
+                "delivered_occurrences": 8,
+                "non_delivered_occurrences": 3,
+            },
+        }
 
-        menu = app._build_resource_backup_menu()
+        with patch(
+            "app.MountedResourceBackup.from_config", return_value=backup
+        ):
+            menu = app._build_resource_backup_menu()
 
         self.assertIn("📂 在 Finder 打开文件备份", set(menu.keys()))
+        self.assertIn(
+            "已备份: 5 个文件 · 8 次出现 · 待补齐: 3 条",
+            set(menu.keys()),
+        )
+        self.assertIn("附件解析: 本次会话未允许", set(menu.keys()))
 
     def test_open_file_backup_entry_reveals_the_generated_portal(self):
         app = self.make_app()
@@ -306,6 +322,40 @@ class AppResourceBackupTests(unittest.TestCase):
                 },
             }, True)
         self.assertEqual(notify.call_args.args[1], "更新完成")
+
+        pending_backup = {
+            "state": "pending_resources",
+            "obsidian": {"state": "written"},
+            "coverage": {
+                "delivered_objects": 2,
+                "delivered_occurrences": 3,
+                "non_delivered_occurrences": 4,
+            },
+            "coverage_complete": False,
+        }
+        healthy_capture = {
+            "state": "healthy",
+            "scan": {"state": "healthy"},
+            "resolve": {"state": "skipped"},
+        }
+        with patch("app._notify") as notify:
+            app._finish_resource_backup_run({
+                "capture": healthy_capture,
+                "backup": pending_backup,
+            }, True)
+        self.assertEqual(
+            notify.call_args.args[1],
+            "索引已更新，附件仍待补齐",
+        )
+        self.assertIn("已备份 2 个文件 / 3 次出现", notify.call_args.args[2])
+        self.assertIn("待补齐 4 条", notify.call_args.args[2])
+
+        with patch("app._notify") as notify:
+            app._finish_resource_backup_run({
+                "capture": healthy_capture,
+                "backup": {**pending_backup, "copied": 1},
+            }, True)
+        self.assertEqual(notify.call_args.args[1], "附件备份有进展")
 
 
 if __name__ == "__main__":

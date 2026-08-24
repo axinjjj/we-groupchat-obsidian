@@ -81,8 +81,10 @@ monitor checkpoint 倒退成“没处理过”。
 - 输出包括 immutable CAS object、privacy-bounded catalog snapshot、Markdown resource
   indexes 和 receipts；GC 只删除 manifest-owned generated paths。
 - Mounted 根部的 00-打开微信资源备份.md 是人类入口；菜单也可以直接在 Finder reveal。
-  文件专属页面按群聊/月分组，只链接既有 CAS object，不复制第二份 bytes，并把待解析
-  occurrence 与已备份文件分开显示。
+  入口下有文件备份、待补齐附件和资源总索引三套平行 view。文件备份按群聊/月列已交付
+  digest，每个 object 一行并显示 occurrence 次数；待补齐页按 queued、cache unavailable、retry、
+  local-space、attention、awaiting-handoff 与 unknown 分组，不生成 target link。三套 view 共用
+  同一个 coverage classifier，且不复制第二份 bytes。
 
 另有两个独立 advanced lane：
 

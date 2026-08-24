@@ -235,27 +235,39 @@ catalogs and receipts rather than the reading projection.
 
 The index contains references only. It does not copy file bytes into the Obsidian vault.
 
-The mounted target additionally exposes a file-only human view:
+The mounted target additionally exposes three parallel human views:
 
 ```text
 <target>/wgo-resource-backup/
   00-打开微信资源备份.md
   v3/views/
     00-文件备份.md
+    00-待补齐附件.md
+    00-资源索引.md
     <chat>/
       00-文件备份.md
       文件备份/<month>.md
+      00-待补齐附件.md
+      待补齐附件/<month>.md
+      00-资源索引.md
+      资源索引/<month>.md
 ```
 
-The namespace-root portal links to both the file-only view and the combined
-resource view. File-only pages group occurrences by selected chat and month,
-show ready and unresolved counts separately, and link each ready occurrence to
-its existing mounted CAS object. They must not duplicate payload bytes or use
+The namespace-root portal links to the delivered-file view, the pending-attachment
+view, and the combined resource view. Delivered pages include only occurrences
+with `ready_local` capture state plus a valid `sync_delegated` delivery. Monthly
+delivered pages are object-centric: one clickable row per digest, a deterministic
+primary filename, optional alternate names, and the number of source occurrences.
+Pending-only chats do not appear in the delivered root. Pending pages contain no
+target links and group every non-delivered occurrence by the shared surface state.
+`waiting_cache` says that resolution was attempted and the local cache was not
+found, with the concrete instruction to reopen or download the attachment in
+WeChat before retrying. Terminal states are described as needing attention, not
+as waiting. The views must not duplicate payload bytes or use
 symlinks, hardlinks, Finder aliases, or provider-specific shortcuts as a second
-storage representation. An unresolved occurrence remains visibly pending and
-must not be described as backed up. The menu-bar app provides a direct Finder
-reveal action for the managed portal. Counts label file occurrences separately
-from distinct delivered digests. These are portable relative Markdown links on
+storage representation. The menu-bar app provides a direct Finder reveal action
+for the managed portal. Counts label file occurrences separately from distinct
+delivered digests. These are portable relative Markdown links on
 the mounted filesystem; the lane does not promise provider-native Drive-web
 rendering or shortcuts.
 
@@ -265,7 +277,8 @@ Every generated index contains an app ownership marker. A managed file normally
 uses the clean preferred name without a `.generated` suffix. If the preferred
 scope-root, chat-root, or monthly path already contains a user-authored file
 without that marker, the worker preserves it and writes a sibling such as
-`00-资源索引.generated.md`, `00-文件备份.generated.md`, or
+`00-资源索引.generated.md`, `00-文件备份.generated.md`,
+`00-待补齐附件.generated.md`, or
 `2026-08.generated.md`. Parent navigation must
 point to the actual generated filename. Two unmanaged collisions fail closed
 rather than overwriting either file.
@@ -284,7 +297,7 @@ mount. Local generated directories reject symlink/non-directory descendants
 before any managed write.
 
 Local Obsidian projection manifests remain v1. Mounted target-view manifests
-are v2 and own the combined mixed plus file-only path set; the renderer reads a
+are v2 and own the combined, delivered, and pending path sets; the renderer reads a
 legacy target v1 once and rewrites it as v2 under the existing target lock.
 Older renderers therefore fail closed on the unknown target v2 schema instead
 of treating file-only pages as stale v1 paths. The namespace-root portal is a
@@ -292,6 +305,15 @@ separate marker-owned singleton: only its preferred and `.generated.md`
 candidates are reconciled, and arbitrary namespace files are never scanned or
 collected. The portal is written last, after the combined target views and v2
 manifest succeed.
+
+When a pre-manifest projection is encountered, one adoption pass examines only
+the exact app-owned root/chat page names and `YYYY-MM(.generated).md` files one
+level below the known `资源索引`, `文件备份`, or `待补齐附件` directories. It reads
+at most a 16 KiB prefix, rejects symlinks, non-regular/binary files and unknown
+path shapes, and requires the exact ownership marker. If frontmatter exists it
+must bind `source_app: we-groupchat-obsidian` and an allowed generated
+`source_kind`; marker-only legacy text remains accepted at a known shape. A
+successful render immediately returns the surface to manifest-bound GC.
 
 Capture construction performs no SQLite write. Capture schema/archive identity
 are initialized only inside the capture operation lock, while backup delivery
@@ -319,10 +341,13 @@ The mounted lane writes under an app-owned namespace:
       COMPLETE
     views/
       00-文件备份.md
+      00-待补齐附件.md
       00-资源索引.md
       <chat>/
         00-文件备份.md
         文件备份/<month>.md
+        00-待补齐附件.md
+        待补齐附件/<month>.md
         00-资源索引.md
         资源索引/<month>.md
 ```
@@ -398,8 +423,8 @@ target_failed
 ```
 
 `pending_resources` means the catalog is current but at least one eligible file
-occurrence has not reached `ready_local`, so the worker must not claim that all
-intended bytes were handed off.
+occurrence is not delivered under the shared surface classifier, so the worker
+must not claim that all intended bytes were handed off.
 
 `sync_delegated` means:
 
@@ -412,6 +437,34 @@ uploaded
 remote_verified
 remote_checksum_verified
 ```
+
+Every file occurrence is classified centrally as one of:
+
+```text
+delivered             = ready_local + valid mounted delivery
+awaiting_resolution   = queued
+cache_unavailable     = waiting_cache
+retry_scheduled       = retry_wait
+local_space_blocked   = insufficient_local_space
+needs_attention       = ambiguous / object_too_large / source_rejected
+awaiting_handoff      = structurally valid ready_local without valid delivery
+unknown_state         = unknown or structurally invalid state
+```
+
+A valid mounted delivery binds digest and logical size to a relative path inside
+the backup root and passes metadata-only `lstat`: regular, non-symlink, matching
+size. Ordinary classification, rendering, `plan`, and `status` do not hash target
+bytes or open the source CAS. Explicit `verify` retains full target hashing.
+
+App/CLI reporting keeps the existing strict `completed` and CLI exit contract for
+compatibility, and adds `operational_success`, `coverage_complete`, and `coverage`.
+`operational_success` accepts a healthy capture/scan/resolution/projection cycle
+whose handoff is `idle`, `sync_delegated`, or `pending_resources`.
+`coverage_complete` is true only when no file occurrence remains outside
+`delivered`. The additive coverage object reports delivered occurrence/object
+counts and a count for every non-delivered surface state. Thus
+`pending_resources` truthfully means “catalog/index updated; attachment-byte
+coverage incomplete,” without relabeling a normal backlog as an operational error.
 
 ## 12. Snapshot contract
 

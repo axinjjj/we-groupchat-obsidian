@@ -284,20 +284,24 @@ selection digest，并且不重新扫描 source。`backfill --all` 表示 known 
     snapshots/<snapshot-id>/{manifest.json,resources.jsonl,COMPLETE}
     views/
       00-文件备份.md
+      00-待补齐附件.md
       00-资源索引.md
-      <chat>/{00-文件备份.md,文件备份/<month>.md,00-资源索引.md,资源索引/<month>.md}
+      <chat>/{00-文件备份.md,文件备份/<month>.md,00-待补齐附件.md,待补齐附件/<month>.md,00-资源索引.md,资源索引/<month>.md}
 ```
 
 根部 portal 是人类入口，菜单栏的 `📂 在 Finder 打开文件备份` 也会直接 reveal 它。
-文件专属页面只链接 mounted CAS 中那一份 bytes，不复制 payload，并把 ready 与 unresolved
-occurrence 分开计数、分开显示，也区分去重后的 unique digest。Target views 使用一个合并的 v2
-ownership manifest，本地 Obsidian 仍是 v1；根部 portal 是独立 marker-owned singleton，只在
+`文件备份` 只列已交付文件：每个 digest 一行，另列 occurrence 次数，并只链接 mounted CAS 中
+那一份 bytes。`待补齐附件` 不生成 target link，会按尚未尝试、cache unavailable、retry、
+本地空间、需处理、awaiting handoff 与 unknown 分组。Target views 使用一个合并的 v2
+ownership manifest 管理三套 family，本地 Obsidian 仍是 v1；根部 portal 是独立 marker-owned singleton，只在
 views 与 manifest 成功后最后写入。这些 portable relative Markdown links 不承诺 provider-native
 Drive-web rendering。
 
 从 pre-manifest projection format 升级时，系统只会在一次 reconciliation 中 adopt 带 exact
-app-generated index marker 的历史生成文件，保留所有无 marker 的人类文件，并立即写入正常
-ownership manifest；之后的 GC 仍完全由 manifest 约束。
+app-generated index marker 的历史生成文件，而且只检查已知 root/chat 页面与三种 generated directory
+下一层的合法月份文件。每个 candidate 最多读取 16 KiB text prefix；symlink、binary、未知 shape 或
+不合法 generated frontmatter 都被拒绝。其他人类文件不会被扫描，成功后立即写入正常 ownership
+manifest；之后的 GC 仍完全由 manifest 约束。
 
 Plan 与 run 都拒绝 filesystem root、与本地 source 相同/嵌套/祖先关系的 target、configured-target
 symlink，以及 planned object、snapshot、view、chat-index directory chain 中的 symlink/non-directory
@@ -313,6 +317,18 @@ placeholder；`plan` 与 `status` 也使用同一 metadata-only check。显式 `
 upload 或 remote checksum verification。如果仍有 eligible file unresolved，系统可以发布 hash-bound
 `COMPLETE` catalog snapshot，但 run state 必须是 `pending_resources`，manifest 记录
 `snapshot_completeness=catalog_complete`，CLI 非零退出。`COMPLETE` 绑定 catalog，不会凭空补出缺失 bytes。
+
+所有 surface 共用一套 classifier：`ready_local` 加有效 mounted receipt 才是 delivered；`queued`、
+`waiting_cache`、`retry_wait`、`insufficient_local_space` 分别映射到对应 backlog；`ambiguous`、
+`object_too_large`、`source_rejected` 是需要处理；有合法本地 object 但没有有效 delivery 是 awaiting
+handoff；未知或结构损坏的 row 保持 unknown。Receipt validation 绑定 digest、logical size 与 backup root
+内 relative path，普通轮次只做 metadata `lstat`（regular、non-symlink、size 匹配），不 hash target bytes，
+也不打开 source CAS；显式 `verify` 继续完整 rehash。
+
+兼容用的 `completed` 与 CLI exit code 保持严格；新增 `operational_success`、`coverage_complete` 与
+`coverage`，分别说明 capture/projection/handoff 本轮是否健康，以及附件 occurrence 是否已经全部 delivered。
+因此健康的 `pending_resources` 表示 catalog/index 已更新但 attachment-byte coverage 尚未完整，不再被通知
+文案误写成普通 operational failure。
 
 Ordinary status 只有在 current catalog、target objects、有效 latest `COMPLETE`、link mode 与 manifest
 全部一致时才报告 `sync_delegated`。Snapshot 缺失或 object pending 时报告 `pending`，file unresolved 时报告
@@ -347,9 +363,10 @@ File-byte resolution 默认关闭，必须经菜单确认，或在当前 CLI run
 还会重新检查，关闭后下一份文件立即停止。
 旧 resource LaunchAgent 可被检测和移除，但新安装会因同一 process-lifetime consent 原因被拒绝。
 
-手动通知只有在 nested source scan 明确 healthy、capture healthy、resolution healthy 或因未授权而显式 skipped、本地 projection 成功，
-且 handoff 为 `idle` / `sync_delegated` 时才写“更新完成”。Source、resolution、projection 或 target 任一
-phase degraded、`worker_busy` 或 unknown 都会报告未完成，不会压扁成 success。
+手动通知会区分三种健康结果：coverage 完整时写“更新完成”；本轮健康但仍有 backlog 时写“索引已更新，
+附件仍待补齐”；新解析或复制出 bytes 时报告进展。Source、resolution、projection 或 target 任一 phase
+degraded、`worker_busy` 或 unknown 仍会报告未完成，不会压扁成 success。菜单同时显示 delivered object 数、
+delivered occurrence 数、backlog 数和本次 session 的附件解析授权状态。
 
 ## 5. 可选 advanced selected-chat Google Drive API 直传
 

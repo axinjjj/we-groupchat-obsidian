@@ -126,8 +126,10 @@ Its most important boundaries are:
   to an existing mounted folder such as Google Drive for Desktop. A
   `sync_delegated` receipt proves target bytes, not provider-side upload.
   Each run also maintains a conspicuous `00-打开微信资源备份.md` portal at the
-  mounted backup root, with a file-only chat/month view that links to the one
-  shared CAS copy and separates unresolved files from backed-up files.
+  mounted backup root. Parallel `文件备份`, `待补齐附件`, and `资源索引` views
+  separate delivered bytes from every unresolved/attention state. Delivered
+  month pages list one row per digest plus occurrence counts and link to the one
+  shared CAS copy; pending pages never expose a target link.
   Scan, backfill, projection, and handoff hold canonical selection under the
   capture lock; real-output-root and target locks serialize aliases and
   cross-database writers. Busy, unknown, or nested failure states fail closed
@@ -447,13 +449,22 @@ are written.
 The mounted target has a separate human-facing entrypoint at
 `<target>/wgo-resource-backup/00-打开微信资源备份.md`; the menu-bar command
 `📂 在 Finder 打开文件备份` reveals it directly. Its `文件备份` pages contain
-files only, grouped by selected chat and month. Ready rows link to the existing
-CAS object, while unresolved rows remain visibly marked as pending. The view
-does not duplicate payload bytes, and its “可打开” count still proves only the
-mounted filesystem handoff—not provider-side cloud synchronization. Counts
-distinguish occurrences from unique deduplicated objects. These are portable
-relative Markdown links; this provider-neutral lane does not claim native
-Google Drive web rendering or Drive shortcuts.
+only delivered files, grouped by selected chat and month; each digest appears
+once with its occurrence count and links to the existing CAS object. A separate
+`待补齐附件` family groups queued, cache-unavailable, retry, local-space,
+attention, awaiting-handoff, and unknown records without clickable target
+links. The portal reports unique delivered objects, delivered occurrences, and
+the pending-state breakdown. “Delivered” still proves only mounted filesystem
+handoff—not provider-side cloud synchronization. These are portable relative
+Markdown links; this provider-neutral lane does not claim native Google Drive
+web rendering or Drive shortcuts.
+
+App and CLI output use that same coverage classifier. The compatibility
+`completed` flag and CLI exit code remain strict; additive
+`operational_success`, `coverage_complete`, and `coverage` fields distinguish a
+healthy index/handoff cycle with a normal attachment backlog from a real source,
+projection, or target failure. Ordinary receipt-backed status reads metadata
+only; explicit `verify` remains the full target-byte audit.
 
 ### Guarded exact relation Markdown cleanup
 

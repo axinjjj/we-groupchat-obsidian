@@ -333,23 +333,28 @@ The mounted namespace is:
     snapshots/<snapshot-id>/{manifest.json,resources.jsonl,COMPLETE}
     views/
       00-文件备份.md
+      00-待补齐附件.md
       00-资源索引.md
-      <chat>/{00-文件备份.md,文件备份/<month>.md,00-资源索引.md,资源索引/<month>.md}
+      <chat>/{00-文件备份.md,文件备份/<month>.md,00-待补齐附件.md,待补齐附件/<month>.md,00-资源索引.md,资源索引/<month>.md}
 ```
 
 The root portal is the human entrypoint and is also revealed by the menu-bar
-action `📂 在 Finder 打开文件备份`. File-only pages link to the one mounted CAS
-copy; they do not duplicate payload bytes. Ready and unresolved occurrences
-are counted and displayed separately from unique delivered digests. Target
-views use one combined v2 ownership manifest; local Obsidian remains v1. The
+action `📂 在 Finder 打开文件备份`. Delivered-file pages link to the one mounted
+CAS copy, one row per digest with a separate occurrence count. Pending pages
+contain no target links and group the real backlog as awaiting resolution,
+cache unavailable, retry scheduled, local-space blocked, needs attention,
+awaiting handoff, or unknown. Target views use one combined v2 ownership
+manifest for all three families; local Obsidian remains v1. The
 root portal is a separately marked singleton written only after the target
 views and manifest succeed. These portable relative Markdown links do not
 promise provider-native Drive-web rendering.
 
 For upgrades from the pre-manifest projection format, one reconciliation pass
-adopts only files carrying the exact app-generated index marker, preserves every
-unmarked user file, and immediately writes the normal ownership manifest. All
-later GC remains manifest-bound.
+examines only known root/chat pages and valid month filenames one level below
+the three generated directories. It reads at most a 16 KiB text prefix, rejects
+symlinks, binary/unknown-shaped files, and invalid generated frontmatter, and
+requires the exact app marker. It preserves every other user file and immediately
+writes the normal ownership manifest. All later GC remains manifest-bound.
 
 Plan and run reject filesystem-root, same/nested/ancestor local-source targets,
 a symlink configured target, and a symlink or non-directory in the app-owned
@@ -372,6 +377,22 @@ catalog may still publish a hash-bound `COMPLETE` snapshot, but the run state is
 `pending_resources`, the manifest says `snapshot_completeness=catalog_complete`,
 and the CLI exits non-zero. `COMPLETE` binds the catalog; it does not fabricate
 missing bytes.
+
+All surfaces consume one classifier: `ready_local` plus a valid mounted receipt
+is delivered; `queued`, `waiting_cache`, `retry_wait`, and
+`insufficient_local_space` map to their corresponding backlog states;
+`ambiguous`, `object_too_large`, and `source_rejected` need attention; a valid
+local object without valid delivery awaits handoff; unknown/structurally invalid
+rows remain unknown. Receipt validation binds digest/size/path and uses only
+metadata `lstat` (regular, non-symlink, matching size). It does not hash target
+bytes or open source CAS; explicit `verify` still performs full hashing.
+
+The compatibility `completed` flag and CLI exit code remain strict. Additive
+`operational_success`, `coverage_complete`, and `coverage` fields report whether
+the capture/projection/handoff cycle was healthy separately from whether every
+attachment occurrence was delivered. Thus a healthy `pending_resources` cycle
+means the catalog/index was updated while attachment-byte coverage remains
+incomplete, not that the operation itself failed.
 
 Ordinary status reports `sync_delegated` only when the current catalog, target
 objects, valid latest `COMPLETE`, link mode, and manifest all agree. A missing
@@ -417,12 +438,13 @@ file immediately. Old resource
 LaunchAgent installs are detected and removable, but new installation is
 refused for the same process-lifetime consent reason.
 
-Manual “update complete” notifications require an explicitly healthy nested
-source scan, healthy capture, healthy or
-explicitly skipped resolution, successful local projection, and an `idle` or
-`sync_delegated` handoff. Any degraded source, resolution, projection, or target
-phase, `worker_busy`, or unknown state is reported as incomplete rather than
-flattened into success.
+Manual notifications distinguish three healthy results: full coverage says
+“update complete”; a healthy backlog says the index was updated and attachments
+remain to be completed; newly resolved/copied bytes report progress. Any
+degraded source, resolution, projection, or target phase, `worker_busy`, or
+unknown state is still reported as incomplete rather than flattened into
+success. The menu shows delivered object count, delivered occurrence count,
+backlog count, and the current session-only attachment parsing state.
 
 ## 5. Optional advanced direct selected-chat Google Drive API sync
 

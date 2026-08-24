@@ -340,6 +340,11 @@ def main(argv=None):
         ).plan()
     elif args.command == "status":
         capture = _capture(config)
+        backup_status = _backup(
+            config,
+            capture=capture,
+            link_export_mode=args.link_export_mode,
+        ).status()
         result = {
             "state": "ok",
             "settings": {
@@ -350,11 +355,9 @@ def main(argv=None):
                 "runtime": "long_lived_app",
             },
             "capture": capture.status(),
-            "backup": _backup(
-                config,
-                capture=capture,
-                link_export_mode=args.link_export_mode,
-            ).status(),
+            "coverage": backup_status.get("coverage") or {},
+            "coverage_complete": bool(backup_status.get("coverage_complete")),
+            "backup": backup_status,
             "launch_agent": resource_backup_agent_status(),
         }
     elif args.command == "run":
@@ -378,6 +381,9 @@ def main(argv=None):
         result = {
             "state": outcome["state"],
             "completed": outcome["completed"],
+            "operational_success": outcome["operational_success"],
+            "coverage_complete": outcome["coverage_complete"],
+            "coverage": outcome["coverage"],
             "capture": capture_result,
             "backup": backup_result,
         }

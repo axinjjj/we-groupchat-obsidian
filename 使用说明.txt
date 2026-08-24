@@ -106,7 +106,10 @@ archive；Obsidian note 可以链接到私有归档 object，但附件 bytes 不
   source guard 和 MCP 真实发送；不要因为看到命令存在就把它们当成已经启用。
 - Mounted target 只证明目标 filesystem bytes/readback，不证明云端 provider 已上传。
 - 每轮 mounted backup 会维护 wgo-resource-backup/00-打开微信资源备份.md；也可从菜单
-  “在 Finder 打开文件备份”直接进入。文件页只链接唯一 CAS copy，待解析项不会冒充已备份。
+  “在 Finder 打开文件备份”直接进入。入口分成“文件备份”“待补齐附件”“资源索引”：
+  文件备份只列真正已交付的去重文件，并显示群聊出现次数；待补齐页按真实状态分组且没有
+  target link。看到“本地缓存暂未找到”时，先在微信里重新打开或下载附件，再点立即更新。
+  “已备份”只表示 mounted target 已交付并即时校验，不表示 provider 云端同步已经完成。
 - 历史 resource backfill 先生成 bounded plan，再用同一个未过期 run_id apply；
   不会在确认后重新无限 rescan。
 - MCP 读取会把本机 chat-derived data 暴露给 MCP client。真实发送默认 disabled，

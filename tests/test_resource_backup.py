@@ -17,15 +17,18 @@ from unittest.mock import Mock, patch
 
 import scripts.resource_backup as resource_backup_cli
 from core.resource_backup import (
+    FILE_SURFACE_STATES,
     LOCAL_INDEX_MANIFEST_SCHEMA,
     MountedResourceBackup,
     TARGET_INDEX_MANIFEST_SCHEMA,
     _markdown_relative_url,
     _redact_url,
     _safe_month,
+    classify_file_occurrence,
     evaluate_resource_backup_outcome,
     load_resource_backup_settings,
     save_resource_backup_settings,
+    summarize_file_coverage,
 )
 from core.resource_capture import (
     ResourceCaptureError,
@@ -281,6 +284,82 @@ class ResourceBackupTests(unittest.TestCase):
             link_export_mode=mode,
         )
 
+    def test_file_surface_classifier_maps_capture_and_delivery_states(self):
+        rows = []
+        capture_states = (
+            ("ready_local", "delivered", "a"),
+            ("ready_local", "awaiting_handoff", "b"),
+            ("queued", "awaiting_resolution", ""),
+            ("waiting_cache", "cache_unavailable", ""),
+            ("retry_wait", "retry_scheduled", ""),
+            ("insufficient_local_space", "local_space_blocked", ""),
+            ("ambiguous", "needs_attention", ""),
+            ("object_too_large", "needs_attention", ""),
+            ("source_rejected", "needs_attention", ""),
+            ("future_state", "unknown_state", ""),
+            ("ready_local", "unknown_state", ""),
+        )
+        for index, (capture_state, _expected, digest_prefix) in enumerate(
+            capture_states
+        ):
+            rows.append({
+                "kind": "file",
+                "status": capture_state,
+                "object_sha256": digest_prefix * 64 if digest_prefix else "",
+                "object_size": (
+                    3 if capture_state == "ready_local" and digest_prefix else None
+                ),
+                "occurrence_id": f"occurrence-{index}",
+            })
+        deliveries = {"a" * 64: {"status": "sync_delegated"}}
+
+        actual = [
+            classify_file_occurrence(
+                row,
+                deliveries.get(str(row.get("object_sha256") or "")),
+            )
+            for row in rows
+        ]
+        coverage = summarize_file_coverage(rows, deliveries)
+
+        self.assertEqual(actual, [item[1] for item in capture_states])
+        self.assertEqual(coverage["delivered_occurrences"], 1)
+        self.assertEqual(coverage["delivered_objects"], 1)
+        self.assertEqual(coverage["needs_attention"], 3)
+        self.assertEqual(coverage["non_delivered_occurrences"], 10)
+        self.assertEqual(
+            set(FILE_SURFACE_STATES),
+            {key for key in coverage if key in FILE_SURFACE_STATES},
+        )
+
+    def test_pending_month_uses_truthful_waiting_cache_and_terminal_wording(self):
+        backup = self._backup(self._capture())
+        rows = [
+            {
+                "kind": "file",
+                "status": "waiting_cache",
+                "original_name": "cache.pdf",
+                "source_time": "2026-08-23 10:31",
+            },
+            {
+                "kind": "file",
+                "status": "source_rejected",
+                "original_name": "rejected.pdf",
+                "source_time": "2026-08-23 10:32",
+            },
+        ]
+
+        text = backup._render_pending_file_month(
+            "猫猫研究群", "2026-08", rows, {}
+        )
+
+        self.assertIn("本地缓存暂未找到（1）", text)
+        self.assertIn("已经尝试解析", text)
+        self.assertIn("在微信里重新打开或下载", text)
+        self.assertIn("需要处理（1）", text)
+        self.assertNotIn("等待本地附件解析", text)
+        self.assertNotIn("](<", text)
+
     def test_scope_is_active_monitor_intersection_explicit_selection(self):
         capture = self._capture()
         chats = capture.selected_chats()
@@ -385,9 +464,10 @@ class ResourceBackupTests(unittest.TestCase):
             portal = handle.read()
         self.assertIn("# 微信资源备份 / WeChat Resource Backup", portal)
         self.assertIn("v3/views/00-文件备份.md", unquote(portal))
-        self.assertIn("2 条可打开", portal)
-        self.assertIn("2 个去重文件", portal)
-        self.assertIn("0 条待解析", portal)
+        self.assertIn("v3/views/00-待补齐附件.md", unquote(portal))
+        self.assertIn("2 个文件已备份", portal)
+        self.assertIn("出现 2 次", portal)
+        self.assertIn("0 条附件记录待补齐", portal)
         self.assertIn("系统目录", portal)
 
         target_views = os.path.join(backup.backup_root, "views")
@@ -396,7 +476,7 @@ class ResourceBackupTests(unittest.TestCase):
             scope_text = handle.read()
         self.assertIn("# 文件备份", scope_text)
         self.assertIn("猫猫研究群", scope_text)
-        self.assertIn("2 条可打开 · 0 条待解析", scope_text)
+        self.assertIn("2 个去重文件 · 2 次出现", scope_text)
 
         chat_root = os.path.join(target_views, "猫猫研究群")
         with open(
@@ -405,14 +485,15 @@ class ResourceBackupTests(unittest.TestCase):
         ) as handle:
             chat_text = handle.read()
         self.assertIn("文件备份/2026-08.md", unquote(chat_text))
-        self.assertIn("2 条可打开 · 0 条待解析", chat_text)
+        self.assertIn("2 个去重文件 · 2 次出现", chat_text)
 
         month_path = os.path.join(chat_root, "文件备份", "2026-08.md")
         with open(month_path, encoding="utf-8") as handle:
             month_text = handle.read()
-        self.assertIn("## 已备份，可点击打开（2）", month_text)
+        self.assertIn("2 个去重文件 · 2 次出现", month_text)
         self.assertIn("[report.pdf]", month_text)
         self.assertIn("../../../objects/sha256/", month_text)
+        self.assertNotIn("待补齐", month_text)
         self.assertNotIn("🔗", month_text)
 
         objects_root = os.path.join(backup.backup_root, "objects", "sha256")
@@ -431,6 +512,7 @@ class ResourceBackupTests(unittest.TestCase):
         self.assertEqual(target_manifest["schema"], TARGET_INDEX_MANIFEST_SCHEMA)
         self.assertTrue(any("00-资源索引.md" in path for path in target_manifest["paths"]))
         self.assertTrue(any("00-文件备份.md" in path for path in target_manifest["paths"]))
+        self.assertTrue(any("00-待补齐附件.md" in path for path in target_manifest["paths"]))
 
         local_manifest_path = os.path.join(
             backup.obsidian_projection_root,
@@ -457,21 +539,53 @@ class ResourceBackupTests(unittest.TestCase):
         )
         with open(portal_path, encoding="utf-8") as handle:
             portal = handle.read()
-        self.assertIn("0 条可打开", portal)
-        self.assertIn("2 条待解析", portal)
+        self.assertIn("0 个文件已备份", portal)
+        self.assertIn("2 条附件记录待补齐", portal)
+        self.assertIn("尚未尝试解析：2 条", portal)
 
         month_path = os.path.join(
             backup.backup_root,
             "views",
             "猫猫研究群",
-            "文件备份",
+            "待补齐附件",
             "2026-08.md",
         )
         with open(month_path, encoding="utf-8") as handle:
             month_text = handle.read()
-        self.assertIn("## 尚未备份（2）", month_text)
-        self.assertIn("等待本地附件解析", month_text)
+        self.assertIn("## 尚未尝试解析（2）", month_text)
         self.assertNotIn("../../../objects/sha256/", month_text)
+        self.assertNotIn("](<", month_text)
+        self.assertFalse(os.path.exists(os.path.join(
+            backup.backup_root,
+            "views",
+            "猫猫研究群",
+            "00-文件备份.md",
+        )))
+
+    def test_mixed_delivery_writes_disjoint_delivered_and_pending_families(self):
+        capture = self._capture()
+        capture.initialize_selected_chat_cursors(start_timestamp=0)
+        capture.scan()
+        resolved = capture.resolve_pending_files(limit=1)
+        self.assertEqual(resolved["ready_local"], 1)
+        backup = self._backup(capture)
+
+        result = backup.run()
+
+        self.assertEqual(result["state"], "pending_resources")
+        self.assertEqual(result["coverage"]["delivered_occurrences"], 1)
+        self.assertEqual(result["coverage"]["awaiting_resolution"], 1)
+        chat_root = os.path.join(backup.backup_root, "views", "猫猫研究群")
+        delivered_path = os.path.join(chat_root, "文件备份", "2026-08.md")
+        pending_path = os.path.join(chat_root, "待补齐附件", "2026-08.md")
+        with open(delivered_path, encoding="utf-8") as handle:
+            delivered = handle.read()
+        with open(pending_path, encoding="utf-8") as handle:
+            pending = handle.read()
+        self.assertIn("1 个去重文件 · 1 次出现", delivered)
+        self.assertNotIn("尚未尝试解析", delivered)
+        self.assertIn("尚未尝试解析（1）", pending)
+        self.assertNotIn("../../../objects/sha256/", pending)
 
     def test_link_only_chat_does_not_get_an_empty_file_page(self):
         message = self._selected_message()
@@ -547,6 +661,7 @@ class ResourceBackupTests(unittest.TestCase):
         self.assertEqual(migrated["schema"], TARGET_INDEX_MANIFEST_SCHEMA)
         self.assertTrue(any("00-资源索引.md" in path for path in migrated["paths"]))
         self.assertTrue(any("00-文件备份.md" in path for path in migrated["paths"]))
+        self.assertTrue(any("00-待补齐附件.md" in path for path in migrated["paths"]))
 
     def test_manifestless_legacy_indexes_are_adopted_without_touching_user_files(self):
         capture = self._ready_capture()
@@ -583,6 +698,80 @@ class ResourceBackupTests(unittest.TestCase):
             ) as handle:
                 self.assertEqual(handle.read(), "user-owned\n")
 
+    def test_legacy_adoption_does_not_open_marker_bearing_files_at_unknown_shapes(self):
+        backup = self._backup(self._capture())
+        root = os.path.join(backup.obsidian_projection_root, "legacy-projection")
+        os.makedirs(root)
+        known = os.path.join(root, "00-资源索引.md")
+        unknown = os.path.join(root, "human-marker.md")
+        with open(known, "w", encoding="utf-8") as handle:
+            handle.write("<!-- we-groupchat-obsidian:resource-index v1 -->\n")
+        with open(unknown, "w", encoding="utf-8") as handle:
+            handle.write("<!-- we-groupchat-obsidian:resource-index v1 -->\n")
+            handle.write("human-owned\n" * 10000)
+
+        with patch.object(
+            backup,
+            "_read_legacy_projection_prefix",
+            wraps=backup._read_legacy_projection_prefix,
+        ) as read_prefix:
+            paths = backup._managed_projection_paths(root, target_view=False)
+
+        opened = {call.args[0] for call in read_prefix.call_args_list}
+        self.assertEqual(paths, {"00-资源索引.md"})
+        self.assertIn(known, opened)
+        self.assertNotIn(unknown, opened)
+
+    def test_legacy_adoption_reads_at_most_16_kib_and_rejects_binary(self):
+        backup = self._backup(self._capture())
+        root = os.path.join(backup.obsidian_projection_root, "legacy-binary")
+        os.makedirs(root)
+        path = os.path.join(root, "00-文件备份.md")
+        with open(path, "wb") as handle:
+            handle.write(b"\0<!-- we-groupchat-obsidian:resource-index v1 -->")
+            handle.write(b"x" * 100000)
+        original_read = os.read
+
+        with patch(
+            "core.resource_backup.os.read",
+            side_effect=lambda fd, size: original_read(fd, size),
+        ) as read_call:
+            paths = backup._managed_projection_paths(root, target_view=False)
+
+        self.assertEqual(paths, set())
+        self.assertEqual(read_call.call_args.args[1], 16 * 1024)
+
+    def test_legacy_frontmatter_must_bind_app_and_allowed_source_kind(self):
+        backup = self._backup(self._capture())
+        root = os.path.join(backup.obsidian_projection_root, "legacy-frontmatter")
+        os.makedirs(root)
+        path = os.path.join(root, "00-待补齐附件.md")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(
+                "---\nsource_app: another-app\n"
+                "source_kind: pending_attachment_index\n---\n"
+                "<!-- we-groupchat-obsidian:resource-index v1 -->\n"
+            )
+
+        self.assertEqual(
+            backup._managed_projection_paths(root, target_view=False),
+            set(),
+        )
+
+    def test_legacy_adoption_rejects_known_shape_symlinks(self):
+        backup = self._backup(self._capture())
+        root = os.path.join(backup.obsidian_projection_root, "legacy-symlink")
+        os.makedirs(root)
+        outside = os.path.join(self.root, "outside-index.md")
+        with open(outside, "w", encoding="utf-8") as handle:
+            handle.write("<!-- we-groupchat-obsidian:resource-index v1 -->\n")
+        os.symlink(outside, os.path.join(root, "00-资源索引.md"))
+
+        self.assertEqual(
+            backup._managed_projection_paths(root, target_view=False),
+            set(),
+        )
+
     def test_deselecting_all_chats_reconciles_target_views_but_keeps_objects(self):
         capture = self._ready_capture()
         canonical = dict(self.config)
@@ -607,8 +796,8 @@ class ResourceBackupTests(unittest.TestCase):
         self.assertTrue(all(os.path.isfile(path) for path in object_files))
         with open(backup.existing_target_portal_path(), encoding="utf-8") as handle:
             portal = handle.read()
-        self.assertIn("0 条可打开", portal)
-        self.assertIn("0 条待解析", portal)
+        self.assertIn("0 个文件已备份", portal)
+        self.assertIn("0 条附件记录待补齐", portal)
 
     def test_file_view_escapes_labels_encodes_hrefs_and_rejects_bad_months(self):
         capture = self._ready_capture()
@@ -650,6 +839,39 @@ class ResourceBackupTests(unittest.TestCase):
             reserved[("reserved-chat-key", "00-文件备份.md")],
             "00-文件备份.md--reserved",
         )
+
+    def test_delivered_month_deduplicates_object_rows_and_preserves_occurrence_count(self):
+        backup = self._backup(self._capture())
+        digest = "d" * 64
+        rows = [
+            {
+                "kind": "file",
+                "status": "ready_local",
+                "object_sha256": digest,
+                "original_name": "report.pdf",
+            },
+            {
+                "kind": "file",
+                "status": "ready_local",
+                "object_sha256": digest,
+                "original_name": "报告.pdf",
+            },
+        ]
+        delivery = {
+            "status": "sync_delegated",
+            "object_sha256": digest,
+            "object_size": 3,
+            "target_relpath": "objects/sha256/dd/report.pdf",
+        }
+
+        text = backup._render_file_month(
+            "猫猫研究群", "2026-08", rows, {digest: delivery}
+        )
+
+        self.assertEqual(text.count("../../../objects/sha256/dd/report.pdf"), 1)
+        self.assertIn("1 个去重文件 · 2 次出现", text)
+        self.assertIn("出现 2 次", text)
+        self.assertIn("其他名称", text)
 
     def test_resource_index_is_a_light_resource_list_without_sender_or_ledger_details(self):
         capture = self._ready_capture()
@@ -1789,6 +2011,33 @@ class ResourceBackupTests(unittest.TestCase):
         self.assertEqual(outcome["state"], "worker_busy")
         self.assertEqual(outcome["scan_state"], "worker_busy")
 
+    def test_shared_outcome_separates_operational_success_from_coverage(self):
+        coverage = {
+            "delivered_occurrences": 3,
+            "delivered_objects": 2,
+            "non_delivered_occurrences": 4,
+            "awaiting_resolution": 4,
+        }
+        outcome = evaluate_resource_backup_outcome(
+            {
+                "state": "healthy",
+                "scan": {"state": "healthy"},
+                "resolve": {"state": "skipped"},
+            },
+            {
+                "state": "pending_resources",
+                "obsidian": {"state": "written"},
+                "coverage": coverage,
+                "coverage_complete": False,
+            },
+        )
+
+        self.assertFalse(outcome["completed"])
+        self.assertTrue(outcome["operational_success"])
+        self.assertFalse(outcome["coverage_complete"])
+        self.assertEqual(outcome["coverage"], coverage)
+        self.assertEqual(outcome["state"], "pending_resources")
+
     def test_file_state_compare_and_set_cannot_overwrite_newer_success(self):
         capture = self._capture()
         capture.initialize_selected_chat_cursors(start_timestamp=0)
@@ -2876,6 +3125,45 @@ class ResourceBackupCliTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         capture.run.assert_called_once_with(resolve_limit=50, resolve_files=False)
+        payload = json.loads(output.getvalue())
+        self.assertTrue(payload["completed"])
+        self.assertTrue(payload["operational_success"])
+        self.assertTrue(payload["coverage_complete"])
+
+    def test_cli_run_reports_healthy_pending_coverage_without_changing_exit_contract(self):
+        output = io.StringIO()
+        capture = Mock()
+        capture.run.return_value = {
+            "state": "healthy",
+            "scan": {"state": "healthy"},
+            "resolve": {"state": "skipped"},
+        }
+        coverage = {
+            "delivered_objects": 2,
+            "delivered_occurrences": 3,
+            "non_delivered_occurrences": 4,
+        }
+        backup = Mock()
+        backup.run.return_value = {
+            "state": "pending_resources",
+            "obsidian": {"state": "written"},
+            "coverage": coverage,
+            "coverage_complete": False,
+        }
+        with (
+            patch.object(resource_backup_cli, "load_config", return_value=self.config),
+            patch.object(resource_backup_cli, "_capture", return_value=capture),
+            patch.object(resource_backup_cli, "_backup", return_value=backup),
+            redirect_stdout(output),
+        ):
+            exit_code = resource_backup_cli.main(["run"])
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 2)
+        self.assertFalse(payload["completed"])
+        self.assertTrue(payload["operational_success"])
+        self.assertFalse(payload["coverage_complete"])
+        self.assertEqual(payload["coverage"], coverage)
 
 
 if __name__ == "__main__":

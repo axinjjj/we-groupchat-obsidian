@@ -37,6 +37,51 @@ TARGET_PORTAL_NAME = "00-打开微信资源备份.md"
 INDEX_MANIFEST_NAME = ".resource-index-manifest.json"
 LOCAL_INDEX_MANIFEST_SCHEMA = "we-groupchat-obsidian.resource-index-manifest.v1"
 TARGET_INDEX_MANIFEST_SCHEMA = "we-groupchat-obsidian.resource-index-manifest.v2"
+FILE_SURFACE_STATES = (
+    "delivered",
+    "awaiting_resolution",
+    "cache_unavailable",
+    "retry_scheduled",
+    "local_space_blocked",
+    "needs_attention",
+    "awaiting_handoff",
+    "unknown_state",
+)
+FILE_SURFACE_LABELS = {
+    "delivered": "已备份",
+    "awaiting_resolution": "尚未尝试解析",
+    "cache_unavailable": "本地缓存暂未找到",
+    "retry_scheduled": "稍后自动重试",
+    "local_space_blocked": "本地空间不足",
+    "needs_attention": "需要处理",
+    "awaiting_handoff": "已归档，待写入备份目录",
+    "unknown_state": "状态异常，需要检查",
+}
+FILE_CAPTURE_TO_SURFACE = {
+    "queued": "awaiting_resolution",
+    "waiting_cache": "cache_unavailable",
+    "retry_wait": "retry_scheduled",
+    "insufficient_local_space": "local_space_blocked",
+    "ambiguous": "needs_attention",
+    "object_too_large": "needs_attention",
+    "source_rejected": "needs_attention",
+}
+LEGACY_PROJECTION_PREFIX_LIMIT = 16 * 1024
+LEGACY_PROJECTION_PAGE_NAMES = {
+    "00-资源索引.md",
+    "00-资源索引.generated.md",
+    "00-文件备份.md",
+    "00-文件备份.generated.md",
+    "00-待补齐附件.md",
+    "00-待补齐附件.generated.md",
+}
+LEGACY_PROJECTION_DIRS = {"资源索引", "文件备份", "待补齐附件"}
+LEGACY_SOURCE_KINDS = {
+    "resource_index",
+    "file_backup_index",
+    "pending_attachment_index",
+}
+LEGACY_MONTH_NAME_RE = re.compile(r"^\d{4}-(?:0[1-9]|1[0-2])(?:\.generated)?\.md$")
 PROJECTION_LOCK_DIR = os.path.join(DATA_DIR, "resource-projection-locks")
 DESTINATION_MARKER_NAME = ".wgo-destination.json"
 DESTINATION_MARKER_SCHEMA = "we-groupchat-obsidian.destination.v1"
@@ -70,6 +115,56 @@ class ResourceBackupError(RuntimeError):
         self.code = str(code)
 
 
+def classify_file_occurrence(occurrence, validated_delivery=None):
+    """Map one file occurrence onto the shared human-facing surface state.
+
+    ``validated_delivery`` must already have passed the mounted destination's
+    receipt, path and metadata-only checks.  Keeping filesystem validation at
+    the owning backup instance leaves this classifier pure and makes every UI
+    surface consume exactly the same state vocabulary.
+    """
+    occurrence = occurrence or {}
+    if str(occurrence.get("kind") or "") != "file":
+        return "unknown_state"
+    capture_state = str(occurrence.get("status") or "")
+    if capture_state == "ready_local":
+        digest = str(occurrence.get("object_sha256") or "")
+        try:
+            object_size = int(occurrence.get("object_size"))
+        except (TypeError, ValueError):
+            object_size = -1
+        if not re.fullmatch(r"[0-9a-f]{64}", digest) or object_size < 0:
+            return "unknown_state"
+        return "delivered" if validated_delivery else "awaiting_handoff"
+    return FILE_CAPTURE_TO_SURFACE.get(capture_state, "unknown_state")
+
+
+def summarize_file_coverage(occurrences, validated_deliveries=None):
+    """Return additive occurrence/object coverage from validated receipts."""
+    validated_deliveries = validated_deliveries or {}
+    counts = {state: 0 for state in FILE_SURFACE_STATES}
+    delivered_digests = set()
+    total = 0
+    for occurrence in occurrences or ():
+        if str(occurrence.get("kind") or "") != "file":
+            continue
+        total += 1
+        digest = str(occurrence.get("object_sha256") or "")
+        delivery = validated_deliveries.get(digest) if digest else None
+        surface_state = classify_file_occurrence(occurrence, delivery)
+        counts[surface_state] += 1
+        if surface_state == "delivered" and digest:
+            delivered_digests.add(digest)
+    non_delivered = total - counts["delivered"]
+    return {
+        "total_file_occurrences": total,
+        "delivered_occurrences": counts["delivered"],
+        "delivered_objects": len(delivered_digests),
+        "non_delivered_occurrences": non_delivered,
+        **counts,
+    }
+
+
 def evaluate_resource_backup_outcome(capture_result, backup_result):
     """Return one shared success decision for app and CLI reporting."""
     capture_result = capture_result or {}
@@ -85,6 +180,23 @@ def evaluate_resource_backup_outcome(capture_result, backup_result):
         (backup_result.get("obsidian") or {}).get("state") or "unknown"
     )
     handoff_state = str(backup_result.get("state") or "unknown")
+    coverage = backup_result.get("coverage") or {}
+    if "coverage_complete" in backup_result:
+        coverage_complete = bool(backup_result.get("coverage_complete"))
+    elif coverage:
+        coverage_complete = int(
+            coverage.get("non_delivered_occurrences") or 0
+        ) == 0
+    else:
+        # Preserve compatibility for older callers that predate coverage.
+        coverage_complete = handoff_state in {"idle", "sync_delegated"}
+    operational_success = (
+        capture_state == "healthy"
+        and scan_state == "healthy"
+        and resolve_state in {"healthy", "skipped"}
+        and projection_state in {"written", "unchanged"}
+        and handoff_state in {"idle", "sync_delegated", "pending_resources"}
+    )
     completed = (
         capture_state == "healthy"
         and scan_state == "healthy"
@@ -106,6 +218,9 @@ def evaluate_resource_backup_outcome(capture_result, backup_result):
         state = handoff_state
     return {
         "completed": completed,
+        "operational_success": operational_success,
+        "coverage_complete": coverage_complete,
+        "coverage": coverage,
         "state": state,
         "capture_state": capture_state,
         "scan_state": scan_state,
@@ -921,6 +1036,7 @@ class MountedResourceBackup:
             planned.add(os.path.join(chat_root, "资源索引"))
             if identity in chats_with_files:
                 planned.add(os.path.join(chat_root, "文件备份"))
+                planned.add(os.path.join(chat_root, "待补齐附件"))
         for path in sorted(planned):
             relative = os.path.relpath(path, self.backup_root)
             current = self.backup_root
@@ -1146,40 +1262,106 @@ class MountedResourceBackup:
             changed = self._projection_text_if_changed(actual_path, text)
         return actual_path, changed
 
+    @staticmethod
+    def _read_legacy_projection_prefix(path):
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(path, flags)
+        except OSError:
+            return b""
+        try:
+            mode = os.fstat(fd).st_mode
+            if not stat.S_ISREG(mode):
+                return b""
+            return os.read(fd, LEGACY_PROJECTION_PREFIX_LIMIT)
+        except OSError:
+            return b""
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _legacy_projection_prefix_is_owned(data):
+        if not data or b"\0" in data or INDEX_MARKER.encode("utf-8") not in data:
+            return False
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+        if not text.startswith("---\n"):
+            return True
+        end = text.find("\n---\n", 4)
+        if end < 0:
+            return False
+        frontmatter = {}
+        for line in text[4:end].splitlines():
+            key, separator, value = line.partition(":")
+            if separator:
+                frontmatter[key.strip()] = value.strip().strip("'\"")
+        return (
+            frontmatter.get("source_app") == "we-groupchat-obsidian"
+            and frontmatter.get("source_kind") in LEGACY_SOURCE_KINDS
+        )
+
+    def _legacy_projection_candidates(self, base_root):
+        """Adopt only marker-bearing files at known pre-manifest shapes."""
+        if not os.path.isdir(base_root) or os.path.islink(base_root):
+            return set()
+        candidates = set()
+
+        def consider(path):
+            try:
+                mode = os.lstat(path).st_mode
+            except OSError:
+                return
+            if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+                return
+            if self._legacy_projection_prefix_is_owned(
+                self._read_legacy_projection_prefix(path)
+            ):
+                candidates.add(
+                    os.path.relpath(path, base_root).replace(os.sep, "/")
+                )
+
+        for name in LEGACY_PROJECTION_PAGE_NAMES:
+            consider(os.path.join(base_root, name))
+        try:
+            root_entries = list(os.scandir(base_root))
+        except OSError:
+            return candidates
+        for entry in root_entries:
+            try:
+                is_chat_dir = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+            if not is_chat_dir:
+                continue
+            chat_root = entry.path
+            for name in LEGACY_PROJECTION_PAGE_NAMES:
+                consider(os.path.join(chat_root, name))
+            for directory_name in LEGACY_PROJECTION_DIRS:
+                month_root = os.path.join(chat_root, directory_name)
+                try:
+                    if os.path.islink(month_root) or not os.path.isdir(month_root):
+                        continue
+                    month_entries = list(os.scandir(month_root))
+                except OSError:
+                    continue
+                for month_entry in month_entries:
+                    if LEGACY_MONTH_NAME_RE.fullmatch(month_entry.name):
+                        consider(month_entry.path)
+        return candidates
+
     def _managed_projection_paths(self, base_root, *, target_view):
         if not target_view:
             self._ensure_projection_dir(base_root)
         manifest_path = os.path.join(base_root, INDEX_MANIFEST_NAME)
         if not os.path.lexists(manifest_path):
-            legacy_paths = set()
-            if os.path.isdir(base_root):
-                for root, dirs, files in os.walk(base_root, followlinks=False):
-                    dirs[:] = [
-                        name for name in dirs
-                        if not os.path.islink(os.path.join(root, name))
-                    ]
-                    for name in files:
-                        path = os.path.join(root, name)
-                        try:
-                            data = (
-                                self._read_regular_bytes(path)
-                                if target_view
-                                else MountedResourceBackup._read_regular_bytes(
-                                    path,
-                                    error_code="projection_file_conflict",
-                                )
-                            )
-                        except ResourceBackupError:
-                            continue
-                        if INDEX_MARKER.encode("utf-8") in data:
-                            legacy_paths.add(
-                                os.path.relpath(path, base_root).replace(os.sep, "/")
-                            )
             # Pre-manifest releases still marked every generated index with the
-            # exact app ownership marker. Adopt only those files for one
-            # reconciliation pass; unmarked user files never enter managed GC.
-            # A successful render immediately writes the normal manifest.
-            return legacy_paths
+            # exact app ownership marker.  Adoption is deliberately limited to
+            # known root/chat/month shapes and a 16 KiB text prefix; arbitrary
+            # descendants are never scanned or hydrated.  A successful render
+            # immediately writes the normal bound manifest.
+            return self._legacy_projection_candidates(base_root)
         try:
             data = (
                 self._read_regular_bytes(manifest_path)
@@ -1245,16 +1427,7 @@ class MountedResourceBackup:
                 continue
             if not target_view:
                 self._ensure_projection_dir(os.path.dirname(path))
-            try:
-                data = (
-                    self._read_regular_bytes(path)
-                    if target_view
-                    else MountedResourceBackup._read_regular_bytes(
-                        path, error_code="projection_file_conflict"
-                    )
-                )
-            except ResourceBackupError:
-                continue
+            data = self._read_legacy_projection_prefix(path)
             if INDEX_MARKER.encode("utf-8") not in data:
                 continue
             try:
@@ -1750,43 +1923,57 @@ class MountedResourceBackup:
         delivery = delivery_map.get(digest) if digest else None
         relpath = str(delivery.get("target_relpath") or "") if delivery else ""
         target_path = os.path.join(self.backup_root, relpath) if relpath else ""
+        try:
+            delivery_size = int(delivery.get("object_size")) if delivery else -1
+            occurrence_size = int(item.get("object_size"))
+        except (TypeError, ValueError):
+            return None
         if (
             not delivery
             or str(delivery.get("status") or "") != "sync_delegated"
-            or int(delivery.get("object_size") or -1)
-            != int(item.get("object_size") or -2)
+            or str(delivery.get("object_sha256") or "") != digest
+            or delivery_size != occurrence_size
             or not relpath
             or os.path.isabs(relpath)
             or not _within(target_path, self.backup_root)
         ):
             return None
+        try:
+            target_stat = os.lstat(target_path)
+        except OSError:
+            return None
+        if (
+            stat.S_ISLNK(target_stat.st_mode)
+            or not stat.S_ISREG(target_stat.st_mode)
+            or int(target_stat.st_size) != occurrence_size
+        ):
+            return None
         return delivery
 
-    def _file_delivery_counts(self, rows, delivery_map):
-        ready = 0
-        pending = 0
+    def _validated_delivery_map(self, rows, delivery_map=None):
+        delivery_map = delivery_map if delivery_map is not None else self._delivery_map()
+        validated = {}
         for item in rows:
-            if item.get("kind") != "file":
+            digest = str(item.get("object_sha256") or "")
+            if not digest or digest in validated:
                 continue
-            if self._ready_delivery(item, delivery_map):
-                ready += 1
-            else:
-                pending += 1
-        return ready, pending
+            delivery = self._ready_delivery(item, delivery_map)
+            if delivery:
+                validated[digest] = delivery
+        return validated
+
+    def _file_coverage(self, rows, delivery_map=None):
+        validated = self._validated_delivery_map(rows, delivery_map)
+        return summarize_file_coverage(rows, validated), validated
 
     def _render_file_month(self, chat_alias, month, rows, delivery_map):
         display_chat = _single_line(chat_alias, "未命名群聊", 120)
         display_month = _single_line(month, "未标月份", 20)
-        ready = []
-        pending = []
+        grouped = defaultdict(list)
         for item in rows:
-            if item.get("kind") != "file":
-                continue
-            delivery = self._ready_delivery(item, delivery_map)
-            if delivery:
-                ready.append((item, delivery))
-            else:
-                pending.append(item)
+            digest = str(item.get("object_sha256") or "")
+            if item.get("kind") == "file" and digest and delivery_map.get(digest):
+                grouped[digest].append(item)
         lines = [
             "---",
             "source_app: we-groupchat-obsidian",
@@ -1799,44 +1986,102 @@ class MountedResourceBackup:
             INDEX_MARKER,
             f"# {_markdown_heading(display_chat)} · {_markdown_heading(display_month)} 文件备份",
             "",
-            "> 这里仅列文件；“已备份”只表示 bytes 已写入并即时校验到当前挂载目录，不表示云端同步完成。",
-            "> 同一份 bytes 只保存在系统 CAS 中，点击文件名即可打开。",
+            "> 这里只列已经交付到当前挂载目录的文件；不表示云端 provider 已完成远端同步。",
+            "> 每个去重文件只列一行；“出现次数”表示它在群聊记录中被引用了多少次，bytes 不会因此重复保存。",
             "",
-            f"## 已备份，可点击打开（{len(ready)}）",
+            f"**{len(grouped)} 个去重文件 · {sum(len(items) for items in grouped.values())} 次出现**",
             "",
         ]
-        if ready:
-            for item, delivery in ready:
-                name = _markdown_label(item.get("original_name"), "attachment")
-                when = _single_line(
-                    item.get("source_time"),
-                    display_month,
-                    32,
+        if grouped:
+            for digest in sorted(grouped):
+                items = grouped[digest]
+                names = sorted(
+                    {
+                        _single_line(item.get("original_name"), "attachment", 240)
+                        for item in items
+                    },
+                    key=lambda value: (value.casefold(), value),
                 )
+                primary = _markdown_label(names[0], "attachment")
+                alternatives = [
+                    _markdown_label(name, "attachment") for name in names[1:]
+                ]
+                delivery = delivery_map[digest]
                 link = os.path.join(
                     "..",
                     "..",
                     "..",
                     str(delivery["target_relpath"]),
                 ).replace(os.sep, "/")
+                suffix = f" · 出现 {len(items)} 次"
+                if alternatives:
+                    suffix += " · 其他名称：" + "、".join(alternatives)
                 lines.append(
-                    f"- {when} · 📎 [{name}](<{_markdown_relative_url(link)}>)"
+                    f"- 📎 [{primary}](<{_markdown_relative_url(link)}>)"
+                    f"{suffix}"
                 )
         else:
             lines.append("本月还没有已备份文件。")
-        lines.extend(["", f"## 尚未备份（{len(pending)}）", ""])
-        if pending:
-            for item in pending:
-                name = _markdown_label(item.get("original_name"), "attachment")
-                when = _single_line(
-                    item.get("source_time"),
-                    display_month,
-                    32,
-                )
-                lines.append(f"- {when} · 📎 {name}（等待本地附件解析）")
-        else:
-            lines.append("没有待解析文件。")
         return "\n".join(lines).rstrip() + "\n"
+
+    def _render_pending_file_month(self, chat_alias, month, rows, delivery_map):
+        display_chat = _single_line(chat_alias, "未命名群聊", 120)
+        display_month = _single_line(month, "未标月份", 20)
+        grouped = defaultdict(list)
+        for item in rows:
+            if item.get("kind") != "file":
+                continue
+            digest = str(item.get("object_sha256") or "")
+            state = classify_file_occurrence(
+                item,
+                delivery_map.get(digest) if digest else None,
+            )
+            if state != "delivered":
+                grouped[state].append(item)
+        lines = [
+            "---",
+            "source_app: we-groupchat-obsidian",
+            "source_kind: pending_attachment_index",
+            "source_schema_version: 1",
+            f"source_chat: {_frontmatter_scalar(display_chat)}",
+            f"month: {_frontmatter_scalar(display_month)}",
+            "---",
+            "",
+            INDEX_MARKER,
+            f"# {_markdown_heading(display_chat)} · {_markdown_heading(display_month)} 待补齐附件",
+            "",
+            "> 这里是尚未交付到备份目录的附件记录，只显示真实状态，不提供文件链接。",
+            "> “本地缓存暂未找到”表示已经尝试解析；请先在微信里重新打开或下载该附件，再重试更新。",
+            "",
+        ]
+        for state in FILE_SURFACE_STATES:
+            items = grouped.get(state) or []
+            if not items or state == "delivered":
+                continue
+            lines.extend([f"## {FILE_SURFACE_LABELS[state]}（{len(items)}）", ""])
+            for item in sorted(
+                items,
+                key=lambda value: (
+                    int(value.get("source_timestamp") or 0),
+                    str(value.get("source_message_id") or ""),
+                    int(value.get("resource_index") or 0),
+                ),
+            ):
+                name = _markdown_label(item.get("original_name"), "attachment")
+                when = _single_line(item.get("source_time"), display_month, 32)
+                lines.append(f"- {when} · 📎 {name}")
+            lines.append("")
+        if not any(grouped.values()):
+            lines.append("本月没有待补齐附件。")
+        return "\n".join(lines).rstrip() + "\n"
+
+    @staticmethod
+    def _coverage_breakdown(coverage):
+        return [
+            (state, FILE_SURFACE_LABELS[state], int(coverage.get(state) or 0))
+            for state in FILE_SURFACE_STATES
+            if state != "delivered" and int(coverage.get(state) or 0)
+        ]
 
     @staticmethod
     def _chat_path_parts(occurrences):
@@ -1853,6 +2098,8 @@ class MountedResourceBackup:
             for name in (
                 "00-文件备份.md",
                 "00-文件备份.generated.md",
+                "00-待补齐附件.md",
+                "00-待补齐附件.generated.md",
                 "00-资源索引.md",
                 "00-资源索引.generated.md",
             )
@@ -1883,7 +2130,10 @@ class MountedResourceBackup:
                 _safe_month(row.get("source_month"))
             ].append(row)
         chat_parts = self._chat_path_parts(occurrences)
-        delivery_map = self._delivery_map() if target_view else {}
+        if target_view:
+            _coverage, delivery_map = self._file_coverage(occurrences)
+        else:
+            delivery_map = {}
         written = 0
         managed_paths = []
         chat_summaries = []
@@ -1892,24 +2142,21 @@ class MountedResourceBackup:
             chat_root = os.path.join(base_root, chat_part)
             index_dir = os.path.join(chat_root, "资源索引")
             file_index_dir = os.path.join(chat_root, "文件备份")
+            pending_index_dir = os.path.join(chat_root, "待补齐附件")
             chat_rows = [row for rows in months.values() for row in rows]
-            chat_has_files = any(
-                row.get("kind") == "file" for row in chat_rows
-            )
             if target_view:
                 self._ensure_target_dir(index_dir)
-                if chat_has_files:
-                    self._ensure_target_dir(file_index_dir)
             else:
                 self._ensure_projection_dir(index_dir)
             index_lines = [
                 INDEX_MARKER,
                 f"# {_markdown_heading(chat_alias, '未命名群聊', limit=120)} · 资源索引",
                 "",
-                "> 按月份查看链接与文件。",
+                "> 按月份查看链接与全部附件记录。",
                 "",
             ]
             file_month_summaries = []
+            pending_month_summaries = []
             for month in sorted(months, reverse=True):
                 rows = sorted(
                     months[month],
@@ -1930,187 +2177,255 @@ class MountedResourceBackup:
                 month_stem = os.path.splitext(os.path.basename(month_path))[0]
                 if target_view:
                     index_lines.append(
-                        f"- [{month}](资源索引/{month_stem}.md) · {links} 个链接 · {files} 个文件"
+                        f"- [{month}](资源索引/{month_stem}.md) · {links} 个链接 · {files} 条附件记录"
                     )
                 else:
                     index_lines.append(
                         f"- [[资源索引/{month_stem}|{month}]] · {links} 个链接 · {files} 个文件"
                     )
-                month_text = self._render_month(
-                    chat_alias,
-                    month,
-                    rows,
-                    delivery_map,
-                    target_view=target_view,
-                )
                 _actual_month_path, month_changed = self._write_managed_text(
                     month_preferred_path,
-                    month_text,
+                    self._render_month(
+                        chat_alias,
+                        month,
+                        rows,
+                        delivery_map,
+                        target_view=target_view,
+                    ),
                     target_view=target_view,
                 )
                 if month_changed:
                     written += 1
                 managed_paths.append(_actual_month_path)
 
+                if not target_view:
+                    continue
                 file_rows = [row for row in rows if row.get("kind") == "file"]
-                if target_view and file_rows:
-                    ready, pending = self._file_delivery_counts(
-                        file_rows,
-                        delivery_map,
+                month_coverage = summarize_file_coverage(file_rows, delivery_map)
+                delivered_rows = [
+                    row for row in file_rows
+                    if classify_file_occurrence(
+                        row,
+                        delivery_map.get(str(row.get("object_sha256") or "")),
+                    ) == "delivered"
+                ]
+                pending_rows = [
+                    row for row in file_rows
+                    if classify_file_occurrence(
+                        row,
+                        delivery_map.get(str(row.get("object_sha256") or "")),
+                    ) != "delivered"
+                ]
+                if delivered_rows:
+                    self._ensure_target_dir(file_index_dir)
+                    actual_file_month, changed = self._write_managed_text(
+                        os.path.join(file_index_dir, month + ".md"),
+                        self._render_file_month(
+                            chat_alias, month, delivered_rows, delivery_map
+                        ),
+                        target_view=True,
                     )
-                    file_month_preferred = os.path.join(
-                        file_index_dir,
-                        month + ".md",
-                    )
-                    actual_file_month, file_month_changed = (
-                        self._write_managed_text(
-                            file_month_preferred,
-                            self._render_file_month(
-                                chat_alias,
-                                month,
-                                file_rows,
-                                delivery_map,
-                            ),
-                            target_view=True,
-                        )
-                    )
-                    if file_month_changed:
-                        written += 1
+                    written += int(changed)
                     managed_paths.append(actual_file_month)
                     file_month_summaries.append({
                         "month": month,
                         "name": os.path.basename(actual_file_month),
-                        "ready": ready,
-                        "pending": pending,
+                        "occurrences": month_coverage["delivered_occurrences"],
+                        "objects": month_coverage["delivered_objects"],
+                    })
+                if pending_rows:
+                    self._ensure_target_dir(pending_index_dir)
+                    actual_pending_month, changed = self._write_managed_text(
+                        os.path.join(pending_index_dir, month + ".md"),
+                        self._render_pending_file_month(
+                            chat_alias, month, pending_rows, delivery_map
+                        ),
+                        target_view=True,
+                    )
+                    written += int(changed)
+                    managed_paths.append(actual_pending_month)
+                    pending_month_summaries.append({
+                        "month": month,
+                        "name": os.path.basename(actual_pending_month),
+                        "coverage": month_coverage,
                     })
 
-            ready_files = pending_files = 0
+            chat_coverage = summarize_file_coverage(chat_rows, delivery_map)
             actual_file_chat = ""
-            if target_view and chat_has_files:
-                ready_files, pending_files = self._file_delivery_counts(
-                    chat_rows,
-                    delivery_map,
-                )
+            if target_view and file_month_summaries:
                 file_index_lines = [
                     INDEX_MARKER,
                     f"# {_markdown_heading(chat_alias, '未命名群聊', limit=120)} · 文件备份",
                     "",
-                    "> 只看文件，不混入网页链接。点击月份后可直接打开已备份文件。",
+                    "> 这里只列已备份文件，不混入网页链接或待补齐记录。",
                     "",
-                    f"**{ready_files} 条可打开 · {pending_files} 条待解析**",
+                    f"**{chat_coverage['delivered_objects']} 个去重文件 · {chat_coverage['delivered_occurrences']} 次出现**",
                     "",
                 ]
-                if file_month_summaries:
-                    for summary in file_month_summaries:
-                        target = _markdown_relative_url(
-                            "文件备份/" + summary["name"]
-                        )
-                        file_index_lines.append(
-                            f"- [{summary['month']}](<{target}>) · "
-                            f"{summary['ready']} 条可打开 · "
-                            f"{summary['pending']} 条待解析"
-                        )
-                else:
-                    file_index_lines.append("当前没有文件记录。")
-                actual_file_chat, file_chat_changed = self._write_managed_text(
+                for summary in file_month_summaries:
+                    target = _markdown_relative_url("文件备份/" + summary["name"])
+                    file_index_lines.append(
+                        f"- [{summary['month']}](<{target}>) · "
+                        f"{summary['objects']} 个去重文件 · "
+                        f"{summary['occurrences']} 次出现"
+                    )
+                actual_file_chat, changed = self._write_managed_text(
                     os.path.join(chat_root, "00-文件备份.md"),
                     "\n".join(file_index_lines),
                     target_view=True,
                 )
-                if file_chat_changed:
-                    written += 1
+                written += int(changed)
                 managed_paths.append(actual_file_chat)
-                file_chat_name = os.path.basename(actual_file_chat)
-                index_lines[4:4] = [
-                    f"> [只看文件备份](<{_markdown_relative_url(file_chat_name)}>)",
+
+            actual_pending_chat = ""
+            if target_view and pending_month_summaries:
+                pending_lines = [
+                    INDEX_MARKER,
+                    f"# {_markdown_heading(chat_alias, '未命名群聊', limit=120)} · 待补齐附件",
+                    "",
+                    f"**{chat_coverage['non_delivered_occurrences']} 条附件记录待补齐**",
                     "",
                 ]
+                pending_lines.extend(
+                    f"- {label}：{count} 条"
+                    for _state, label, count in self._coverage_breakdown(chat_coverage)
+                )
+                pending_lines.append("")
+                for summary in pending_month_summaries:
+                    target = _markdown_relative_url(
+                        "待补齐附件/" + summary["name"]
+                    )
+                    pending_lines.append(
+                        f"- [{summary['month']}](<{target}>) · "
+                        f"{summary['coverage']['non_delivered_occurrences']} 条待补齐"
+                    )
+                actual_pending_chat, changed = self._write_managed_text(
+                    os.path.join(chat_root, "00-待补齐附件.md"),
+                    "\n".join(pending_lines),
+                    target_view=True,
+                )
+                written += int(changed)
+                managed_paths.append(actual_pending_chat)
+
+            if target_view:
+                navigation = []
+                if actual_file_chat:
+                    navigation.append(
+                        f"> [已备份文件](<{_markdown_relative_url(os.path.basename(actual_file_chat))}>)"
+                    )
+                if actual_pending_chat:
+                    navigation.append(
+                        f"> [待补齐附件](<{_markdown_relative_url(os.path.basename(actual_pending_chat))}>)"
+                    )
+                if navigation:
+                    index_lines[4:4] = navigation + [""]
             _actual_index_path, index_changed = self._write_managed_text(
                 os.path.join(chat_root, "00-资源索引.md"),
                 "\n".join(index_lines),
                 target_view=target_view,
             )
-            if index_changed:
-                written += 1
+            written += int(index_changed)
             managed_paths.append(_actual_index_path)
             chat_summaries.append({
                 "alias": _single_line(chat_alias, "未命名群聊", 120),
-                "path": os.path.relpath(_actual_index_path, base_root).replace(
-                    os.sep, "/"
-                ),
+                "path": os.path.relpath(_actual_index_path, base_root).replace(os.sep, "/"),
                 "months": len(months),
-                "links": sum(
-                    1
-                    for rows in months.values()
-                    for row in rows
-                    if row.get("kind") == "link"
-                ),
-                "files": sum(
-                    1
-                    for rows in months.values()
-                    for row in rows
-                    if row.get("kind") == "file"
-                ),
+                "links": sum(1 for row in chat_rows if row.get("kind") == "link"),
+                "files": sum(1 for row in chat_rows if row.get("kind") == "file"),
                 "file_path": (
-                    os.path.relpath(actual_file_chat, base_root).replace(
-                        os.sep,
-                        "/",
-                    )
+                    os.path.relpath(actual_file_chat, base_root).replace(os.sep, "/")
                     if actual_file_chat else ""
                 ),
-                "ready_files": ready_files,
-                "pending_files": pending_files,
+                "pending_path": (
+                    os.path.relpath(actual_pending_chat, base_root).replace(os.sep, "/")
+                    if actual_pending_chat else ""
+                ),
+                "coverage": chat_coverage,
                 "file_months": len(file_month_summaries),
+                "pending_months": len(pending_month_summaries),
             })
 
-        file_scope_path = ""
+        file_scope_path = pending_scope_path = ""
         if target_view:
-            file_chat_summaries = [
-                item for item in chat_summaries if item["file_path"]
-            ]
             file_scope_lines = [
                 INDEX_MARKER,
                 "# 文件备份",
                 "",
-                "> 文件专属入口：按群聊进入，只显示附件，不混入网页链接。",
+                "> 这里只列已经交付到当前 mounted destination 的文件。每个群聊同时显示去重文件数与群聊出现次数。",
                 "",
             ]
-            if file_chat_summaries:
+            file_chats = [item for item in chat_summaries if item["file_path"]]
+            if file_chats:
                 for summary in sorted(
-                    file_chat_summaries,
+                    file_chats,
                     key=lambda item: (item["alias"].casefold(), item["file_path"]),
                 ):
-                    label = _markdown_label(summary["alias"], "未命名群聊")
-                    target = _markdown_relative_url(summary["file_path"])
+                    coverage = summary["coverage"]
                     file_scope_lines.append(
-                        f"- [{label}](<{target}>) · "
-                        f"{summary['ready_files']} 条可打开 · "
-                        f"{summary['pending_files']} 条待解析 · "
+                        f"- [{_markdown_label(summary['alias'], '未命名群聊')}](<{_markdown_relative_url(summary['file_path'])}>) · "
+                        f"{coverage['delivered_objects']} 个去重文件 · "
+                        f"{coverage['delivered_occurrences']} 次出现 · "
                         f"{summary['file_months']} 个月份"
                     )
             else:
-                file_scope_lines.append("当前没有已选群聊文件。")
-            file_scope_path, file_scope_changed = self._write_managed_text(
+                file_scope_lines.append("当前没有已备份文件。")
+            file_scope_path, changed = self._write_managed_text(
                 os.path.join(base_root, "00-文件备份.md"),
                 "\n".join(file_scope_lines),
                 target_view=True,
             )
-            if file_scope_changed:
-                written += 1
+            written += int(changed)
             managed_paths.append(file_scope_path)
+
+            total_coverage = summarize_file_coverage(occurrences, delivery_map)
+            pending_scope_lines = [
+                INDEX_MARKER,
+                "# 待补齐附件",
+                "",
+                f"**{total_coverage['non_delivered_occurrences']} 条附件记录待补齐**",
+                "",
+            ]
+            pending_scope_lines.extend(
+                f"- {label}：{count} 条"
+                for _state, label, count in self._coverage_breakdown(total_coverage)
+            )
+            if self._coverage_breakdown(total_coverage):
+                pending_scope_lines.append("")
+            pending_chats = [item for item in chat_summaries if item["pending_path"]]
+            if pending_chats:
+                for summary in sorted(
+                    pending_chats,
+                    key=lambda item: (item["alias"].casefold(), item["pending_path"]),
+                ):
+                    pending_scope_lines.append(
+                        f"- [{_markdown_label(summary['alias'], '未命名群聊')}](<{_markdown_relative_url(summary['pending_path'])}>) · "
+                        f"{summary['coverage']['non_delivered_occurrences']} 条待补齐 · "
+                        f"{summary['pending_months']} 个月份"
+                    )
+            else:
+                pending_scope_lines.append("当前没有待补齐附件。")
+            pending_scope_path, changed = self._write_managed_text(
+                os.path.join(base_root, "00-待补齐附件.md"),
+                "\n".join(pending_scope_lines),
+                target_view=True,
+            )
+            written += int(changed)
+            managed_paths.append(pending_scope_path)
+
         scope_lines = [
             INDEX_MARKER,
             "# 资源索引",
             "",
-            "> 按群聊进入链接与文件清单。",
+            ("> 按群聊进入链接与全部附件记录。" if target_view
+             else "> 按群聊进入链接与文件清单。"),
             "",
         ]
         if target_view:
-            file_scope_name = os.path.basename(file_scope_path)
-            scope_lines.extend([
-                f"> [只看文件备份](<{_markdown_relative_url(file_scope_name)}>)",
+            scope_lines[4:4] = [
+                f"> [已备份文件](<{_markdown_relative_url(os.path.basename(file_scope_path))}>)",
+                f"> [待补齐附件](<{_markdown_relative_url(os.path.basename(pending_scope_path))}>)",
                 "",
-            ])
+            ]
         if chat_summaries:
             for summary in sorted(
                 chat_summaries,
@@ -2118,14 +2433,14 @@ class MountedResourceBackup:
             ):
                 label = _markdown_label(summary["alias"], "未命名群聊")
                 if target_view:
-                    target = _markdown_relative_url(summary["path"])
-                    link = f"[{label}](<{target}>)"
+                    link = f"[{label}](<{_markdown_relative_url(summary['path'])}>)"
                 else:
-                    target = os.path.splitext(summary["path"])[0]
-                    link = f"[[{target}|{label}]]"
+                    link = f"[[{os.path.splitext(summary['path'])[0]}|{label}]]"
                 scope_lines.append(
                     f"- {link} · {summary['links']} 个链接 · "
-                    f"{summary['files']} 个文件 · {summary['months']} 个月份"
+                    f"{summary['files']} "
+                    f"{'条附件记录' if target_view else '个文件'} · "
+                    f"{summary['months']} 个月份"
                 )
         else:
             scope_lines.append("当前没有已选群聊资源。")
@@ -2134,8 +2449,7 @@ class MountedResourceBackup:
             "\n".join(scope_lines),
             target_view=target_view,
         )
-        if scope_changed:
-            written += 1
+        written += int(scope_changed)
         managed_paths.append(scope_path)
         self._reconcile_managed_projection(
             base_root,
@@ -2201,15 +2515,13 @@ class MountedResourceBackup:
         root = os.path.join(self.backup_root, "views")
         self._ensure_target_dir(root)
         written = self._render_indexes_at(root, occurrences, target_view=True)
-        delivery_map = self._delivery_map()
-        ready, pending = self._file_delivery_counts(occurrences, delivery_map)
-        ready_digests = {
-            str(item.get("object_sha256") or "")
-            for item in occurrences
-            if self._ready_delivery(item, delivery_map)
-        }
+        coverage, _delivery_map = self._file_coverage(occurrences)
         file_scope_path = self._managed_text_path(
             os.path.join(root, "00-文件备份.md"),
+            target_view=True,
+        )
+        pending_scope_path = self._managed_text_path(
+            os.path.join(root, "00-待补齐附件.md"),
             target_view=True,
         )
         resource_scope_path = self._managed_text_path(
@@ -2220,17 +2532,32 @@ class MountedResourceBackup:
             PORTAL_MARKER,
             "# 微信资源备份 / WeChat Resource Backup",
             "",
-            f"**{ready} 条可打开（{len(ready_digests)} 个去重文件） · {pending} 条待解析**",
+            f"**{coverage['delivered_objects']} 个文件已备份 · "
+            f"在群聊记录中出现 {coverage['delivered_occurrences']} 次 · "
+            f"{coverage['non_delivered_occurrences']} 条附件记录待补齐**",
             "",
             f"- [打开文件备份](<{_markdown_relative_url(os.path.relpath(file_scope_path, self.target_namespace_root).replace(os.sep, '/'))}>)",
+            f"- [查看待补齐附件](<{_markdown_relative_url(os.path.relpath(pending_scope_path, self.target_namespace_root).replace(os.sep, '/'))}>)",
             f"- [打开链接与文件总索引](<{_markdown_relative_url(os.path.relpath(resource_scope_path, self.target_namespace_root).replace(os.sep, '/'))}>)",
             "",
-            "> “可打开”表示文件已经交付到当前 mounted destination；不表示 Google Drive、Dropbox 或 iCloud 已完成远端同步。",
+        ]
+        if self._coverage_breakdown(coverage):
+            portal_lines.extend([
+                "## 待补齐状态",
+                "",
+                *[
+                    f"- {label}：{count} 条"
+                    for _state, label, count in self._coverage_breakdown(coverage)
+                ],
+                "",
+            ])
+        portal_lines.extend([
+            "> “已备份”表示文件已经交付并即时校验到当前 mounted destination；不表示 Google Drive、Dropbox 或 iCloud 已完成远端同步。",
             "",
             "`v3/objects` 与 `v3/snapshots` 是系统目录，请从上面的文件入口浏览，不要手工整理或改名。",
             "",
-            "待解析项目只有 metadata；需要在长驻 app 的本次会话中显式允许附件解析，才会读取并备份文件 bytes。",
-        ]
+            "附件解析仍需在长驻 app 的本次会话中显式允许；未允许时只更新链接、metadata 与待补齐清单，不读取附件 bytes。",
+        ])
         _portal_path, portal_changed = self._write_target_portal(
             "\n".join(portal_lines),
         )
@@ -2274,6 +2601,10 @@ class MountedResourceBackup:
         objects = self._object_rows(occurrences)
         boundary = self._target_boundary_error(occurrences, objects)
         delivery_map = self._delivery_map()
+        coverage, _validated_deliveries = self._file_coverage(
+            occurrences,
+            delivery_map,
+        )
         pending = 0
         for row in objects:
             digest = str(row["object_sha256"])
@@ -2321,6 +2652,10 @@ class MountedResourceBackup:
                 1 for row in occurrences
                 if row["kind"] == "file" and row["status"] != "ready_local"
             ),
+            "coverage": coverage,
+            "coverage_complete": int(
+                coverage["non_delivered_occurrences"]
+            ) == 0,
         }
 
     def run(self):
@@ -2418,6 +2753,8 @@ class MountedResourceBackup:
                 "failed": 0,
                 "obsidian": obsidian,
                 "target_index_files_written": target_indexes,
+                "coverage": summarize_file_coverage([], {}),
+                "coverage_complete": True,
             }
         with self._target_worker_lock():
             self._ensure_destination_identity_owned()
@@ -2457,8 +2794,13 @@ class MountedResourceBackup:
         records = self._catalog_records(occurrences, delivery_map)
         target_indexes = self._render_target_indexes(occurrences)
         snapshot = self._write_snapshot(records, object_rows, delivery_map)
+        coverage, _validated_deliveries = self._file_coverage(
+            occurrences,
+            delivery_map,
+        )
         unresolved_files = int(snapshot.get("unresolved_files") or 0)
-        if unresolved_files:
+        coverage_complete = int(coverage["non_delivered_occurrences"]) == 0
+        if not coverage_complete:
             state = "pending_resources"
         elif copied or snapshot["state"] == "written":
             state = "sync_delegated"
@@ -2474,6 +2816,8 @@ class MountedResourceBackup:
             "target_index_files_written": target_indexes,
             "obsidian": obsidian,
             "unresolved_files": unresolved_files,
+            "coverage": coverage,
+            "coverage_complete": coverage_complete,
         }
 
     def _snapshot_dir(self, snapshot_id=""):
