@@ -276,20 +276,34 @@ selection digest，并且不重新扫描 source。`backfill --all` 表示 known 
 本地 Obsidian index，然后才尝试 mounted handoff。`--resolve-files` 是显式授权。
 
 ```text
-<target>/wgo-resource-backup/.wgo-destination.json
-<target>/wgo-resource-backup/v3/
-  objects/sha256/...
-  snapshots/<snapshot-id>/{manifest.json,resources.jsonl,COMPLETE}
-  views/<chat>/...
+<target>/wgo-resource-backup/
+  00-打开微信资源备份.md
+  .wgo-destination.json
+  v3/
+    objects/sha256/...
+    snapshots/<snapshot-id>/{manifest.json,resources.jsonl,COMPLETE}
+    views/
+      00-文件备份.md
+      00-资源索引.md
+      <chat>/{00-文件备份.md,文件备份/<month>.md,00-资源索引.md,资源索引/<month>.md}
 ```
+
+根部 portal 是人类入口，菜单栏的 `📂 在 Finder 打开文件备份` 也会直接 reveal 它。
+文件专属页面只链接 mounted CAS 中那一份 bytes，不复制 payload，并把 ready 与 unresolved
+occurrence 分开计数、分开显示，也区分去重后的 unique digest。Target views 使用一个合并的 v2
+ownership manifest，本地 Obsidian 仍是 v1；根部 portal 是独立 marker-owned singleton，只在
+views 与 manifest 成功后最后写入。这些 portable relative Markdown links 不承诺 provider-native
+Drive-web rendering。
 
 Plan 与 run 都拒绝 filesystem root、与本地 source 相同/嵌套/祖先关系的 target、configured-target
 symlink，以及 planned object、snapshot、view、chat-index directory chain 中的 symlink/non-directory
 component。Snapshot/view 冲突返回 structured `target_failed`。第一次复制会边写边 hash，并立即
 readback target bytes。Regular non-symlink destination marker 保存一个绑定 owning archive 的随机 UUID；
 target-side lock 会串行化指向同一 mount 的不同本地 ledger。Projection manifest 在任何 write/managed GC
-前同时验证 archive 与 destination identity。后续 scheduled run 在复用 receipt 前重新 hash target object，
-因此同尺寸替换物不能继承旧 receipt；显式 `verify` 会重验所选 snapshot 的全部 objects。
+前同时验证 archive 与 destination identity。后续 scheduled run 对有效 local receipt 只用 `lstat`
+确认 target 仍是 regular、non-symlink 且 logical size 匹配，不重新 hash，也不 hydrate streamed
+placeholder；`plan` 与 `status` 也使用同一 metadata-only check。显式 `verify` 才重新 hash
+所选 snapshot 的全部 objects，并检测 same-size corruption。
 
 `sync_delegated` 只表示 resolved bytes 已写入 mounted filesystem 并立即验证；它绝不表示 provider-side
 upload 或 remote checksum verification。如果仍有 eligible file unresolved，系统可以发布 hash-bound

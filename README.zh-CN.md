@@ -104,7 +104,9 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
   与 Markdown views 交给 Google Drive for Desktop 等现有 mounted folder。`sync_delegated` 只证明 target bytes，
   不证明 provider-side upload。Scan、backfill、projection 与 handoff 会在 capture lock 下持有 canonical selection；
   real-output-root 与 target lock 会串行化 path aliases 和 cross-database writers。Busy、unknown 或 nested failure
-  都会 fail closed，不会被推断成 success。
+  都会 fail closed，不会被推断成 success。每轮还会在 mounted backup 根部维护醒目的
+  `00-打开微信资源备份.md`，其中的文件专属群聊/月视图只链接那一份共享 CAS object，并把
+  尚未解析的文件与真正已备份文件分开显示。
 - Direct Google Drive 文件同步是另一条可选 advanced lane：只扫描用户选定群聊，以 per-chat ×
   message-shard cursor 防止 partial shard read 推进遗漏。File message 不需要 Knowledge hit 就会进入
   durable queue 和 archive-owned provider-neutral CAS catalog；每个 digest 只上传一次，>5 MiB upload 按
@@ -388,6 +390,15 @@ app-owned generated Markdown；只有首选文件名已被猫手写内容占用�
 render/handoff 期间持有 canonical selected-chat authority，再按 output root 的 real path 取得私有
 root-identity lock；因此不同 capture DB 或不同 path alias 指向同一 root 时也会串行化。若 managed
 descendant 已是 symlink 或非目录，会在写 generated file 或 target bytes 前 fail closed。
+
+Mounted target 另有一个真正给人打开的入口：
+`<target>/wgo-resource-backup/00-打开微信资源备份.md`；菜单栏的
+`📂 在 Finder 打开文件备份` 会直接在 Finder 中 reveal 它。入口下的 `文件备份` 页面只列文件，
+按显式选中的群聊与月份分组；ready row 链接既有 CAS object，unresolved row 会明确写成待解析，
+不会伪装成已备份。这个 view 不复制第二份 payload bytes，其中“可打开”仍只证明 mounted
+filesystem handoff，不证明 provider-side cloud sync 已完成；counts 会区分 occurrence 与去重后的
+unique object。这些是 mounted filesystem 上的 portable relative Markdown links，本 lane 不冒充
+Google Drive 网页端的原生 rendering 或 Drive shortcut。
 
 菜单栏的 `关注推送 -> 后台通知：开/关` 是自动 banner 总开关。关闭后，
 后台监控、知识库写入和 Daily Digest 仍会继续运行，只是不再显示自动命中、

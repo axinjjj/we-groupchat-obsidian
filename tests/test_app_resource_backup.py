@@ -76,6 +76,50 @@ class AppResourceBackupTests(unittest.TestCase):
 
         self.assertFalse(restarted._resource_file_resolution_session_enabled)
 
+    def test_menu_exposes_the_human_file_backup_entry(self):
+        app = self.make_app()
+        capture = Mock()
+        capture.status.return_value = {
+            "counts": {"link:ready_metadata": 2, "file:ready_local": 1},
+            "pending_files": 0,
+            "selected_chats": 1,
+        }
+        app._resource_capture_service = Mock(return_value=capture)
+
+        menu = app._build_resource_backup_menu()
+
+        self.assertIn("📂 在 Finder 打开文件备份", set(menu.keys()))
+
+    def test_open_file_backup_entry_reveals_the_generated_portal(self):
+        app = self.make_app()
+        backup = Mock()
+        backup.existing_target_portal_path.return_value = "/tmp/portal.md"
+
+        with (
+            patch("app.load_config", return_value=app.config),
+            patch("app.MountedResourceBackup.from_config", return_value=backup),
+            patch("app.subprocess.run") as run,
+        ):
+            app._open_resource_backup_portal(None)
+
+        run.assert_called_once_with(["open", "-R", "/tmp/portal.md"])
+
+    def test_open_file_backup_entry_explains_when_no_portal_exists(self):
+        app = self.make_app()
+        backup = Mock()
+        backup.existing_target_portal_path.return_value = ""
+
+        with (
+            patch("app.load_config", return_value=app.config),
+            patch("app.MountedResourceBackup.from_config", return_value=backup),
+            patch("app.subprocess.run") as run,
+            patch("app._notify") as notify,
+        ):
+            app._open_resource_backup_portal(None)
+
+        run.assert_not_called()
+        self.assertEqual(notify.call_args.args[1], "还没有可打开的文件备份入口")
+
     def test_backfill_does_not_report_success_when_projection_failed(self):
         app = self.make_app()
         app._finish_task = Mock()

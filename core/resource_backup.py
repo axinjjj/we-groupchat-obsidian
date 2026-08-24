@@ -32,8 +32,11 @@ from .resource_capture import ResourceCaptureError, SelectedResourceCapture
 
 BACKUP_SCHEMA = "we-groupchat-obsidian.resource-backup.v3"
 INDEX_MARKER = "<!-- we-groupchat-obsidian:resource-index v1 -->"
+PORTAL_MARKER = "<!-- we-groupchat-obsidian:resource-backup-portal v1 -->"
+TARGET_PORTAL_NAME = "00-打开微信资源备份.md"
 INDEX_MANIFEST_NAME = ".resource-index-manifest.json"
-INDEX_MANIFEST_SCHEMA = "we-groupchat-obsidian.resource-index-manifest.v1"
+LOCAL_INDEX_MANIFEST_SCHEMA = "we-groupchat-obsidian.resource-index-manifest.v1"
+TARGET_INDEX_MANIFEST_SCHEMA = "we-groupchat-obsidian.resource-index-manifest.v2"
 PROJECTION_LOCK_DIR = os.path.join(DATA_DIR, "resource-projection-locks")
 DESTINATION_MARKER_NAME = ".wgo-destination.json"
 DESTINATION_MARKER_SCHEMA = "we-groupchat-obsidian.destination.v1"
@@ -349,7 +352,23 @@ def _markdown_label(value, fallback="链接", *, limit=240):
     text = re.sub(r"\s+", " ", text).strip() or fallback
     if limit is not None:
         text = text[:limit]
-    return text.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\\", "\\\\")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+    )
+
+
+def _markdown_heading(value, fallback="", *, limit=240):
+    return (
+        _single_line(value, fallback, limit)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
 
 
 def _frontmatter_scalar(value):
@@ -420,6 +439,17 @@ def _markdown_url(url):
         .replace("<", "%3C")
         .replace(">", "%3E")
     )
+
+
+def _markdown_relative_url(path):
+    return quote(_single_line(path, "", 8192), safe="/-._~")
+
+
+def _safe_month(value):
+    text = str(value or "").strip()
+    if re.fullmatch(r"\d{4}-(?:0[1-9]|1[0-2])", text):
+        return text
+    return "未标月份"
 
 
 def _stable_occurrence_id(row):
@@ -567,6 +597,64 @@ class MountedResourceBackup:
     @property
     def backup_root(self):
         return os.path.join(self.target, "wgo-resource-backup", "v3") if self.target else ""
+
+    @property
+    def target_namespace_root(self):
+        return os.path.dirname(self.backup_root) if self.backup_root else ""
+
+    @property
+    def target_portal_preferred_path(self):
+        if not self.target_namespace_root:
+            return ""
+        return os.path.join(self.target_namespace_root, TARGET_PORTAL_NAME)
+
+    @property
+    def _target_portal_candidates(self):
+        preferred = self.target_portal_preferred_path
+        if not preferred:
+            return ()
+        stem, extension = os.path.splitext(preferred)
+        return (preferred, stem + ".generated" + extension)
+
+    def _portal_marker_owned(self, path):
+        if not os.path.lexists(path):
+            return False
+        try:
+            data = self._read_regular_bytes(path)
+        except ResourceBackupError:
+            return False
+        return PORTAL_MARKER.encode("utf-8") in data
+
+    def _managed_target_portal_path(self):
+        candidates = self._target_portal_candidates
+        for path in candidates:
+            if self._portal_marker_owned(path):
+                return path
+        for path in candidates:
+            if not os.path.lexists(path):
+                return path
+        raise ResourceBackupError("managed_projection_conflict")
+
+    def _write_target_portal(self, text):
+        actual = self._managed_target_portal_path()
+        changed = self._target_text_if_changed(actual, text)
+        for candidate in self._target_portal_candidates:
+            if candidate == actual or not self._portal_marker_owned(candidate):
+                continue
+            try:
+                os.unlink(candidate)
+            except OSError as exc:
+                raise ResourceBackupError("target_file_conflict") from exc
+        return actual, changed
+
+    def existing_target_portal_path(self):
+        """Return the managed human entrypoint without touching payload bytes."""
+        if not self.target_portal_preferred_path or self._target_boundary_error():
+            return ""
+        for path in self._target_portal_candidates:
+            if self._portal_marker_owned(path):
+                return path
+        return ""
 
     @property
     def destination_id(self):
@@ -817,10 +905,22 @@ class MountedResourceBackup:
             planned.add(os.path.dirname(os.path.join(
                 self.backup_root, self._target_relpath(row)
             )))
-        for chat_part in self._chat_path_parts(occurrences or []).values():
+        occurrence_rows = occurrences or []
+        chat_parts = self._chat_path_parts(occurrence_rows)
+        chats_with_files = {
+            (
+                str(row.get("chat_key") or ""),
+                str(row.get("chat_alias") or "未命名群聊"),
+            )
+            for row in occurrence_rows
+            if row.get("kind") == "file"
+        }
+        for identity, chat_part in chat_parts.items():
             chat_root = os.path.join(self.backup_root, "views", chat_part)
             planned.add(chat_root)
             planned.add(os.path.join(chat_root, "资源索引"))
+            if identity in chats_with_files:
+                planned.add(os.path.join(chat_root, "文件备份"))
         for path in sorted(planned):
             relative = os.path.relpath(path, self.backup_root)
             current = self.backup_root
@@ -1082,9 +1182,16 @@ class MountedResourceBackup:
                 )
             )
             payload = json.loads(data.decode("utf-8"))
+            expected_schema = (
+                TARGET_INDEX_MANIFEST_SCHEMA
+                if target_view else LOCAL_INDEX_MANIFEST_SCHEMA
+            )
+            accepted_schemas = {expected_schema}
+            if target_view:
+                accepted_schemas.add(LOCAL_INDEX_MANIFEST_SCHEMA)
             if (
                 not isinstance(payload, dict)
-                or payload.get("schema") != INDEX_MANIFEST_SCHEMA
+                or payload.get("schema") not in accepted_schemas
                 or not isinstance(payload.get("paths"), list)
             ):
                 raise ValueError("invalid manifest")
@@ -1155,7 +1262,10 @@ class MountedResourceBackup:
                     break
                 parent = os.path.dirname(parent)
         payload = _canonical_json_bytes({
-            "schema": INDEX_MANIFEST_SCHEMA,
+            "schema": (
+                TARGET_INDEX_MANIFEST_SCHEMA
+                if target_view else LOCAL_INDEX_MANIFEST_SCHEMA
+            ),
             "archive_id": self.capture.archive_id,
             "destination_id": self.destination_id if target_view else "local",
             "paths": sorted(current),
@@ -1547,7 +1657,7 @@ class MountedResourceBackup:
             "---",
             "",
             INDEX_MARKER,
-            f"# {display_chat} · {display_month} 资源索引",
+            f"# {_markdown_heading(display_chat)} · {_markdown_heading(display_month)} 资源索引",
             "",
             "> 点击即可打开；详细来源与归档记录保留在本地 catalog。",
             "",
@@ -1620,10 +1730,105 @@ class MountedResourceBackup:
                 unavailable = "（等待本地文件）"
             if link:
                 lines.append(
-                    f"- {clock} · 📎 [{name}](<{_markdown_url(link)}>)"
+                    f"- {clock} · 📎 [{name}](<{_markdown_relative_url(link)}>)"
                 )
             else:
                 lines.append(f"- {clock} · 📎 {name}{unavailable}")
+        return "\n".join(lines).rstrip() + "\n"
+
+    def _ready_delivery(self, item, delivery_map):
+        if item.get("kind") != "file" or item.get("status") != "ready_local":
+            return None
+        digest = str(item.get("object_sha256") or "")
+        delivery = delivery_map.get(digest) if digest else None
+        relpath = str(delivery.get("target_relpath") or "") if delivery else ""
+        target_path = os.path.join(self.backup_root, relpath) if relpath else ""
+        if (
+            not delivery
+            or str(delivery.get("status") or "") != "sync_delegated"
+            or int(delivery.get("object_size") or -1)
+            != int(item.get("object_size") or -2)
+            or not relpath
+            or os.path.isabs(relpath)
+            or not _within(target_path, self.backup_root)
+        ):
+            return None
+        return delivery
+
+    def _file_delivery_counts(self, rows, delivery_map):
+        ready = 0
+        pending = 0
+        for item in rows:
+            if item.get("kind") != "file":
+                continue
+            if self._ready_delivery(item, delivery_map):
+                ready += 1
+            else:
+                pending += 1
+        return ready, pending
+
+    def _render_file_month(self, chat_alias, month, rows, delivery_map):
+        display_chat = _single_line(chat_alias, "未命名群聊", 120)
+        display_month = _single_line(month, "未标月份", 20)
+        ready = []
+        pending = []
+        for item in rows:
+            if item.get("kind") != "file":
+                continue
+            delivery = self._ready_delivery(item, delivery_map)
+            if delivery:
+                ready.append((item, delivery))
+            else:
+                pending.append(item)
+        lines = [
+            "---",
+            "source_app: we-groupchat-obsidian",
+            "source_kind: file_backup_index",
+            "source_schema_version: 1",
+            f"source_chat: {_frontmatter_scalar(display_chat)}",
+            f"month: {_frontmatter_scalar(display_month)}",
+            "---",
+            "",
+            INDEX_MARKER,
+            f"# {_markdown_heading(display_chat)} · {_markdown_heading(display_month)} 文件备份",
+            "",
+            "> 这里仅列文件；“已备份”只表示 bytes 已写入并即时校验到当前挂载目录，不表示云端同步完成。",
+            "> 同一份 bytes 只保存在系统 CAS 中，点击文件名即可打开。",
+            "",
+            f"## 已备份，可点击打开（{len(ready)}）",
+            "",
+        ]
+        if ready:
+            for item, delivery in ready:
+                name = _markdown_label(item.get("original_name"), "attachment")
+                when = _single_line(
+                    item.get("source_time"),
+                    display_month,
+                    32,
+                )
+                link = os.path.join(
+                    "..",
+                    "..",
+                    "..",
+                    str(delivery["target_relpath"]),
+                ).replace(os.sep, "/")
+                lines.append(
+                    f"- {when} · 📎 [{name}](<{_markdown_relative_url(link)}>)"
+                )
+        else:
+            lines.append("本月还没有已备份文件。")
+        lines.extend(["", f"## 尚未备份（{len(pending)}）", ""])
+        if pending:
+            for item in pending:
+                name = _markdown_label(item.get("original_name"), "attachment")
+                when = _single_line(
+                    item.get("source_time"),
+                    display_month,
+                    32,
+                )
+                lines.append(f"- {when} · 📎 {name}（等待本地附件解析）")
+        else:
+            lines.append("没有待解析文件。")
         return "\n".join(lines).rstrip() + "\n"
 
     @staticmethod
@@ -1636,10 +1841,22 @@ class MountedResourceBackup:
             safe = _safe_part(chat_alias, "未命名群聊")
             aliases[(chat_key, chat_alias)] = safe
             collision_groups[_path_collision_key(safe)].add(chat_key)
+        reserved = {
+            _path_collision_key(name)
+            for name in (
+                "00-文件备份.md",
+                "00-文件备份.generated.md",
+                "00-资源索引.md",
+                "00-资源索引.generated.md",
+            )
+        }
         return {
             identity: (
                 f"{safe}--{identity[0][:8]}"
-                if len(collision_groups[_path_collision_key(safe)]) > 1
+                if (
+                    len(collision_groups[_path_collision_key(safe)]) > 1
+                    or _path_collision_key(safe) in reserved
+                )
                 else safe
             )
             for identity, safe in aliases.items()
@@ -1656,7 +1873,7 @@ class MountedResourceBackup:
             chat_key = str(row.get("chat_key") or "")
             chat_alias = str(row.get("chat_alias") or "未命名群聊")
             grouped[(chat_key, chat_alias)][
-                str(row.get("source_month") or "未标月份")
+                _safe_month(row.get("source_month"))
             ].append(row)
         chat_parts = self._chat_path_parts(occurrences)
         delivery_map = self._delivery_map() if target_view else {}
@@ -1667,17 +1884,25 @@ class MountedResourceBackup:
             chat_part = chat_parts[(chat_key, chat_alias)]
             chat_root = os.path.join(base_root, chat_part)
             index_dir = os.path.join(chat_root, "资源索引")
+            file_index_dir = os.path.join(chat_root, "文件备份")
+            chat_rows = [row for rows in months.values() for row in rows]
+            chat_has_files = any(
+                row.get("kind") == "file" for row in chat_rows
+            )
             if target_view:
                 self._ensure_target_dir(index_dir)
+                if chat_has_files:
+                    self._ensure_target_dir(file_index_dir)
             else:
                 self._ensure_projection_dir(index_dir)
             index_lines = [
                 INDEX_MARKER,
-                f"# {_single_line(chat_alias, '未命名群聊', 120)} · 资源索引",
+                f"# {_markdown_heading(chat_alias, '未命名群聊', limit=120)} · 资源索引",
                 "",
                 "> 按月份查看链接与文件。",
                 "",
             ]
+            file_month_summaries = []
             for month in sorted(months, reverse=True):
                 rows = sorted(
                     months[month],
@@ -1719,6 +1944,80 @@ class MountedResourceBackup:
                 if month_changed:
                     written += 1
                 managed_paths.append(_actual_month_path)
+
+                file_rows = [row for row in rows if row.get("kind") == "file"]
+                if target_view and file_rows:
+                    ready, pending = self._file_delivery_counts(
+                        file_rows,
+                        delivery_map,
+                    )
+                    file_month_preferred = os.path.join(
+                        file_index_dir,
+                        month + ".md",
+                    )
+                    actual_file_month, file_month_changed = (
+                        self._write_managed_text(
+                            file_month_preferred,
+                            self._render_file_month(
+                                chat_alias,
+                                month,
+                                file_rows,
+                                delivery_map,
+                            ),
+                            target_view=True,
+                        )
+                    )
+                    if file_month_changed:
+                        written += 1
+                    managed_paths.append(actual_file_month)
+                    file_month_summaries.append({
+                        "month": month,
+                        "name": os.path.basename(actual_file_month),
+                        "ready": ready,
+                        "pending": pending,
+                    })
+
+            ready_files = pending_files = 0
+            actual_file_chat = ""
+            if target_view and chat_has_files:
+                ready_files, pending_files = self._file_delivery_counts(
+                    chat_rows,
+                    delivery_map,
+                )
+                file_index_lines = [
+                    INDEX_MARKER,
+                    f"# {_markdown_heading(chat_alias, '未命名群聊', limit=120)} · 文件备份",
+                    "",
+                    "> 只看文件，不混入网页链接。点击月份后可直接打开已备份文件。",
+                    "",
+                    f"**{ready_files} 条可打开 · {pending_files} 条待解析**",
+                    "",
+                ]
+                if file_month_summaries:
+                    for summary in file_month_summaries:
+                        target = _markdown_relative_url(
+                            "文件备份/" + summary["name"]
+                        )
+                        file_index_lines.append(
+                            f"- [{summary['month']}](<{target}>) · "
+                            f"{summary['ready']} 条可打开 · "
+                            f"{summary['pending']} 条待解析"
+                        )
+                else:
+                    file_index_lines.append("当前没有文件记录。")
+                actual_file_chat, file_chat_changed = self._write_managed_text(
+                    os.path.join(chat_root, "00-文件备份.md"),
+                    "\n".join(file_index_lines),
+                    target_view=True,
+                )
+                if file_chat_changed:
+                    written += 1
+                managed_paths.append(actual_file_chat)
+                file_chat_name = os.path.basename(actual_file_chat)
+                index_lines[4:4] = [
+                    f"> [只看文件备份](<{_markdown_relative_url(file_chat_name)}>)",
+                    "",
+                ]
             _actual_index_path, index_changed = self._write_managed_text(
                 os.path.join(chat_root, "00-资源索引.md"),
                 "\n".join(index_lines),
@@ -1745,7 +2044,53 @@ class MountedResourceBackup:
                     for row in rows
                     if row.get("kind") == "file"
                 ),
+                "file_path": (
+                    os.path.relpath(actual_file_chat, base_root).replace(
+                        os.sep,
+                        "/",
+                    )
+                    if actual_file_chat else ""
+                ),
+                "ready_files": ready_files,
+                "pending_files": pending_files,
+                "file_months": len(file_month_summaries),
             })
+
+        file_scope_path = ""
+        if target_view:
+            file_chat_summaries = [
+                item for item in chat_summaries if item["file_path"]
+            ]
+            file_scope_lines = [
+                INDEX_MARKER,
+                "# 文件备份",
+                "",
+                "> 文件专属入口：按群聊进入，只显示附件，不混入网页链接。",
+                "",
+            ]
+            if file_chat_summaries:
+                for summary in sorted(
+                    file_chat_summaries,
+                    key=lambda item: (item["alias"].casefold(), item["file_path"]),
+                ):
+                    label = _markdown_label(summary["alias"], "未命名群聊")
+                    target = _markdown_relative_url(summary["file_path"])
+                    file_scope_lines.append(
+                        f"- [{label}](<{target}>) · "
+                        f"{summary['ready_files']} 条可打开 · "
+                        f"{summary['pending_files']} 条待解析 · "
+                        f"{summary['file_months']} 个月份"
+                    )
+            else:
+                file_scope_lines.append("当前没有已选群聊文件。")
+            file_scope_path, file_scope_changed = self._write_managed_text(
+                os.path.join(base_root, "00-文件备份.md"),
+                "\n".join(file_scope_lines),
+                target_view=True,
+            )
+            if file_scope_changed:
+                written += 1
+            managed_paths.append(file_scope_path)
         scope_lines = [
             INDEX_MARKER,
             "# 资源索引",
@@ -1753,6 +2098,12 @@ class MountedResourceBackup:
             "> 按群聊进入链接与文件清单。",
             "",
         ]
+        if target_view:
+            file_scope_name = os.path.basename(file_scope_path)
+            scope_lines.extend([
+                f"> [只看文件备份](<{_markdown_relative_url(file_scope_name)}>)",
+                "",
+            ])
         if chat_summaries:
             for summary in sorted(
                 chat_summaries,
@@ -1760,7 +2111,7 @@ class MountedResourceBackup:
             ):
                 label = _markdown_label(summary["alias"], "未命名群聊")
                 if target_view:
-                    target = _markdown_url(summary["path"])
+                    target = _markdown_relative_url(summary["path"])
                     link = f"[{label}](<{target}>)"
                 else:
                     target = os.path.splitext(summary["path"])[0]
@@ -1842,7 +2193,41 @@ class MountedResourceBackup:
     def _render_target_indexes(self, occurrences):
         root = os.path.join(self.backup_root, "views")
         self._ensure_target_dir(root)
-        return self._render_indexes_at(root, occurrences, target_view=True)
+        written = self._render_indexes_at(root, occurrences, target_view=True)
+        delivery_map = self._delivery_map()
+        ready, pending = self._file_delivery_counts(occurrences, delivery_map)
+        ready_digests = {
+            str(item.get("object_sha256") or "")
+            for item in occurrences
+            if self._ready_delivery(item, delivery_map)
+        }
+        file_scope_path = self._managed_text_path(
+            os.path.join(root, "00-文件备份.md"),
+            target_view=True,
+        )
+        resource_scope_path = self._managed_text_path(
+            os.path.join(root, "00-资源索引.md"),
+            target_view=True,
+        )
+        portal_lines = [
+            PORTAL_MARKER,
+            "# 微信资源备份 / WeChat Resource Backup",
+            "",
+            f"**{ready} 条可打开（{len(ready_digests)} 个去重文件） · {pending} 条待解析**",
+            "",
+            f"- [打开文件备份](<{_markdown_relative_url(os.path.relpath(file_scope_path, self.target_namespace_root).replace(os.sep, '/'))}>)",
+            f"- [打开链接与文件总索引](<{_markdown_relative_url(os.path.relpath(resource_scope_path, self.target_namespace_root).replace(os.sep, '/'))}>)",
+            "",
+            "> “可打开”表示文件已经交付到当前 mounted destination；不表示 Google Drive、Dropbox 或 iCloud 已完成远端同步。",
+            "",
+            "`v3/objects` 与 `v3/snapshots` 是系统目录，请从上面的文件入口浏览，不要手工整理或改名。",
+            "",
+            "待解析项目只有 metadata；需要在长驻 app 的本次会话中显式允许附件解析，才会读取并备份文件 bytes。",
+        ]
+        _portal_path, portal_changed = self._write_target_portal(
+            "\n".join(portal_lines),
+        )
+        return written + int(portal_changed)
 
     def plan(self):
         try:
@@ -1904,17 +2289,6 @@ class MountedResourceBackup:
                 stat.S_ISLNK(target_stat.st_mode)
                 or not stat.S_ISREG(target_stat.st_mode)
                 or int(target_stat.st_size) != int(row["object_size"])
-            ):
-                pending += 1
-                continue
-            try:
-                actual_size, actual_digest = _hash_path(target_path)
-            except (OSError, ResourceBackupError):
-                pending += 1
-                continue
-            if (
-                actual_size != int(row["object_size"])
-                or actual_digest != digest
             ):
                 pending += 1
         if boundary:
@@ -2026,11 +2400,17 @@ class MountedResourceBackup:
                 "obsidian": obsidian,
             }
         if not self.capture.selected_chats():
+            target_indexes = 0
+            if self._read_destination_marker(required=False) is not None:
+                with self._target_worker_lock():
+                    self._ensure_destination_identity_owned()
+                    target_indexes = self._render_target_indexes([])
             return {
                 "state": "no_selected_chats",
                 "copied": 0,
                 "failed": 0,
                 "obsidian": obsidian,
+                "target_index_files_written": target_indexes,
             }
         with self._target_worker_lock():
             self._ensure_destination_identity_owned()

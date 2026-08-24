@@ -235,13 +235,38 @@ catalogs and receipts rather than the reading projection.
 
 The index contains references only. It does not copy file bytes into the Obsidian vault.
 
+The mounted target additionally exposes a file-only human view:
+
+```text
+<target>/wgo-resource-backup/
+  00-打开微信资源备份.md
+  v3/views/
+    00-文件备份.md
+    <chat>/
+      00-文件备份.md
+      文件备份/<month>.md
+```
+
+The namespace-root portal links to both the file-only view and the combined
+resource view. File-only pages group occurrences by selected chat and month,
+show ready and unresolved counts separately, and link each ready occurrence to
+its existing mounted CAS object. They must not duplicate payload bytes or use
+symlinks, hardlinks, Finder aliases, or provider-specific shortcuts as a second
+storage representation. An unresolved occurrence remains visibly pending and
+must not be described as backed up. The menu-bar app provides a direct Finder
+reveal action for the managed portal. Counts label file occurrences separately
+from distinct delivered digests. These are portable relative Markdown links on
+the mounted filesystem; the lane does not promise provider-native Drive-web
+rendering or shortcuts.
+
 If two selected chats have the same human alias, their generated directories must remain distinct by adding a stable short chat-key suffix.
 
 Every generated index contains an app ownership marker. A managed file normally
 uses the clean preferred name without a `.generated` suffix. If the preferred
 scope-root, chat-root, or monthly path already contains a user-authored file
 without that marker, the worker preserves it and writes a sibling such as
-`00-资源索引.generated.md` or `2026-08.generated.md`. Parent navigation must
+`00-资源索引.generated.md`, `00-文件备份.generated.md`, or
+`2026-08.generated.md`. Parent navigation must
 point to the actual generated filename. Two unmanaged collisions fail closed
 rather than overwriting either file.
 
@@ -258,6 +283,16 @@ distinct capture databases and path aliases that target the same projection or
 mount. Local generated directories reject symlink/non-directory descendants
 before any managed write.
 
+Local Obsidian projection manifests remain v1. Mounted target-view manifests
+are v2 and own the combined mixed plus file-only path set; the renderer reads a
+legacy target v1 once and rewrites it as v2 under the existing target lock.
+Older renderers therefore fail closed on the unknown target v2 schema instead
+of treating file-only pages as stale v1 paths. The namespace-root portal is a
+separate marker-owned singleton: only its preferred and `.generated.md`
+candidates are reconciled, and arbitrary namespace files are never scanned or
+collected. The portal is written last, after the combined target views and v2
+manifest succeed.
+
 Capture construction performs no SQLite write. Capture schema/archive identity
 are initialized only inside the capture operation lock, while backup delivery
 tables are initialized only inside the backup-DB lock. Attachment occurrence
@@ -271,16 +306,25 @@ The target may be a Google Drive for Desktop Stream files mount or another writa
 
 The user-selected target directory must already exist and be writable. The worker never recreates a missing File Provider mount path; a missing target is `destination_unavailable`.
 
-The mounted lane writes under an app-owned subtree:
+The mounted lane writes under an app-owned namespace:
 
 ```text
-<target>/wgo-resource-backup/v3/
-  objects/sha256/<prefix>/<sha256>--<safe-original-name>
-  snapshots/<snapshot-id>/
-    manifest.json
-    resources.jsonl
-    COMPLETE
-  views/<chat>/资源索引/<month>.md
+<target>/wgo-resource-backup/
+  00-打开微信资源备份.md
+  v3/
+    objects/sha256/<prefix>/<sha256>--<safe-original-name>
+    snapshots/<snapshot-id>/
+      manifest.json
+      resources.jsonl
+      COMPLETE
+    views/
+      00-文件备份.md
+      00-资源索引.md
+      <chat>/
+        00-文件备份.md
+        文件备份/<month>.md
+        00-资源索引.md
+        资源索引/<month>.md
 ```
 
 The lane must:
@@ -294,9 +338,12 @@ The lane must:
 - publish through a worker-owned temporary file and replace;
 - perform one immediate destination hash readback;
 - write a local durable delivery receipt only after successful readback;
+- maintain the root portal and zero-copy file-only views as generated,
+  collision-safe navigation surfaces;
 - on later scheduled runs, validate only the target entry type and logical size
   before trusting a valid local `sync_delegated` receipt; do not hash or hydrate
   a streamed placeholder;
+- apply the same metadata-only receipt validation in `plan` and `status`;
 - reserve full target rehash for an explicit `verify` action.
 
 Before creating a new target object, the worker checks available target-volume

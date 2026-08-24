@@ -80,6 +80,9 @@ monitor checkpoint 倒退成“没处理过”。
   sync_delegated 只证明目标 bytes/readback，不证明 provider-side upload。
 - 输出包括 immutable CAS object、privacy-bounded catalog snapshot、Markdown resource
   indexes 和 receipts；GC 只删除 manifest-owned generated paths。
+- Mounted 根部的 00-打开微信资源备份.md 是人类入口；菜单也可以直接在 Finder reveal。
+  文件专属页面按群聊/月分组，只链接既有 CAS object，不复制第二份 bytes，并把待解析
+  occurrence 与已备份文件分开显示。
 
 另有两个独立 advanced lane：
 

@@ -322,15 +322,29 @@ Ordinary `run` captures deterministic metadata occurrences, skips file-byte
 resolution, refreshes local Obsidian indexes even when the target is
 unavailable, and then attempts mounted handoff. `--resolve-files` is explicit.
 
-The mounted subtree is:
+The mounted namespace is:
 
 ```text
-<target>/wgo-resource-backup/.wgo-destination.json
-<target>/wgo-resource-backup/v3/
-  objects/sha256/...
-  snapshots/<snapshot-id>/{manifest.json,resources.jsonl,COMPLETE}
-  views/<chat>/...
+<target>/wgo-resource-backup/
+  00-打开微信资源备份.md
+  .wgo-destination.json
+  v3/
+    objects/sha256/...
+    snapshots/<snapshot-id>/{manifest.json,resources.jsonl,COMPLETE}
+    views/
+      00-文件备份.md
+      00-资源索引.md
+      <chat>/{00-文件备份.md,文件备份/<month>.md,00-资源索引.md,资源索引/<month>.md}
 ```
+
+The root portal is the human entrypoint and is also revealed by the menu-bar
+action `📂 在 Finder 打开文件备份`. File-only pages link to the one mounted CAS
+copy; they do not duplicate payload bytes. Ready and unresolved occurrences
+are counted and displayed separately from unique delivered digests. Target
+views use one combined v2 ownership manifest; local Obsidian remains v1. The
+root portal is a separately marked singleton written only after the target
+views and manifest succeed. These portable relative Markdown links do not
+promise provider-native Drive-web rendering.
 
 Plan and run reject filesystem-root, same/nested/ancestor local-source targets,
 a symlink configured target, and a symlink or non-directory in the app-owned
@@ -340,9 +354,11 @@ target bytes back. The regular, non-symlink destination marker contains a
 random UUID bound to the owning archive, and a target-side lock serializes
 different local ledgers that point at the same mount. Projection manifests bind
 both archive and destination identities before any write or managed GC. Later
-scheduled runs rehash a receipted target object before reuse, so a same-size
-replacement cannot inherit the old receipt. Explicit `verify` rehashes every
-object in the selected snapshot.
+scheduled runs trust a valid local receipt after `lstat` confirms a regular,
+non-symlink target with matching logical size; they do not rehash or hydrate a
+streamed placeholder. `plan` and `status` use that same metadata-only check.
+Explicit `verify` rehashes every object in the selected snapshot and detects
+same-size corruption.
 
 `sync_delegated` means the resolved file bytes were written and immediately
 verified on the mounted filesystem. It never means provider-side upload or

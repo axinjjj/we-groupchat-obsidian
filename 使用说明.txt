@@ -105,6 +105,8 @@ archive；Obsidian note 可以链接到私有归档 object，但附件 bytes 不
 - 默认关闭远程 URL preview、附件 bytes 解析、archive、resource backup、
   source guard 和 MCP 真实发送；不要因为看到命令存在就把它们当成已经启用。
 - Mounted target 只证明目标 filesystem bytes/readback，不证明云端 provider 已上传。
+- 每轮 mounted backup 会维护 wgo-resource-backup/00-打开微信资源备份.md；也可从菜单
+  “在 Finder 打开文件备份”直接进入。文件页只链接唯一 CAS copy，待解析项不会冒充已备份。
 - 历史 resource backfill 先生成 bounded plan，再用同一个未过期 run_id apply；
   不会在确认后重新无限 rescan。
 - MCP 读取会把本机 chat-derived data 暴露给 MCP client。真实发送默认 disabled，

@@ -12,12 +12,17 @@ import threading
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from urllib.parse import unquote
 from unittest.mock import Mock, patch
 
 import scripts.resource_backup as resource_backup_cli
 from core.resource_backup import (
+    LOCAL_INDEX_MANIFEST_SCHEMA,
     MountedResourceBackup,
+    TARGET_INDEX_MANIFEST_SCHEMA,
+    _markdown_relative_url,
     _redact_url,
+    _safe_month,
     evaluate_resource_backup_outcome,
     load_resource_backup_settings,
     save_resource_backup_settings,
@@ -364,6 +369,253 @@ class ResourceBackupTests(unittest.TestCase):
         self.assertEqual(len(copied_files), 2)
         self.assertFalse(any(unselected_digest in path for path in copied_files))
 
+    def test_mounted_target_has_a_human_file_portal_without_duplicate_bytes(self):
+        capture = self._ready_capture()
+        backup = self._backup(capture)
+
+        result = backup.run()
+
+        self.assertEqual(result["state"], "sync_delegated")
+        portal_path = os.path.join(
+            self.target,
+            "wgo-resource-backup",
+            "00-打开微信资源备份.md",
+        )
+        with open(portal_path, encoding="utf-8") as handle:
+            portal = handle.read()
+        self.assertIn("# 微信资源备份 / WeChat Resource Backup", portal)
+        self.assertIn("v3/views/00-文件备份.md", unquote(portal))
+        self.assertIn("2 条可打开", portal)
+        self.assertIn("2 个去重文件", portal)
+        self.assertIn("0 条待解析", portal)
+        self.assertIn("系统目录", portal)
+
+        target_views = os.path.join(backup.backup_root, "views")
+        file_scope = os.path.join(target_views, "00-文件备份.md")
+        with open(file_scope, encoding="utf-8") as handle:
+            scope_text = handle.read()
+        self.assertIn("# 文件备份", scope_text)
+        self.assertIn("猫猫研究群", scope_text)
+        self.assertIn("2 条可打开 · 0 条待解析", scope_text)
+
+        chat_root = os.path.join(target_views, "猫猫研究群")
+        with open(
+            os.path.join(chat_root, "00-文件备份.md"),
+            encoding="utf-8",
+        ) as handle:
+            chat_text = handle.read()
+        self.assertIn("文件备份/2026-08.md", unquote(chat_text))
+        self.assertIn("2 条可打开 · 0 条待解析", chat_text)
+
+        month_path = os.path.join(chat_root, "文件备份", "2026-08.md")
+        with open(month_path, encoding="utf-8") as handle:
+            month_text = handle.read()
+        self.assertIn("## 已备份，可点击打开（2）", month_text)
+        self.assertIn("[report.pdf]", month_text)
+        self.assertIn("../../../objects/sha256/", month_text)
+        self.assertNotIn("🔗", month_text)
+
+        objects_root = os.path.join(backup.backup_root, "objects", "sha256")
+        payloads = [
+            os.path.join(root, name)
+            for root, _dirs, names in os.walk(objects_root)
+            for name in names
+        ]
+        self.assertEqual(len(payloads), 2)
+
+        with open(
+            os.path.join(target_views, ".resource-index-manifest.json"),
+            encoding="utf-8",
+        ) as handle:
+            target_manifest = json.load(handle)
+        self.assertEqual(target_manifest["schema"], TARGET_INDEX_MANIFEST_SCHEMA)
+        self.assertTrue(any("00-资源索引.md" in path for path in target_manifest["paths"]))
+        self.assertTrue(any("00-文件备份.md" in path for path in target_manifest["paths"]))
+
+        local_manifest_path = os.path.join(
+            backup.obsidian_projection_root,
+            ".resource-index-manifest.json",
+        )
+        with open(local_manifest_path, encoding="utf-8") as handle:
+            local_manifest = json.load(handle)
+        self.assertEqual(local_manifest["schema"], LOCAL_INDEX_MANIFEST_SCHEMA)
+
+    def test_file_portal_separates_unresolved_files_from_backed_up_files(self):
+        capture = self._capture()
+        capture.initialize_selected_chat_cursors(start_timestamp=0)
+        scanned = capture.scan()
+        self.assertEqual(scanned["captured_files"], 2)
+        backup = self._backup(capture)
+
+        result = backup.run()
+
+        self.assertEqual(result["state"], "pending_resources")
+        portal_path = os.path.join(
+            self.target,
+            "wgo-resource-backup",
+            "00-打开微信资源备份.md",
+        )
+        with open(portal_path, encoding="utf-8") as handle:
+            portal = handle.read()
+        self.assertIn("0 条可打开", portal)
+        self.assertIn("2 条待解析", portal)
+
+        month_path = os.path.join(
+            backup.backup_root,
+            "views",
+            "猫猫研究群",
+            "文件备份",
+            "2026-08.md",
+        )
+        with open(month_path, encoding="utf-8") as handle:
+            month_text = handle.read()
+        self.assertIn("## 尚未备份（2）", month_text)
+        self.assertIn("等待本地附件解析", month_text)
+        self.assertNotIn("../../../objects/sha256/", month_text)
+
+    def test_link_only_chat_does_not_get_an_empty_file_page(self):
+        message = self._selected_message()
+        message["resources"] = []
+        capture = SelectedResourceCapture(
+            self.config,
+            source=FakeSource({self.selected: [message]}),
+            now_func=lambda: 1_787_500_000,
+            archive_id_factory=lambda: "00000000-0000-0000-0000-000000000001",
+        )
+        capture.initialize_selected_chat_cursors(start_timestamp=0)
+        scanned = capture.scan()
+        self.assertEqual(scanned["captured_links"], 2)
+        self.assertEqual(scanned["captured_files"], 0)
+        backup = self._backup(capture)
+
+        result = backup.run()
+
+        self.assertEqual(result["state"], "sync_delegated")
+        views = os.path.join(backup.backup_root, "views")
+        self.assertTrue(os.path.isfile(os.path.join(views, "00-文件备份.md")))
+        self.assertFalse(os.path.exists(os.path.join(
+            views,
+            "猫猫研究群",
+            "00-文件备份.md",
+        )))
+
+    def test_file_portal_preserves_a_user_collision_with_generated_fallback(self):
+        capture = self._ready_capture()
+        namespace_root = os.path.join(self.target, "wgo-resource-backup")
+        os.makedirs(namespace_root, exist_ok=True)
+        preferred = os.path.join(namespace_root, "00-打开微信资源备份.md")
+        with open(preferred, "w", encoding="utf-8") as handle:
+            handle.write("user-owned\n")
+        backup = self._backup(capture)
+
+        result = backup.run()
+
+        self.assertEqual(result["state"], "sync_delegated")
+        with open(preferred, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "user-owned\n")
+        generated = os.path.join(
+            namespace_root,
+            "00-打开微信资源备份.generated.md",
+        )
+        with open(generated, encoding="utf-8") as handle:
+            generated_text = handle.read()
+        self.assertIn("resource-backup-portal v1", generated_text)
+        self.assertIn("# 微信资源备份", generated_text)
+        self.assertEqual(backup.existing_target_portal_path(), generated)
+
+    def test_target_manifest_v1_migrates_to_v2_without_gc_between_view_families(self):
+        capture = self._ready_capture()
+        backup = self._backup(capture)
+        first = backup.run()
+        self.assertEqual(first["state"], "sync_delegated")
+        manifest_path = os.path.join(
+            backup.backup_root,
+            "views",
+            ".resource-index-manifest.json",
+        )
+        with open(manifest_path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        manifest["schema"] = LOCAL_INDEX_MANIFEST_SCHEMA
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle)
+
+        second = backup.run()
+
+        self.assertEqual(second["state"], "idle")
+        with open(manifest_path, encoding="utf-8") as handle:
+            migrated = json.load(handle)
+        self.assertEqual(migrated["schema"], TARGET_INDEX_MANIFEST_SCHEMA)
+        self.assertTrue(any("00-资源索引.md" in path for path in migrated["paths"]))
+        self.assertTrue(any("00-文件备份.md" in path for path in migrated["paths"]))
+
+    def test_deselecting_all_chats_reconciles_target_views_but_keeps_objects(self):
+        capture = self._ready_capture()
+        canonical = dict(self.config)
+        capture.config_loader = lambda: dict(canonical)
+        backup = self._backup(capture)
+        first = backup.run()
+        self.assertEqual(first["state"], "sync_delegated")
+        chat_root = os.path.join(backup.backup_root, "views", "猫猫研究群")
+        objects_root = os.path.join(backup.backup_root, "objects", "sha256")
+        object_files = [
+            os.path.join(root, name)
+            for root, _dirs, names in os.walk(objects_root)
+            for name in names
+        ]
+        self.assertEqual(len(object_files), 2)
+
+        canonical["resource_backup_selected_chats"] = []
+        second = backup.run()
+
+        self.assertEqual(second["state"], "no_selected_chats")
+        self.assertFalse(os.path.exists(chat_root))
+        self.assertTrue(all(os.path.isfile(path) for path in object_files))
+        with open(backup.existing_target_portal_path(), encoding="utf-8") as handle:
+            portal = handle.read()
+        self.assertIn("0 条可打开", portal)
+        self.assertIn("0 条待解析", portal)
+
+    def test_file_view_escapes_labels_encodes_hrefs_and_rejects_bad_months(self):
+        capture = self._ready_capture()
+        backup = self._backup(capture)
+        item = {
+            "kind": "file",
+            "status": "ready_local",
+            "object_sha256": "a" * 64,
+            "object_size": 3,
+            "original_name": "<img src=x>#%.pdf",
+            "source_time": "2026-08-23 10:31",
+        }
+        delivery = {
+            "status": "sync_delegated",
+            "object_size": 3,
+            "target_relpath": "objects/sha256/aa/file #%.pdf",
+        }
+
+        text = backup._render_file_month(
+            "<b>猫猫</b>",
+            "2026-08",
+            [item],
+            {"a" * 64: delivery},
+        )
+
+        self.assertIn("&lt;b&gt;猫猫&lt;/b&gt;", text)
+        self.assertIn("&lt;img src=x&gt;#%.pdf", text)
+        self.assertIn("file%20%23%25.pdf", text)
+        self.assertEqual(
+            _markdown_relative_url("../objects/a # % ?.pdf"),
+            "../objects/a%20%23%20%25%20%3F.pdf",
+        )
+        self.assertEqual(_safe_month("../../outside"), "未标月份")
+        reserved = backup._chat_path_parts([{
+            "chat_key": "reserved-chat-key",
+            "chat_alias": "00-文件备份.md",
+        }])
+        self.assertEqual(
+            reserved[("reserved-chat-key", "00-文件备份.md")],
+            "00-文件备份.md--reserved",
+        )
+
     def test_resource_index_is_a_light_resource_list_without_sender_or_ledger_details(self):
         capture = self._ready_capture()
         backup = self._backup(capture)
@@ -479,6 +731,23 @@ class ResourceBackupTests(unittest.TestCase):
         self.assertEqual(second["reused"], 2)
         hash_path.assert_not_called()
         source_path.assert_not_called()
+
+    def test_receipt_backed_plan_and_status_do_not_hash_target_bytes(self):
+        capture = self._ready_capture()
+        backup = self._backup(capture)
+        first = backup.run()
+        self.assertEqual(first["copied"], 2)
+
+        with patch(
+            "core.resource_backup._hash_path",
+            side_effect=AssertionError("metadata status hashed target bytes"),
+        ) as hash_path:
+            plan = backup.plan()
+            status = backup.status()
+
+        self.assertEqual(plan["state"], "ready")
+        self.assertEqual(status["handoff_semantics"], "sync_delegated")
+        hash_path.assert_not_called()
 
     def test_explicit_verify_rehashes_and_detects_target_corruption(self):
         capture = self._ready_capture()
@@ -2118,6 +2387,28 @@ class ResourceBackupTests(unittest.TestCase):
 
                 self.assertEqual(plan["state"], "invalid_target")
                 self.assertEqual(plan["error_code"], "target_subtree_conflict")
+
+    def test_file_backup_view_rejects_a_nested_symlink_before_external_write(self):
+        capture = self._ready_capture()
+        backup = self._backup(capture)
+        chat_root = os.path.join(
+            backup.backup_root,
+            "views",
+            "猫猫研究群",
+        )
+        outside = os.path.join(self.root, "outside-file-view")
+        os.makedirs(chat_root, exist_ok=True)
+        os.makedirs(outside)
+        os.symlink(outside, os.path.join(chat_root, "文件备份"))
+
+        plan = backup.plan()
+        result = backup.run()
+
+        self.assertEqual(plan["state"], "invalid_target")
+        self.assertEqual(plan["error_code"], "target_subtree_conflict")
+        self.assertEqual(result["state"], "target_failed")
+        self.assertIn("target_subtree_conflict", result["error_codes"])
+        self.assertEqual(os.listdir(outside), [])
 
     def test_run_returns_target_failed_for_snapshot_directory_conflict(self):
         capture = self._ready_capture()

@@ -27,6 +27,8 @@ archival artifact 的历史 offline fallback。完整隐私边界、MCP 发送�
 macOS 可能在菜单 app 启动后询问一次 WeChat App Data 访问。请确认发起者是本项目 app；
 source guard 和资源索引都在这只长驻 app 内运行，不会每 300 秒启动一只新 Python 来重复询问。
 历史补链接不读取附件 bytes；附件解析只接受本次 app 会话授权，CLI 则必须在单次 `run` 上显式传 `--resolve-files`。
+Mounted backup 完成一轮后，可从菜单选择 `📂 在 Finder 打开文件备份`，或打开 target 下的
+`wgo-resource-backup/00-打开微信资源备份.md`；待解析项会与真正可打开的备份文件分开显示。
 
 这是 source-distributed macOS menu-bar app，不包含已签名 installer、`.dmg` 或
 bundled Python runtime。

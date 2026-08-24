@@ -648,6 +648,10 @@ class WeGroupchatObsidianApp(rumps.App):
             callback=self._run_resource_backup_now,
         ))
         menu.add(rumps.MenuItem(
+            "📂 在 Finder 打开文件备份",
+            callback=self._open_resource_backup_portal,
+        ))
+        menu.add(rumps.MenuItem(
             "📚 补历史链接...",
             callback=self._request_link_backfill,
         ))
@@ -740,6 +744,18 @@ class WeGroupchatObsidianApp(rumps.App):
             _notify("资源索引与本地备份", "数据源未就绪", "请稍后再试。")
             return
         self._start_resource_backup_consumer(manual=True)
+
+    def _open_resource_backup_portal(self, _):
+        backup = MountedResourceBackup.from_config(load_config())
+        portal_path = backup.existing_target_portal_path()
+        if not portal_path:
+            _notify(
+                "资源索引与本地备份",
+                "还没有可打开的文件备份入口",
+                "请先选择群聊并运行一次“立即更新资源索引”。",
+            )
+            return
+        subprocess.run(["open", "-R", portal_path])
 
     def _start_resource_backup_consumer(self, *, manual):
         threading.Thread(

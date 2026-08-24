@@ -125,6 +125,9 @@ Its most important boundaries are:
   delegates immutable objects plus privacy-bounded catalogs and Markdown views
   to an existing mounted folder such as Google Drive for Desktop. A
   `sync_delegated` receipt proves target bytes, not provider-side upload.
+  Each run also maintains a conspicuous `00-打开微信资源备份.md` portal at the
+  mounted backup root, with a file-only chat/month view that links to the one
+  shared CAS copy and separates unresolved files from backed-up files.
   Scan, backfill, projection, and handoff hold canonical selection under the
   capture lock; real-output-root and target locks serialize aliases and
   cross-database writers. Busy, unknown, or nested failure states fail closed
@@ -440,6 +443,17 @@ real output path. This serializes app and CLI writers even when different
 capture databases or path aliases point at the same root. Existing symlink or
 non-directory descendants fail closed before generated files or target bytes
 are written.
+
+The mounted target has a separate human-facing entrypoint at
+`<target>/wgo-resource-backup/00-打开微信资源备份.md`; the menu-bar command
+`📂 在 Finder 打开文件备份` reveals it directly. Its `文件备份` pages contain
+files only, grouped by selected chat and month. Ready rows link to the existing
+CAS object, while unresolved rows remain visibly marked as pending. The view
+does not duplicate payload bytes, and its “可打开” count still proves only the
+mounted filesystem handoff—not provider-side cloud synchronization. Counts
+distinguish occurrences from unique deduplicated objects. These are portable
+relative Markdown links; this provider-neutral lane does not claim native
+Google Drive web rendering or Drive shortcuts.
 
 ### Guarded exact relation Markdown cleanup
 
