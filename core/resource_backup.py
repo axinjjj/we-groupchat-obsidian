@@ -1151,6 +1151,7 @@ class MountedResourceBackup:
             self._ensure_projection_dir(base_root)
         manifest_path = os.path.join(base_root, INDEX_MANIFEST_NAME)
         if not os.path.lexists(manifest_path):
+            legacy_paths = set()
             if os.path.isdir(base_root):
                 for root, dirs, files in os.walk(base_root, followlinks=False):
                     dirs[:] = [
@@ -1171,8 +1172,14 @@ class MountedResourceBackup:
                         except ResourceBackupError:
                             continue
                         if INDEX_MARKER.encode("utf-8") in data:
-                            raise ResourceBackupError("projection_owner_missing")
-            return set()
+                            legacy_paths.add(
+                                os.path.relpath(path, base_root).replace(os.sep, "/")
+                            )
+            # Pre-manifest releases still marked every generated index with the
+            # exact app ownership marker. Adopt only those files for one
+            # reconciliation pass; unmarked user files never enter managed GC.
+            # A successful render immediately writes the normal manifest.
+            return legacy_paths
         try:
             data = (
                 self._read_regular_bytes(manifest_path)

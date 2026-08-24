@@ -346,6 +346,11 @@ root portal is a separately marked singleton written only after the target
 views and manifest succeed. These portable relative Markdown links do not
 promise provider-native Drive-web rendering.
 
+For upgrades from the pre-manifest projection format, one reconciliation pass
+adopts only files carrying the exact app-generated index marker, preserves every
+unmarked user file, and immediately writes the normal ownership manifest. All
+later GC remains manifest-bound.
+
 Plan and run reject filesystem-root, same/nested/ancestor local-source targets,
 a symlink configured target, and a symlink or non-directory in the app-owned
 subtree, including planned object, snapshot, view, and chat-index directories.

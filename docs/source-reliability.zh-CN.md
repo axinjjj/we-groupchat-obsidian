@@ -295,6 +295,10 @@ ownership manifest，本地 Obsidian 仍是 v1；根部 portal 是独立 marker-
 views 与 manifest 成功后最后写入。这些 portable relative Markdown links 不承诺 provider-native
 Drive-web rendering。
 
+从 pre-manifest projection format 升级时，系统只会在一次 reconciliation 中 adopt 带 exact
+app-generated index marker 的历史生成文件，保留所有无 marker 的人类文件，并立即写入正常
+ownership manifest；之后的 GC 仍完全由 manifest 约束。
+
 Plan 与 run 都拒绝 filesystem root、与本地 source 相同/嵌套/祖先关系的 target、configured-target
 symlink，以及 planned object、snapshot、view、chat-index directory chain 中的 symlink/non-directory
 component。Snapshot/view 冲突返回 structured `target_failed`。第一次复制会边写边 hash，并立即

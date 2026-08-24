@@ -548,6 +548,41 @@ class ResourceBackupTests(unittest.TestCase):
         self.assertTrue(any("00-资源索引.md" in path for path in migrated["paths"]))
         self.assertTrue(any("00-文件备份.md" in path for path in migrated["paths"]))
 
+    def test_manifestless_legacy_indexes_are_adopted_without_touching_user_files(self):
+        capture = self._ready_capture()
+        backup = self._backup(capture)
+        first = backup.run()
+        self.assertEqual(first["state"], "sync_delegated")
+
+        local_root = backup.obsidian_projection_root
+        target_root = os.path.join(backup.backup_root, "views")
+        for root in (local_root, target_root):
+            os.unlink(os.path.join(root, ".resource-index-manifest.json"))
+            with open(
+                os.path.join(root, "human-note.md"),
+                "w",
+                encoding="utf-8",
+            ) as handle:
+                handle.write("user-owned\n")
+
+        second = backup.run()
+
+        self.assertEqual(second["state"], "idle")
+        for root, schema in (
+            (local_root, LOCAL_INDEX_MANIFEST_SCHEMA),
+            (target_root, TARGET_INDEX_MANIFEST_SCHEMA),
+        ):
+            with open(
+                os.path.join(root, ".resource-index-manifest.json"),
+                encoding="utf-8",
+            ) as handle:
+                self.assertEqual(json.load(handle)["schema"], schema)
+            with open(
+                os.path.join(root, "human-note.md"),
+                encoding="utf-8",
+            ) as handle:
+                self.assertEqual(handle.read(), "user-owned\n")
+
     def test_deselecting_all_chats_reconciles_target_views_but_keeps_objects(self):
         capture = self._ready_capture()
         canonical = dict(self.config)
