@@ -25,7 +25,9 @@ from .attachment_archive import AttachmentArchive
 from .config import (
     DATA_DIR,
     active_monitor_chats,
+    load_config,
     selected_resource_backup_chats,
+    update_config,
 )
 from .link_preview import URL_RE
 from .wechat_db import WeChatSourceDegraded
@@ -49,6 +51,45 @@ class ResourceCaptureError(RuntimeError):
     def __init__(self, code: str):
         super().__init__(str(code))
         self.code = str(code)
+
+
+def _capture_db_path(config):
+    value = (config or {}).get("resource_capture_db") or os.path.join(
+        DATA_DIR, "resource_capture.db"
+    )
+    return os.path.abspath(os.path.expanduser(value))
+
+
+@contextmanager
+def resource_capture_operation_lock(config):
+    """Serialize capture operations and selected-chat config mutations.
+
+    The lock order is always capture operation lock -> config store lock.  UI
+    and CLI selection writers use this surface before patching config, while a
+    capture worker reloads canonical config only after acquiring the same lock.
+    """
+    db_path = _capture_db_path(config)
+    os.makedirs(os.path.dirname(db_path), mode=0o700, exist_ok=True)
+    lock_path = db_path + ".capture.lock"
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                raise ResourceCaptureError("capture_worker_busy") from exc
+            raise
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
 
 
 def _safe_label(value, fallback="未命名群聊", limit=180):
@@ -161,6 +202,7 @@ class SelectedResourceCapture:
         random_func=random.random,
         archive_id_factory=None,
         backfill_run_id_factory=None,
+        config_loader=None,
     ):
         self.config = dict(config or {})
         self.source = source
@@ -170,10 +212,8 @@ class SelectedResourceCapture:
         self.backfill_run_id_factory = backfill_run_id_factory or (
             lambda: str(uuid.uuid4())
         )
-        self.db_path = os.path.abspath(os.path.expanduser(
-            self.config.get("resource_capture_db")
-            or os.path.join(DATA_DIR, "resource_capture.db")
-        ))
+        self.config_loader = config_loader
+        self.db_path = _capture_db_path(self.config)
         self.archive_root = os.path.abspath(os.path.expanduser(
             self.config.get("attachment_archive_root")
             or os.path.join(DATA_DIR, "attachment_archive")
@@ -194,6 +234,7 @@ class SelectedResourceCapture:
 
     @classmethod
     def from_config(cls, config, **kwargs):
+        kwargs.setdefault("config_loader", load_config)
         return cls(config, **kwargs)
 
     def _connect(self):
@@ -205,26 +246,29 @@ class SelectedResourceCapture:
     @contextmanager
     def _operation_lock(self):
         """Serialize source/cursor work across app and explicit CLI runs."""
-        lock_path = self.db_path + ".capture.lock"
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-        try:
-            try:
-                os.fchmod(fd, 0o600)
-            except OSError:
-                pass
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as exc:
-                if exc.errno in {errno.EACCES, errno.EAGAIN}:
-                    raise ResourceCaptureError("capture_worker_busy") from exc
-                raise
+        with resource_capture_operation_lock(self.config):
             yield
-        finally:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            os.close(fd)
+
+    def _reload_canonical_config_locked(self):
+        if self.config_loader is None:
+            return self.config
+        latest = dict(self.config_loader() or {})
+        latest_db_path = _capture_db_path(latest)
+        latest_archive_root = os.path.abspath(os.path.expanduser(
+            latest.get("attachment_archive_root")
+            or os.path.join(DATA_DIR, "attachment_archive")
+        ))
+        if latest_db_path != self.db_path or latest_archive_root != self.archive_root:
+            raise ResourceCaptureError("capture_config_changed")
+        source_db_dir = str(getattr(self.source, "db_dir", "") or "")
+        latest_source_db_dir = str(latest.get("db_dir") or "")
+        if source_db_dir and (
+            os.path.abspath(os.path.expanduser(source_db_dir))
+            != os.path.abspath(os.path.expanduser(latest_source_db_dir))
+        ):
+            raise ResourceCaptureError("capture_config_changed")
+        self.config = latest
+        return self.config
 
     def _ensure_schema(self):
         os.makedirs(os.path.dirname(self.db_path), mode=0o700, exist_ok=True)
@@ -234,6 +278,9 @@ class SelectedResourceCapture:
             pass
         conn = self._connect()
         try:
+            user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if user_version > SCHEMA_VERSION:
+                raise ResourceCaptureError("schema_too_new")
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS resource_meta (
@@ -413,30 +460,30 @@ class SelectedResourceCapture:
             conn.close()
 
     def _ensure_archive_id(self):
-        existing = self._meta_get("archive_id")
-        if existing:
-            try:
-                return str(uuid.UUID(existing))
-            except ValueError as exc:
-                raise ResourceCaptureError("archive_id_invalid") from exc
         conn = self._connect()
         try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT value FROM resource_meta WHERE key = 'archive_id'"
+            ).fetchone()
+            if row is not None:
+                conn.commit()
+                value = str(row["value"] or "")
+                try:
+                    return str(uuid.UUID(value))
+                except ValueError as exc:
+                    raise ResourceCaptureError("archive_id_invalid") from exc
             has_identity_bound_data = any(
                 int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
                 for table in ("resource_chats", "resource_occurrences")
             )
-        finally:
-            conn.close()
-        if has_identity_bound_data:
-            raise ResourceCaptureError("archive_identity_missing")
-        candidate = str(self.archive_id_factory())
-        try:
-            candidate = str(uuid.UUID(candidate))
-        except ValueError as exc:
-            raise ResourceCaptureError("archive_id_invalid") from exc
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
+            if has_identity_bound_data:
+                raise ResourceCaptureError("archive_identity_missing")
+            candidate = str(self.archive_id_factory())
+            try:
+                candidate = str(uuid.UUID(candidate))
+            except ValueError as exc:
+                raise ResourceCaptureError("archive_id_invalid") from exc
             conn.execute(
                 "INSERT OR IGNORE INTO resource_meta(key, value) VALUES ('archive_id', ?)",
                 (candidate,),
@@ -477,6 +524,22 @@ class SelectedResourceCapture:
         return [chat["chat_key"] for chat in self.selected_chats()]
 
     def initialize_selected_chat_cursors(self, start_timestamp=None):
+        try:
+            with self._operation_lock():
+                self._reload_canonical_config_locked()
+                return self._initialize_selected_chat_cursors_locked(start_timestamp)
+        except ResourceCaptureError as exc:
+            if exc.code == "capture_worker_busy":
+                return {
+                    "state": "worker_busy",
+                    "selected_chats": 0,
+                    "new_chats": 0,
+                    "reselected_chats": 0,
+                    "error_code": exc.code,
+                }
+            raise
+
+    def _initialize_selected_chat_cursors_locked(self, start_timestamp=None):
         default_start = int(
             self.now_func() if start_timestamp is None else start_timestamp
         )
@@ -615,6 +678,8 @@ class SelectedResourceCapture:
             "source_shard_unavailable",
             "source_shard_unknown",
             "source_shards_unavailable",
+            "source_cache_only",
+            "source_snapshot_failed",
         }:
             return code
         return "source_shard_unavailable"
@@ -864,6 +929,7 @@ class SelectedResourceCapture:
     def scan(self):
         try:
             with self._operation_lock():
+                self._reload_canonical_config_locked()
                 return self._scan_locked()
         except ResourceCaptureError as exc:
             if exc.code == "capture_worker_busy":
@@ -893,7 +959,7 @@ class SelectedResourceCapture:
                 "captured_files": 0,
                 "error_code": "source_unavailable",
             }
-        initialized = self.initialize_selected_chat_cursors()["new_chats"]
+        initialized = self._initialize_selected_chat_cursors_locked()["new_chats"]
         max_messages = max(1, int(
             self.config.get("resource_backup_max_messages_per_scan", 500)
         ))
@@ -1367,7 +1433,7 @@ class SelectedResourceCapture:
 
             # Planning is staging-only. Canonical chat/cursor rows are created or
             # reconciled only after the user applies the identity-bound plan.
-            self.initialize_selected_chat_cursors()
+            self._initialize_selected_chat_cursors_locked()
             now = self.now_func()
             conn.execute("BEGIN IMMEDIATE")
             before = conn.total_changes
@@ -1471,6 +1537,7 @@ class SelectedResourceCapture:
         include_files,
         mode,
     ):
+        self._reload_canonical_config_locked()
         if apply:
             return self._apply_backfill_run(
                 run_id,
@@ -1499,13 +1566,36 @@ class SelectedResourceCapture:
         exponential = min(maximum, base * (2 ** max(0, attempt_count - 1)))
         return max(1, int(exponential * (0.75 + 0.5 * float(self.random_func()))))
 
-    def _set_file_state(self, occurrence_id, status, *, method="", error_code="", values=None):
+    def _set_file_state(
+        self,
+        occurrence_id,
+        status,
+        *,
+        method="",
+        error_code="",
+        values=None,
+        expected_status=None,
+        expected_updated_at=None,
+    ):
         conn = self._connect()
         try:
             row = conn.execute(
-                "SELECT attempt_count FROM resource_occurrences WHERE occurrence_id = ?",
+                "SELECT attempt_count, status, updated_at FROM resource_occurrences "
+                "WHERE occurrence_id = ?",
                 (occurrence_id,),
             ).fetchone()
+            if row is None:
+                return False
+            if (
+                expected_status is not None
+                and str(row["status"] or "") != str(expected_status)
+            ):
+                return False
+            if (
+                expected_updated_at is not None
+                and float(row["updated_at"] or 0) != float(expected_updated_at)
+            ):
+                return False
             previous = int(row["attempt_count"] or 0) if row else 0
             failure = status in {
                 "waiting_cache", "insufficient_local_space", "retry_wait"
@@ -1522,17 +1612,37 @@ class SelectedResourceCapture:
                     continue
                 assignments.append(f"{key} = ?")
                 params.append(value)
-            params.append(occurrence_id)
-            conn.execute(
+            params.extend((occurrence_id, str(row["status"]), float(row["updated_at"])))
+            cursor = conn.execute(
                 "UPDATE resource_occurrences SET " + ", ".join(assignments)
-                + " WHERE occurrence_id = ?",
+                + " WHERE occurrence_id = ? AND status = ? AND updated_at = ?",
                 params,
             )
             conn.commit()
+            return int(cursor.rowcount or 0) == 1
         finally:
             conn.close()
 
-    def resolve_pending_files(self, limit=50):
+    def resolve_pending_files(self, limit=50, *, consent_check=None):
+        try:
+            with self._operation_lock():
+                self._reload_canonical_config_locked()
+                return self._resolve_pending_files_locked(
+                    limit=limit,
+                    consent_check=consent_check,
+                )
+        except ResourceCaptureError as exc:
+            if exc.code == "capture_worker_busy":
+                return {
+                    "state": "worker_busy",
+                    "processed": 0,
+                    "ready_local": 0,
+                    "failed": 0,
+                    "error_code": exc.code,
+                }
+            raise
+
+    def _resolve_pending_files_locked(self, limit=50, *, consent_check=None):
         chat_keys = self.selected_chat_keys()
         if not chat_keys:
             return {"state": "no_selected_chats", "processed": 0, "ready_local": 0, "failed": 0}
@@ -1562,6 +1672,14 @@ class SelectedResourceCapture:
         ready_local = 0
         failed = 0
         for row in rows:
+            if consent_check is not None and not bool(consent_check()):
+                return {
+                    "state": "consent_revoked",
+                    "processed": processed,
+                    "ready_local": ready_local,
+                    "failed": failed,
+                    "error_code": "attachment_consent_revoked",
+                }
             processed += 1
             result = self.archive.preserve_file_mention(dict(row))
             status = str(result.get("status") or "retry_wait")
@@ -1576,24 +1694,32 @@ class SelectedResourceCapture:
                         "object_size": int(result["size"]),
                         "object_relpath": result["object_relpath"],
                     },
+                    expected_status=row["status"],
+                    expected_updated_at=row["updated_at"],
                 )
                 ready_local += 1
             elif status == "missing_retryable":
                 self._set_file_state(
                     row["occurrence_id"], "waiting_cache",
                     method=method, error_code=status,
+                    expected_status=row["status"],
+                    expected_updated_at=row["updated_at"],
                 )
                 failed += 1
             elif status in {"ambiguous", "object_too_large", "source_rejected"}:
                 self._set_file_state(
                     row["occurrence_id"], status,
                     method=method, error_code=status,
+                    expected_status=row["status"],
+                    expected_updated_at=row["updated_at"],
                 )
                 failed += 1
             elif status == "insufficient_local_space":
                 self._set_file_state(
                     row["occurrence_id"], status,
                     method=method, error_code=status,
+                    expected_status=row["status"],
+                    expected_updated_at=row["updated_at"],
                 )
                 failed += 1
             else:
@@ -1601,6 +1727,8 @@ class SelectedResourceCapture:
                     row["occurrence_id"], "retry_wait",
                     method=method,
                     error_code=str(result.get("error_code") or status),
+                    expected_status=row["status"],
+                    expected_updated_at=row["updated_at"],
                 )
                 failed += 1
         return {
@@ -1678,25 +1806,70 @@ class SelectedResourceCapture:
             "error_code": self._meta_get("source_error_code", ""),
         }
 
-    def run(self, resolve_limit=50, *, resolve_files=False):
-        scan = self.scan()
-        resolve = (
-            self.resolve_pending_files(limit=resolve_limit)
-            if resolve_files
-            else {
-                "state": "skipped",
-                "reason": "file_resolution_disabled",
+    def run(
+        self,
+        resolve_limit=50,
+        *,
+        resolve_files=False,
+        consent_check=None,
+    ):
+        try:
+            with self._operation_lock():
+                self._reload_canonical_config_locked()
+                scan = self._scan_locked()
+                if str(scan.get("state") or "") == "worker_busy":
+                    raise ResourceCaptureError("capture_worker_busy")
+                resolve = (
+                    self._resolve_pending_files_locked(
+                        limit=resolve_limit,
+                        consent_check=consent_check,
+                    )
+                    if resolve_files
+                    else {
+                        "state": "skipped",
+                        "reason": "file_resolution_disabled",
+                        "processed": 0,
+                        "ready_local": 0,
+                        "failed": 0,
+                    }
+                )
+        except ResourceCaptureError as exc:
+            if exc.code != "capture_worker_busy":
+                raise
+            scan = {
+                "state": "worker_busy",
+                "scanned": 0,
+                "captured_links": 0,
+                "captured_files": 0,
+                "error_code": exc.code,
+            }
+            resolve = {
+                "state": "not_run_worker_busy",
                 "processed": 0,
                 "ready_local": 0,
                 "failed": 0,
             }
-        )
+            return {"state": "worker_busy", "scan": scan, "resolve": resolve}
         scan_state = str(scan.get("state") or "")
         resolve_state = str(resolve.get("state") or "")
-        if scan_state in {"no_selected_chats", "source_unavailable"}:
+        if scan_state in {"no_selected_chats", "source_unavailable", "worker_busy"}:
             state = scan_state
+        elif resolve_state == "consent_revoked":
+            state = "consent_revoked"
         elif scan_state == "source_degraded" or resolve_state == "degraded":
             state = "degraded"
         else:
             state = "healthy"
         return {"state": state, "scan": scan, "resolve": resolve}
+
+
+def update_resource_backup_selection(config, selected_chats):
+    """Patch selection and initialize its epoch under one capture operation lock."""
+    with resource_capture_operation_lock(config):
+        updated = update_config(patch={
+            "resource_backup_selected_chats": list(selected_chats or []),
+        })
+        capture = SelectedResourceCapture.from_config(updated)
+        capture._reload_canonical_config_locked()
+        initialized = capture._initialize_selected_chat_cursors_locked()
+        return updated, initialized

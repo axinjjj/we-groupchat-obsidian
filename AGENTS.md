@@ -71,6 +71,17 @@ private/public publication, app-bundle rebuild, LaunchAgent reload and live
 acceptance are separate gates. Do not mutate live config/data or reload a live
 agent merely because source tests pass.
 
+## Review ref resolution
+
+Before producing a code-review finding, resolve and print `repository`,
+`requested_ref`, `resolved_sha`, `default_branch_sha`, `merge_base`, and
+`applies_to`. When Faye supplies a named active branch, PR branch, or review
+URL, inspect that exact immutable SHA. Never transfer a finding from the
+default branch to the active branch, and never fall back to `main` when the
+requested ref cannot be resolved; fail closed instead. Every finding title
+must include `applies_to=<ref>@<sha>`. If a default-branch defect is already
+closed on a verified active branch, label both facts explicitly.
+
 ## Documentation triggers
 
 Update README EN/ZH when entrypoints, supported behavior, privacy boundaries,

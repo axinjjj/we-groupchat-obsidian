@@ -13,6 +13,7 @@ from core.config import (
     _sanitize_config,
     active_monitor_chats,
     merge_monitor_chat_preferences,
+    load_config,
     selected_resource_backup_chats,
     selected_drive_sync_chats,
 )
@@ -27,6 +28,44 @@ def _config_patch_worker(path, field, value, start_event, iterations=1):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_auto_detect_install_does_not_overwrite_concurrent_explicit_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            explicit = os.path.join(tmp, "explicit-but-unmounted")
+            detected = os.path.join(tmp, "detected")
+            store = ConfigStore(path)
+            store.replace({"db_dir": ""})
+
+            def detect_after_explicit_write():
+                store.update(lambda config: {**config, "db_dir": explicit})
+                return detected
+
+            with (
+                patch("core.config.CONFIG_FILE", path),
+                patch("core.config.DATA_DIR", tmp),
+                patch("core.config.auto_detect_db_dir", side_effect=detect_after_explicit_write),
+            ):
+                loaded = load_config()
+
+            self.assertEqual(loaded["db_dir"], explicit)
+            self.assertEqual(store.read()["db_dir"], explicit)
+
+    def test_nonempty_unavailable_explicit_source_is_not_auto_replaced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            explicit = os.path.join(tmp, "temporarily-unavailable")
+            ConfigStore(path).replace({"db_dir": explicit})
+
+            with (
+                patch("core.config.CONFIG_FILE", path),
+                patch("core.config.DATA_DIR", tmp),
+                patch("core.config.auto_detect_db_dir") as detect,
+            ):
+                loaded = load_config()
+
+            detect.assert_not_called()
+            self.assertEqual(loaded["db_dir"], explicit)
+
     def test_config_store_noop_patch_keeps_revision(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = ConfigStore(os.path.join(tmp, "config.json"))

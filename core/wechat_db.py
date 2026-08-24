@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import tempfile
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
@@ -16,7 +17,7 @@ from urllib.parse import quote
 
 import zstandard as zstd
 
-from .decryptor import decrypt_database, decrypt_wal
+from .decryptor import WALSnapshotError, decrypt_database, decrypt_wal
 
 _zstd_dctx = zstd.ZstdDecompressor()
 
@@ -498,18 +499,17 @@ class WeChatDB:
         if not enc_key:
             return None
 
-        wal_path = db_path + "-wal"
-        db_identity = self._file_identity(db_path)
-        wal_identity = self._file_identity(wal_path)
-        if db_identity is None:
-            return None
         key_fingerprint = self._key_fingerprint(rel_path)
+        wal_path = db_path + "-wal"
+        cache_path = self._cache_path(rel_path)
+        for _attempt in range(2):
+            db_identity = self._file_identity(db_path)
+            wal_identity = self._file_identity(wal_path)
+            if db_identity is None:
+                return None
 
-        # Check cache
-        if rel_path in self._db_cache:
-            record = self._db_cache[rel_path]
-            cache_path = record["cache_path"]
-            if (
+            record = self._db_cache.get(rel_path)
+            if record is not None and (
                 record["db_identity"] == db_identity
                 and record["wal_identity"] == wal_identity
                 and record["key_fingerprint"] == key_fingerprint
@@ -517,44 +517,49 @@ class WeChatDB:
             ):
                 return self._pin_source_snapshot(rel_path, cache_path)
 
-        # Decrypt
-        cache_path = self._cache_path(rel_path)
-
-        fd, temp_path = tempfile.mkstemp(
-            prefix=".partial-", suffix=".db", dir=self.cache_dir
-        )
-        os.close(fd)
-        try:
-            pages = decrypt_database(db_path, temp_path, enc_key)
-            if pages == 0:
-                return None
-
-            # Patch WAL into the private temporary file.  Only a complete file is
-            # published at the shared cache path, so another process can never
-            # observe an in-place partial rewrite.
-            if os.path.exists(wal_path):
-                decrypt_wal(wal_path, temp_path, enc_key)
+            fd, temp_path = tempfile.mkstemp(
+                prefix=".partial-", suffix=".db", dir=self.cache_dir
+            )
+            os.close(fd)
             try:
-                os.chmod(temp_path, 0o600)
-            except OSError:
-                pass
-            os.replace(temp_path, cache_path)
-            temp_path = ""
-        finally:
-            if temp_path:
+                pages = decrypt_database(db_path, temp_path, enc_key)
+                if pages == 0:
+                    return None
+                if wal_identity is not None:
+                    decrypt_wal(wal_path, temp_path, enc_key)
+
+                # A checkpoint/reset/replacement during reconstruction can mix
+                # database generations.  Publish only when both source files
+                # still have the exact identities observed before decryption.
+                if (
+                    self._file_identity(db_path) != db_identity
+                    or self._file_identity(wal_path) != wal_identity
+                ):
+                    continue
                 try:
-                    os.unlink(temp_path)
+                    os.chmod(temp_path, 0o600)
                 except OSError:
                     pass
+                os.replace(temp_path, cache_path)
+                temp_path = ""
+            except WALSnapshotError as exc:
+                raise WeChatSourceDegraded("source_snapshot_failed") from exc
+            finally:
+                if temp_path:
+                    try:
+                        os.unlink(temp_path)
+                    except OSError:
+                        pass
 
-        self._db_cache[rel_path] = {
-            "db_identity": db_identity,
-            "wal_identity": wal_identity,
-            "key_fingerprint": key_fingerprint,
-            "cache_path": cache_path,
-            "published_identity": self._file_identity(cache_path),
-        }
-        return self._pin_source_snapshot(rel_path, cache_path)
+            self._db_cache[rel_path] = {
+                "db_identity": db_identity,
+                "wal_identity": wal_identity,
+                "key_fingerprint": key_fingerprint,
+                "cache_path": cache_path,
+                "published_identity": self._file_identity(cache_path),
+            }
+            return self._pin_source_snapshot(rel_path, cache_path)
+        raise WeChatSourceDegraded("source_snapshot_failed")
 
     def _load_contacts(self):
         """Load contacts."""
@@ -813,10 +818,20 @@ class WeChatDB:
             return "NULL AS [__rowid]"
 
     def _db_shard_identity(self, db_path):
-        basename = os.path.basename(str(db_path))
+        path = os.path.abspath(str(db_path))
+        try:
+            source_stat = os.lstat(path)
+        except OSError:
+            source_identity = "missing"
+        else:
+            source_identity = (
+                f"{source_stat.st_dev}:{source_stat.st_ino}"
+                if stat.S_ISREG(source_stat.st_mode)
+                else "not-regular"
+            )
         namespace = str(getattr(self, "cache_namespace", "legacy-unscoped"))
         return hashlib.sha256(
-            f"wechat-db-shard-v2\0{namespace}\0{basename}".encode()
+            f"wechat-db-shard-v3\0{namespace}\0{path}\0{source_identity}".encode()
         ).hexdigest()[:20]
 
     @staticmethod
@@ -1026,11 +1041,36 @@ class WeChatDB:
 
         return messages
 
-    def _source_shard_identity(self, rel_key):
+    def _source_generation_marker(self, rel_key, *, cache_path=""):
+        path = cache_path or os.path.join(self.db_dir, rel_key)
+        try:
+            source_stat = os.lstat(path)
+            if not stat.S_ISREG(source_stat.st_mode):
+                return "not-regular"
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                prefix = os.read(fd, 16)
+            finally:
+                os.close(fd)
+        except OSError:
+            return "missing"
+        return hashlib.sha256(
+            b"wechat-db-generation-v1\0"
+            + f"{source_stat.st_dev}:{source_stat.st_ino}\0".encode("ascii")
+            + prefix
+            + b"\0"
+            + self._key_fingerprint(rel_key).encode("ascii")
+        ).hexdigest()
+
+    def _source_shard_identity(self, rel_key, *, cache_path=""):
         normalized = str(rel_key or "").replace("\\", "/").lower()
         namespace = str(getattr(self, "cache_namespace", "legacy-unscoped"))
+        generation = self._source_generation_marker(
+            rel_key,
+            cache_path=cache_path,
+        )
         return hashlib.sha256(
-            f"wechat-message-source-shard-v2\0{namespace}\0{normalized}".encode(
+            f"wechat-message-source-shard-v3\0{namespace}\0{normalized}\0{generation}".encode(
                 "utf-8"
             )
         ).hexdigest()[:20]
@@ -1061,6 +1101,7 @@ class WeChatDB:
                     "source_shard_id": self._source_shard_identity(rel_key),
                     "rel_key": rel_key,
                     "cache_path": "",
+                    "cache_only": False,
                 })
         if specs:
             return specs
@@ -1074,15 +1115,22 @@ class WeChatDB:
                 cache_path = self._fallback_cache_path(rel_key)
                 if os.path.isfile(cache_path):
                     specs.append({
-                        "source_shard_id": self._source_shard_identity(rel_key),
+                        "source_shard_id": self._source_shard_identity(
+                            rel_key,
+                            cache_path=cache_path,
+                        ),
                         "rel_key": rel_key,
                         "cache_path": cache_path,
+                        "cache_only": True,
                     })
         return specs
 
     def get_message_shards(self, _username):
         """Return privacy-safe identities for every known message shard."""
-        return [spec["source_shard_id"] for spec in self._message_shard_specs()]
+        specs = self._message_shard_specs()
+        if specs and all(spec.get("cache_only") for spec in specs):
+            raise WeChatSourceDegraded("source_cache_only")
+        return [spec["source_shard_id"] for spec in specs]
 
     def get_messages_for_shard(
         self,
@@ -1164,6 +1212,8 @@ class WeChatDB:
         )
         if spec is None:
             raise WeChatSourceDegraded("source_shard_unknown")
+        if spec.get("cache_only"):
+            raise WeChatSourceDegraded("source_cache_only")
         path = spec["cache_path"] or self._get_decrypted_db(spec["rel_key"])
         if not path:
             raise WeChatSourceDegraded("source_shard_unavailable")
@@ -1183,13 +1233,6 @@ class WeChatDB:
         if not exists:
             return {"messages": [], "next_cursor": cursor_token, "exhausted": True}
 
-        source_path = os.path.join(self.db_dir, spec["rel_key"])
-        if spec["cache_path"]:
-            identity_path = spec["cache_path"]
-        elif self._is_plain_sqlite(source_path):
-            identity_path = source_path
-        else:
-            identity_path = self._cache_path(spec["rel_key"])
         messages = self._get_messages_from_paths(
             username,
             [path],
@@ -1197,7 +1240,7 @@ class WeChatDB:
             limit=page_limit + 1,
             page_forward=True,
             include_filtered=True,
-            db_shard_id=self._db_shard_identity(identity_path),
+            db_shard_id=str(spec["source_shard_id"]),
             after_cursor=after_cursor,
         )
         exhausted = len(messages) <= page_limit
@@ -1236,6 +1279,8 @@ class WeChatDB:
         )
         if spec is None:
             raise WeChatSourceDegraded("source_shard_unknown")
+        if spec.get("cache_only"):
+            raise WeChatSourceDegraded("source_cache_only")
         path = spec["cache_path"] or self._get_decrypted_db(spec["rel_key"])
         if not path:
             raise WeChatSourceDegraded("source_shard_unavailable")
@@ -1254,13 +1299,6 @@ class WeChatDB:
                 conn.close()
         if not exists:
             return []
-        source_path = os.path.join(self.db_dir, spec["rel_key"])
-        if spec["cache_path"]:
-            identity_path = spec["cache_path"]
-        elif self._is_plain_sqlite(source_path):
-            identity_path = source_path
-        else:
-            identity_path = self._cache_path(spec["rel_key"])
         return self._get_messages_from_paths(
             username,
             [path],
@@ -1270,7 +1308,7 @@ class WeChatDB:
             page_forward=page_forward,
             since_inclusive=since_inclusive,
             include_filtered=include_filtered,
-            db_shard_id=self._db_shard_identity(identity_path),
+            db_shard_id=str(spec["source_shard_id"]),
         )
 
     def get_messages(

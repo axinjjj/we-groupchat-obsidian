@@ -9,6 +9,12 @@ from unittest.mock import patch
 
 from Crypto.Cipher import AES
 
+from core.decryptor import (
+    PAGE_SZ,
+    WAL_MAGIC_LITTLE_ENDIAN_CHECKSUM,
+    _wal_checksum,
+    decrypt_wal,
+)
 from core.image_decoder import decode_wechat_image_data, detect_mime
 from core.wechat_db import WeChatDB, WeChatSourceDegraded
 
@@ -55,6 +61,89 @@ class WeChatDBCacheRefreshTests(unittest.TestCase):
         self.assertEqual(after_paths, [self.cache_path])
         self.assertEqual(after_table, self.table_name)
         self.assertTrue(os.path.exists(self.cache_path))
+
+    def test_cache_only_message_source_is_explicitly_degraded(self):
+        with self.assertRaisesRegex(WeChatSourceDegraded, "source_cache_only"):
+            self.db.get_message_shards(self.username)
+
+    def test_live_shard_identity_changes_when_same_path_is_replaced(self):
+        rel_path = "message/message_4.db"
+        source_path = os.path.join(self.tmp.name, rel_path)
+        os.makedirs(os.path.dirname(source_path), exist_ok=True)
+        conn = sqlite3.connect(source_path)
+        conn.execute("CREATE TABLE first_generation(value TEXT)")
+        conn.commit()
+        conn.close()
+        db = WeChatDB(self.tmp.name, keys={})
+        first = db.get_message_shards(self.username)
+
+        replacement = os.path.join(self.tmp.name, "replacement.db")
+        conn = sqlite3.connect(replacement)
+        conn.execute("CREATE TABLE second_generation(value TEXT)")
+        conn.commit()
+        conn.close()
+        os.replace(replacement, source_path)
+        second = db.get_message_shards(self.username)
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 1)
+        self.assertNotEqual(first, second)
+
+    def test_live_shard_identity_changes_after_key_rotation(self):
+        rel_path = "message/message_5.db"
+        source_path = os.path.join(self.tmp.name, rel_path)
+        os.makedirs(os.path.dirname(source_path), exist_ok=True)
+        with open(source_path, "wb") as handle:
+            handle.write(b"encrypted generation marker")
+        db = WeChatDB(self.tmp.name, keys={
+            rel_path: {"enc_key": "11" * 32},
+        })
+        first = db.get_message_shards(self.username)
+
+        db.keys[rel_path] = {"enc_key": "22" * 32}
+        second = db.get_message_shards(self.username)
+
+        self.assertNotEqual(first, second)
+
+    def test_encrypted_reconstruction_retries_when_source_identity_changes(self):
+        rel_path = "message/message_6.db"
+        source_path = os.path.join(self.tmp.name, rel_path)
+        os.makedirs(os.path.dirname(source_path), exist_ok=True)
+        with open(source_path, "wb") as handle:
+            handle.write(b"encrypted fixture")
+        db = WeChatDB(self.tmp.name, keys={
+            rel_path: {"enc_key": "33" * 32},
+        })
+        calls = []
+
+        def fake_decrypt(_source, output, _key):
+            calls.append(output)
+            conn = sqlite3.connect(output)
+            conn.execute("CREATE TABLE snapshot_value(value TEXT)")
+            conn.execute("INSERT INTO snapshot_value VALUES ('stable')")
+            conn.commit()
+            conn.close()
+            if len(calls) == 1:
+                with open(source_path, "ab") as handle:
+                    handle.write(b"changed")
+            return 1
+
+        with (
+            patch.object(db, "_is_plain_sqlite", return_value=False),
+            patch("core.wechat_db.decrypt_database", side_effect=fake_decrypt),
+        ):
+            path = db._get_decrypted_db(rel_path)
+
+        self.assertEqual(len(calls), 2)
+        conn = sqlite3.connect(path)
+        try:
+            self.assertEqual(
+                conn.execute("SELECT value FROM snapshot_value").fetchone()[0],
+                "stable",
+            )
+        finally:
+            conn.close()
+
 
     def test_decrypted_cache_publish_is_atomic_and_snapshot_is_pinned(self):
         rel_path = "message/message_1.db"
@@ -183,6 +272,84 @@ class WeChatDBCacheRefreshTests(unittest.TestCase):
             self.assertFalse(os.path.exists(pinned))
         finally:
             source.close()
+
+
+class SQLiteWalReplayTests(unittest.TestCase):
+    @staticmethod
+    def _wal_bytes(frames):
+        salt1 = 0x11223344
+        salt2 = 0x55667788
+        header_prefix = struct.pack(
+            ">IIIIII",
+            WAL_MAGIC_LITTLE_ENDIAN_CHECKSUM,
+            3_007_000,
+            PAGE_SZ,
+            0,
+            salt1,
+            salt2,
+        )
+        checksum = _wal_checksum(header_prefix, byteorder="little")
+        payload = bytearray(header_prefix + struct.pack(">II", *checksum))
+        for pgno, db_pages, page in frames:
+            frame_prefix = struct.pack(">IIII", pgno, db_pages, salt1, salt2)
+            checksum = _wal_checksum(
+                frame_prefix[:8] + page,
+                checksum,
+                byteorder="little",
+            )
+            payload.extend(frame_prefix + struct.pack(">II", *checksum) + page)
+        return bytes(payload)
+
+    def test_wal_replay_ignores_valid_uncommitted_tail_and_truncates_to_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wal_path = os.path.join(tmp, "fixture.db-wal")
+            out_path = os.path.join(tmp, "fixture.db")
+            committed = b"A" * PAGE_SZ
+            uncommitted = b"B" * PAGE_SZ
+            with open(wal_path, "wb") as handle:
+                handle.write(self._wal_bytes([
+                    (1, 1, committed),
+                    (1, 0, uncommitted),
+                ]))
+            with open(out_path, "wb") as handle:
+                handle.write(b"0" * (PAGE_SZ * 2))
+
+            with patch(
+                "core.decryptor.decrypt_page",
+                side_effect=lambda _key, page, _pgno: page,
+            ):
+                patched = decrypt_wal(wal_path, out_path, "00" * 32)
+
+            self.assertEqual(patched, 1)
+            self.assertEqual(os.path.getsize(out_path), PAGE_SZ)
+            with open(out_path, "rb") as handle:
+                self.assertEqual(handle.read(), committed)
+
+    def test_wal_replay_stops_at_checksum_failure_after_last_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wal_path = os.path.join(tmp, "fixture.db-wal")
+            out_path = os.path.join(tmp, "fixture.db")
+            committed = b"C" * PAGE_SZ
+            tail = b"D" * PAGE_SZ
+            payload = bytearray(self._wal_bytes([
+                (1, 1, committed),
+                (1, 0, tail),
+            ]))
+            payload[-1] ^= 0x01
+            with open(wal_path, "wb") as handle:
+                handle.write(payload)
+            with open(out_path, "wb") as handle:
+                handle.write(b"0" * PAGE_SZ)
+
+            with patch(
+                "core.decryptor.decrypt_page",
+                side_effect=lambda _key, page, _pgno: page,
+            ):
+                patched = decrypt_wal(wal_path, out_path, "00" * 32)
+
+            self.assertEqual(patched, 1)
+            with open(out_path, "rb") as handle:
+                self.assertEqual(handle.read(), committed)
 
 
 class WeChatDBPagingTests(unittest.TestCase):

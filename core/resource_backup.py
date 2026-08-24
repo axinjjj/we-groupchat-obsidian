@@ -19,6 +19,7 @@ import stat
 import tempfile
 import time
 import unicodedata
+import uuid
 from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -33,6 +34,8 @@ BACKUP_SCHEMA = "we-groupchat-obsidian.resource-backup.v3"
 INDEX_MARKER = "<!-- we-groupchat-obsidian:resource-index v1 -->"
 INDEX_MANIFEST_NAME = ".resource-index-manifest.json"
 INDEX_MANIFEST_SCHEMA = "we-groupchat-obsidian.resource-index-manifest.v1"
+DESTINATION_MARKER_NAME = ".wgo-destination.json"
+DESTINATION_MARKER_SCHEMA = "we-groupchat-obsidian.destination.v1"
 SETTINGS_FILE = os.path.join(DATA_DIR, "resource_backup.json")
 SETTINGS_LOCK_SUFFIX = ".lock"
 OCCURRENCE_ID_DOMAIN = b"we-groupchat-resource-occurrence-v1\0"
@@ -61,6 +64,76 @@ class ResourceBackupError(RuntimeError):
     def __init__(self, code):
         super().__init__(str(code))
         self.code = str(code)
+
+
+def evaluate_resource_backup_outcome(capture_result, backup_result):
+    """Return one shared success decision for app and CLI reporting."""
+    capture_result = capture_result or {}
+    backup_result = backup_result or {}
+    capture_state = str(capture_result.get("state") or "unknown")
+    resolve_state = str(
+        (capture_result.get("resolve") or {}).get("state") or "unknown"
+    )
+    projection_state = str(
+        (backup_result.get("obsidian") or {}).get("state") or "unknown"
+    )
+    handoff_state = str(backup_result.get("state") or "unknown")
+    completed = (
+        capture_state == "healthy"
+        and resolve_state in {"healthy", "skipped"}
+        and projection_state in {"written", "unchanged"}
+        and handoff_state in {"idle", "sync_delegated"}
+    )
+    if completed:
+        state = "ok"
+    elif capture_state != "healthy":
+        state = capture_state
+    elif resolve_state not in {"healthy", "skipped"}:
+        state = resolve_state
+    elif projection_state not in {"written", "unchanged"}:
+        state = projection_state
+    else:
+        state = handoff_state
+    return {
+        "completed": completed,
+        "state": state,
+        "capture_state": capture_state,
+        "resolve_state": resolve_state,
+        "projection_state": projection_state,
+        "handoff_state": handoff_state,
+    }
+
+
+def evaluate_link_backfill_outcome(backfill_result, backup_result):
+    backfill_result = backfill_result or {}
+    source_completed = (
+        bool(backfill_result.get("source_complete"))
+        and str(backfill_result.get("state") or "") == "applied"
+    )
+    backup_result = backup_result or {}
+    projection_state = str(
+        (backup_result.get("obsidian") or {}).get("state") or "unknown"
+    )
+    handoff_state = str(backup_result.get("state") or "unknown")
+    completed = (
+        source_completed
+        and projection_state in {"written", "unchanged"}
+        and handoff_state in {"idle", "sync_delegated"}
+    )
+    return {
+        "completed": completed,
+        "state": (
+            "ok"
+            if completed
+            else str(backfill_result.get("state") or "failed")
+            if not source_completed
+            else projection_state
+            if projection_state not in {"written", "unchanged"}
+            else handoff_state
+        ),
+        "projection_state": projection_state,
+        "handoff_state": handoff_state,
+    }
 
 
 def _ensure_dir(path):
@@ -472,6 +545,7 @@ class MountedResourceBackup:
         if mode not in {"full", "redacted", "off"}:
             raise ValueError("link_export_mode must be full, redacted, or off")
         self.link_export_mode = mode
+        self._destination_uuid = ""
         self._ensure_schema()
 
     @classmethod
@@ -486,10 +560,22 @@ class MountedResourceBackup:
     def destination_id(self):
         if not self.target:
             return ""
-        identity = os.path.realpath(self.target) or os.path.abspath(self.target)
-        return hashlib.sha256(
-            f"we-groupchat-mounted-target-v1\0{identity}".encode("utf-8")
-        ).hexdigest()
+        if self._destination_uuid:
+            return self._destination_uuid
+        payload = self._read_destination_marker(required=False)
+        if payload is None:
+            return ""
+        return str(payload["destination_uuid"])
+
+    @property
+    def _destination_marker_path(self):
+        if not self.target:
+            return ""
+        return os.path.join(
+            self.target,
+            "wgo-resource-backup",
+            DESTINATION_MARKER_NAME,
+        )
 
     def _connect(self):
         conn = sqlite3.connect(self.db_path)
@@ -546,6 +632,79 @@ class MountedResourceBackup:
             except OSError:
                 pass
             os.close(fd)
+
+    @contextmanager
+    def _target_worker_lock(self):
+        if not self.target or not os.path.isdir(self.target):
+            raise ResourceBackupError("destination_unavailable")
+        lock_path = os.path.join(self.target, ".wgo-resource-backup.lock")
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(lock_path, flags, 0o600)
+        except OSError as exc:
+            raise ResourceBackupError("target_lock_unavailable") from exc
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise ResourceBackupError("target_lock_invalid")
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                    raise ResourceBackupError("worker_busy") from exc
+                raise
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)
+
+    def _read_destination_marker(self, *, required):
+        path = self._destination_marker_path
+        if not path or not os.path.lexists(path):
+            if required:
+                raise ResourceBackupError("destination_identity_missing")
+            return None
+        try:
+            data = self._read_regular_bytes(
+                path,
+                error_code="destination_identity_invalid",
+            )
+            payload = json.loads(data.decode("utf-8"))
+            destination_uuid = str(payload.get("destination_uuid") or "")
+            destination_uuid = str(uuid.UUID(destination_uuid))
+        except (ResourceBackupError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            if isinstance(exc, ResourceBackupError):
+                raise
+            raise ResourceBackupError("destination_identity_invalid") from exc
+        if payload.get("schema") != DESTINATION_MARKER_SCHEMA:
+            raise ResourceBackupError("destination_identity_invalid")
+        if str(payload.get("archive_id") or "") != self.capture.archive_id:
+            raise ResourceBackupError("destination_archive_mismatch")
+        return {**payload, "destination_uuid": destination_uuid}
+
+    def _ensure_destination_identity_owned(self):
+        existing = self._read_destination_marker(required=False)
+        if existing is not None:
+            self._destination_uuid = str(existing["destination_uuid"])
+            return self._destination_uuid
+        marker_parent = os.path.dirname(self._destination_marker_path)
+        self._ensure_target_dir(marker_parent)
+        destination_uuid = str(uuid.uuid4())
+        payload = _canonical_json_bytes({
+            "schema": DESTINATION_MARKER_SCHEMA,
+            "archive_id": self.capture.archive_id,
+            "destination_uuid": destination_uuid,
+        })
+        self._target_atomic_bytes(self._destination_marker_path, payload)
+        confirmed = self._read_destination_marker(required=True)
+        self._destination_uuid = str(confirmed["destination_uuid"])
+        return self._destination_uuid
 
     def _target_boundary_error(self, occurrences=None, object_rows=None):
         if not self.target:
@@ -758,6 +917,29 @@ class MountedResourceBackup:
 
     def _managed_projection_paths(self, base_root, *, target_view):
         manifest_path = os.path.join(base_root, INDEX_MANIFEST_NAME)
+        if not os.path.lexists(manifest_path):
+            if os.path.isdir(base_root):
+                for root, dirs, files in os.walk(base_root, followlinks=False):
+                    dirs[:] = [
+                        name for name in dirs
+                        if not os.path.islink(os.path.join(root, name))
+                    ]
+                    for name in files:
+                        path = os.path.join(root, name)
+                        try:
+                            data = (
+                                self._read_regular_bytes(path)
+                                if target_view
+                                else MountedResourceBackup._read_regular_bytes(
+                                    path,
+                                    error_code="projection_file_conflict",
+                                )
+                            )
+                        except ResourceBackupError:
+                            continue
+                        if INDEX_MARKER.encode("utf-8") in data:
+                            raise ResourceBackupError("projection_owner_missing")
+            return set()
         try:
             data = (
                 self._read_regular_bytes(manifest_path)
@@ -773,6 +955,10 @@ class MountedResourceBackup:
                 or not isinstance(payload.get("paths"), list)
             ):
                 raise ValueError("invalid manifest")
+            if str(payload.get("archive_id") or "") != self.capture.archive_id:
+                raise ResourceBackupError("projection_archive_mismatch")
+            if target_view and str(payload.get("destination_id") or "") != self.destination_id:
+                raise ResourceBackupError("projection_destination_mismatch")
             result = set()
             for value in payload["paths"]:
                 relative = str(value or "")
@@ -784,31 +970,10 @@ class MountedResourceBackup:
                 ):
                     result.add(relative.replace("\\", "/"))
             return result
-        except (OSError, ResourceBackupError, UnicodeError, ValueError, json.JSONDecodeError):
-            result = set()
-            for root, dirs, files in os.walk(base_root, followlinks=False):
-                dirs[:] = [
-                    name
-                    for name in dirs
-                    if not os.path.islink(os.path.join(root, name))
-                ]
-                for name in files:
-                    path = os.path.join(root, name)
-                    try:
-                        data = (
-                            self._read_regular_bytes(path)
-                            if target_view
-                            else MountedResourceBackup._read_regular_bytes(
-                                path, error_code="projection_file_conflict"
-                            )
-                        )
-                    except ResourceBackupError:
-                        continue
-                    if INDEX_MARKER.encode("utf-8") in data:
-                        result.add(
-                            os.path.relpath(path, base_root).replace(os.sep, "/")
-                        )
-            return result
+        except ResourceBackupError:
+            raise
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            raise ResourceBackupError("projection_manifest_invalid") from exc
 
     def _reconcile_managed_projection(
         self,
@@ -816,13 +981,16 @@ class MountedResourceBackup:
         current_paths,
         *,
         target_view,
+        previous_paths=None,
     ):
         current = {
             os.path.relpath(path, base_root).replace(os.sep, "/")
             for path in current_paths
         }
-        previous = self._managed_projection_paths(
-            base_root, target_view=target_view
+        previous = (
+            self._managed_projection_paths(base_root, target_view=target_view)
+            if previous_paths is None
+            else set(previous_paths)
         )
         for relative in sorted(previous - current, reverse=True):
             path = os.path.abspath(os.path.join(base_root, relative))
@@ -854,6 +1022,7 @@ class MountedResourceBackup:
         payload = _canonical_json_bytes({
             "schema": INDEX_MANIFEST_SCHEMA,
             "archive_id": self.capture.archive_id,
+            "destination_id": self.destination_id if target_view else "local",
             "paths": sorted(current),
         })
         manifest_path = os.path.join(base_root, INDEX_MANIFEST_NAME)
@@ -973,6 +1142,9 @@ class MountedResourceBackup:
                 if stat.S_ISLNK(target_stat.st_mode) or not stat.S_ISREG(target_stat.st_mode):
                     raise ResourceBackupError("target_object_conflict")
                 if int(target_stat.st_size) != size:
+                    raise ResourceBackupError("target_object_conflict")
+                target_size, target_digest = _hash_path(target_path)
+                if target_size != size or target_digest != digest:
                     raise ResourceBackupError("target_object_conflict")
                 return "already_delegated", relpath
 
@@ -1342,6 +1514,11 @@ class MountedResourceBackup:
         }
 
     def _render_indexes_at(self, base_root, occurrences, *, target_view=False):
+        # Validate projection ownership before touching any generated path.
+        previous_managed_paths = self._managed_projection_paths(
+            base_root,
+            target_view=target_view,
+        )
         grouped = defaultdict(lambda: defaultdict(list))
         for row in occurrences:
             chat_key = str(row.get("chat_key") or "")
@@ -1474,10 +1651,25 @@ class MountedResourceBackup:
             base_root,
             managed_paths,
             target_view=target_view,
+            previous_paths=previous_managed_paths,
         )
         return written
 
     def render_obsidian_indexes(self):
+        try:
+            with self._worker_lock():
+                return self._render_obsidian_indexes_owned()
+        except ResourceBackupError as exc:
+            if exc.code == "worker_busy":
+                return {
+                    "state": "worker_busy",
+                    "files_written": 0,
+                    "occurrences": 0,
+                    "error_code": exc.code,
+                }
+            raise
+
+    def _render_obsidian_indexes_owned(self):
         occurrences = self.capture.occurrences(selected_only=True)
         root = os.path.join(self.obsidian_root, self.obsidian_subdir)
         _ensure_dir(root)
@@ -1489,7 +1681,7 @@ class MountedResourceBackup:
 
     def _render_obsidian_indexes_safely(self):
         try:
-            return self.render_obsidian_indexes()
+            return self._render_obsidian_indexes_owned()
         except (OSError, ResourceBackupError) as exc:
             return {
                 "state": "projection_failed",
@@ -1532,6 +1724,17 @@ class MountedResourceBackup:
                 stat.S_ISLNK(target_stat.st_mode)
                 or not stat.S_ISREG(target_stat.st_mode)
                 or int(target_stat.st_size) != int(row["object_size"])
+            ):
+                pending += 1
+                continue
+            try:
+                actual_size, actual_digest = _hash_path(target_path)
+            except (OSError, ResourceBackupError):
+                pending += 1
+                continue
+            if (
+                actual_size != int(row["object_size"])
+                or actual_digest != digest
             ):
                 pending += 1
         if boundary:
@@ -1627,11 +1830,13 @@ class MountedResourceBackup:
                 "failed": 0,
                 "obsidian": obsidian,
             }
-        return self._run_locked(
-            obsidian=obsidian,
-            occurrences=occurrences,
-            object_rows=object_rows,
-        )
+        with self._target_worker_lock():
+            self._ensure_destination_identity_owned()
+            return self._run_locked(
+                obsidian=obsidian,
+                occurrences=occurrences,
+                object_rows=object_rows,
+            )
 
     def _run_locked(self, *, obsidian=None, occurrences=None, object_rows=None):
         occurrences = (

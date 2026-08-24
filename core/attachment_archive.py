@@ -75,7 +75,27 @@ def _safe_object_name(value, fallback="attachment"):
     name = os.path.basename(str(value or "").strip())
     name = re.sub(r"[\x00-\x1f/:\\]+", "_", name).strip(" ._")
     name = re.sub(r"\s+", " ", name)
-    return (name or fallback)[:160]
+    name = name or fallback
+    if len(name.encode("utf-8")) <= 189:
+        return name
+    stem, extension = os.path.splitext(name)
+    if len(extension.encode("utf-8")) > 32:
+        extension = _utf8_prefix(extension, 32)
+    suffix = "--" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:8] + extension
+    stem = _utf8_prefix(stem, 189 - len(suffix.encode("utf-8"))).rstrip(" ._")
+    return (stem + suffix) if stem else _utf8_prefix(suffix, 189)
+
+
+def _utf8_prefix(value, max_bytes):
+    result = []
+    used = 0
+    for char in str(value or ""):
+        encoded = char.encode("utf-8")
+        if used + len(encoded) > max(0, int(max_bytes)):
+            break
+        result.append(char)
+        used += len(encoded)
+    return "".join(result)
 
 
 def _hash_stream(stream):

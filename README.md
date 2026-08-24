@@ -191,7 +191,9 @@ independently deployed microservices. Editable sources:
   project does not schedule short-lived source/resource workers that would make
   that process-lifetime consent recur; attachment-byte resolution is a separate
   in-memory session opt-in that resets on every app restart and is never
-  restored from config. Link-only backfill never reads the attachment cache.
+  restored from config. Turning it off also cancels the in-flight resolver
+  before its next attachment-byte operation. Link-only backfill never reads the
+  attachment cache.
 - Cloud AI providers receive the text you ask them to summarize. Use Ollama if you want the AI step to stay local.
 - Remote link previews are disabled by default. If you set `monitor_fetch_links: true`, the app fetches public URLs found in monitored messages, and those remote sites may receive your request metadata. Link preview has a conservative SSRF guard, but it is still a best-effort public URL preview, not a hardened crawler.
 - MCP read tools expose local chat-derived data to the MCP client. Some management tools can mutate local metadata such as groups or config-derived state.
@@ -389,7 +391,10 @@ Apply requires the exact unexpired `run_id` returned by that plan and consumes
 only its staged rows; it never rescans source after confirmation. Ordinary
 resource `run` skips attachment-byte resolution. `--resolve-files` authorizes
 only that explicit CLI run, while menu consent lasts only for the current app
-process. Drive
+process and is rechecked before every attachment-byte operation. Each mounted
+target receives a private random destination marker bound to the local archive;
+path reuse, target replacement, or a different archive fails closed instead of
+reusing receipts or managed projection ownership. Drive
 `enable` does not authenticate, select chats, backfill, or run an upload. Backup `verify` checks bytes visible at the configured filesystem target
 and deliberately makes no claim about provider-side upload. See the
 [source reliability guide](docs/source-reliability.md) for mounted handoff,

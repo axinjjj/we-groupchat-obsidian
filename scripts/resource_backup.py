@@ -23,6 +23,7 @@ from core.config import (
 from core.key_extractor import get_cached_keys
 from core.resource_backup import (
     MountedResourceBackup,
+    evaluate_resource_backup_outcome,
     load_resource_backup_settings,
     save_resource_backup_settings,
 )
@@ -31,7 +32,12 @@ from core.resource_backup_launch_agent import (
     status as resource_backup_agent_status,
     uninstall as uninstall_resource_backup_agent,
 )
-from core.resource_capture import SelectedResourceCapture, resource_backup_chat_candidates
+from core.resource_capture import (
+    ResourceCaptureError,
+    SelectedResourceCapture,
+    resource_backup_chat_candidates,
+    update_resource_backup_selection,
+)
 from core.wechat_db import WeChatDB
 
 
@@ -92,6 +98,12 @@ def _exit_code(result):
         "run_not_found",
         "selection_changed",
         "candidate_mismatch",
+        "consent_revoked",
+        "not_run_worker_busy",
+        "projection_failed",
+        "projection_archive_mismatch",
+        "projection_destination_mismatch",
+        "projection_owner_missing",
     }:
         return 2
     return 0
@@ -223,9 +235,16 @@ def main(argv=None):
             chat["selected_since"] = int(old.get("selected_since") or now)
             chat["selection_id"] = str(old.get("selection_id") or uuid.uuid4())
             selected.append(chat)
-        updated = update_config(patch={
-            "resource_backup_selected_chats": selected,
-        })
+        try:
+            updated, _initialized = update_resource_backup_selection(
+                config,
+                selected,
+            )
+        except ResourceCaptureError as exc:
+            if exc.code == "capture_worker_busy":
+                _print({"state": "worker_busy", "error_code": exc.code})
+                return 2
+            raise
         _print({
             "state": "configured",
             "selected_chats": len(selected),
@@ -233,7 +252,13 @@ def main(argv=None):
         })
         return 0
     if args.command == "clear-selected-chats":
-        update_config(patch={"resource_backup_selected_chats": []})
+        try:
+            update_resource_backup_selection(config, [])
+        except ResourceCaptureError as exc:
+            if exc.code == "capture_worker_busy":
+                _print({"state": "worker_busy", "error_code": exc.code})
+                return 2
+            raise
         _print({"state": "configured", "selected_chats": 0})
         return 0
     if args.command in {"enable", "disable"}:
@@ -338,22 +363,18 @@ def main(argv=None):
             resolve_limit=max(1, args.resolve_limit),
             resolve_files=bool(args.resolve_files),
         )
-        backup_result = _backup(
-            config,
-            capture=capture,
-            link_export_mode=args.link_export_mode,
-        ).run()
-        state = "ok"
-        capture_state = str(capture_result.get("state") or "")
-        backup_state = str(backup_result.get("state") or "")
-        if capture_state in {"degraded", "source_degraded", "source_unavailable"}:
-            state = capture_state
-        if backup_state in {
-            "invalid_target", "target_failed", "target_not_configured",
-            "destination_unavailable", "no_selected_chats", "worker_busy",
-            "pending_resources",
-        }:
-            state = backup_state
+        if capture_result.get("state") == "worker_busy":
+            backup_result = {"state": "not_run_worker_busy"}
+        else:
+            backup_result = _backup(
+                config,
+                capture=capture,
+                link_export_mode=args.link_export_mode,
+            ).run()
+        state = evaluate_resource_backup_outcome(
+            capture_result,
+            backup_result,
+        )["state"]
         result = {
             "state": state,
             "capture": capture_result,

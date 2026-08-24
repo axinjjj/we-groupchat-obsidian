@@ -95,6 +95,22 @@ Missing optional columns remain explicit nulls. A deterministic
 `source_message_id` is derived from those values and a hash of the chat
 username; it does not expose the username or `wxid`.
 
+An explicitly configured `db_dir` remains authoritative even when its mount or
+container is temporarily unavailable; auto-detection can fill only a still-empty
+canonical value. Message-shard identity includes the source namespace, key
+fingerprint, and stable database-generation evidence (file identity plus the
+encrypted-page salt/header prefix). Replacing or rekeying a database at the
+same relative path therefore starts a new shard cursor instead of reusing the
+old generation. A decrypted cache with no corresponding live source is marked
+`source_cache_only` and cannot produce an applicable backfill plan.
+
+Encrypted WAL reconstruction validates the SQLite WAL header and cumulative
+frame checksums, applies frames only through the last valid commit marker,
+honors the committed database-page count, and discards an uncommitted tail.
+Main/WAL identities are checked again before publishing the decrypted cache;
+a concurrent checkpoint, reset, or replacement triggers one bounded retry and
+then `source_snapshot_failed` rather than publishing a mixed snapshot.
+
 File XML and image packed metadata are parsed before message text is cleaned.
 The resulting resource envelope can contain the original file name, declared
 size, declared MD5/SHA-256, attach id, extension, or image hash. Only sender and
@@ -305,6 +321,7 @@ unavailable, and then attempts mounted handoff. `--resolve-files` is explicit.
 The mounted subtree is:
 
 ```text
+<target>/wgo-resource-backup/.wgo-destination.json
 <target>/wgo-resource-backup/v3/
   objects/sha256/...
   snapshots/<snapshot-id>/{manifest.json,resources.jsonl,COMPLETE}
@@ -315,9 +332,13 @@ Plan and run reject filesystem-root, same/nested/ancestor local-source targets,
 a symlink configured target, and a symlink or non-directory in the app-owned
 subtree, including planned object, snapshot, view, and chat-index directories.
 Snapshot/view conflicts return structured `target_failed` results. A successful first copy hashes while writing and immediately reads the
-target bytes back. Later scheduled runs trust the local delivery receipt plus
-regular-file type and logical size so they do not rehydrate streamed
-placeholders. Explicit `verify` performs the full target rehash.
+target bytes back. The regular, non-symlink destination marker contains a
+random UUID bound to the owning archive, and a target-side lock serializes
+different local ledgers that point at the same mount. Projection manifests bind
+both archive and destination identities before any write or managed GC. Later
+scheduled runs rehash a receipted target object before reuse, so a same-size
+replacement cannot inherit the old receipt. Explicit `verify` rehashes every
+object in the selected snapshot.
 
 `sync_delegated` means the resolved file bytes were written and immediately
 verified on the mounted filesystem. It never means provider-side upload or
@@ -352,7 +373,9 @@ GC, and mounted handoff share a second operation lock.
 
 File-byte resolution remains off by default and requires the menu confirmation
 or `--resolve-files` on the current explicit CLI run. Menu consent exists only
-in memory, is never persisted, and resets when the app process exits. Old resource
+in memory, is never persisted, resets when the app process exits, and is checked
+again before each attachment-byte operation so turning it off stops the next
+file immediately. Old resource
 LaunchAgent installs are detected and removable, but new installation is
 refused for the same process-lifetime consent reason.
 

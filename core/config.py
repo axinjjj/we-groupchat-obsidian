@@ -712,16 +712,25 @@ def auto_detect_db_dir():
 
 
 def load_config():
-    """Load config, auto-detect on first run."""
+    """Load config and install an auto-detected source only when still unset.
+
+    Detection deliberately happens outside the config lock because walking the
+    WeChat container can be slow.  The conditional install happens inside the
+    locked mutator, so a concurrent explicit choice always wins.  A non-empty
+    path remains authoritative even while its volume/container is unavailable.
+    """
     ensure_private_dir(DATA_DIR)
 
     cfg = _load_saved_config()
-
-    # Auto-detect db_dir
-    if not cfg["db_dir"] or not os.path.isdir(cfg["db_dir"]):
+    if not cfg["db_dir"]:
         detected = auto_detect_db_dir()
         if detected:
-            cfg = update_config(patch={"db_dir": detected})
+            def install_if_still_unset(current):
+                if not str(current.get("db_dir") or "").strip():
+                    current["db_dir"] = detected
+                return current
+
+            cfg = update_config(mutator=install_if_still_unset)
 
     return cfg
 

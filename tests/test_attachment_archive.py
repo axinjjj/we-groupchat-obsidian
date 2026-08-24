@@ -189,6 +189,21 @@ class AttachmentArchiveTests(unittest.TestCase):
         self.assertIn("归档状态：original_archived", markdown)
         self.assertIn("本地归档：file://", markdown)
 
+    def test_cjk_object_name_stays_within_filesystem_byte_limit(self):
+        name = "猫" * 80 + ".pdf"
+        data = b"cjk filename fixture"
+        self.add_file_mention(name, declared_size=len(data))
+        self.write_cache_file(name, data)
+
+        outcome = self.archive().process_pending()
+
+        self.assertEqual(outcome["archived"], 1)
+        obj = self.rows("SELECT * FROM attachment_objects")[0]
+        leaf = os.path.basename(obj["object_relpath"])
+        self.assertLessEqual(len(leaf.encode("utf-8")), 255)
+        self.assertTrue(leaf.endswith(".pdf"))
+        self.assertTrue(os.path.isfile(os.path.join(self.archive_root, obj["object_relpath"])))
+
     def test_identical_bytes_across_names_are_deduplicated(self):
         data = b"same bytes, different cache names"
         self.add_file_mention("alpha.txt", topic_key="dedup-alpha")

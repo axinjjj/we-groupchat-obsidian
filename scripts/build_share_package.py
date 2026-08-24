@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a manifest-bound sanitized source zip for sharing."""
+"""Build a verified source-payload zip with generated control metadata."""
 
 from __future__ import annotations
 
@@ -425,7 +425,10 @@ def build(out_dir: Path, package_name: str) -> Path:
         os.replace(temp_package, package_dir)
         os.replace(temp_zip, zip_path)
     print(f"wrote {zip_path}")
-    print(f"staged {len(entries) + 2} manifest-bound files in {package_dir}")
+    print(
+        f"staged {len(entries)} verified payload files + 2 generated control files "
+        f"in {package_dir}"
+    )
     return zip_path
 
 

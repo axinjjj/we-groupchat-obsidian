@@ -2,7 +2,7 @@ import os
 import tempfile
 import threading
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from app import WeGroupchatObsidianApp
 from core.app_runtime import AppAlreadyRunning, AppInstanceLock
@@ -61,12 +61,44 @@ class AppResourceBackupTests(unittest.TestCase):
         ):
             app._run_resource_backup_consumer(manual=False)
 
-        capture.run.assert_called_once_with(resolve_limit=50, resolve_files=True)
+        capture.run.assert_called_once_with(
+            resolve_limit=50,
+            resolve_files=True,
+            consent_check=ANY,
+        )
+        consent_check = capture.run.call_args.kwargs["consent_check"]
+        self.assertTrue(consent_check())
+        app._resource_file_resolution_session_enabled = False
+        self.assertFalse(consent_check())
 
     def test_restart_resets_file_resolution_session_grant(self):
         restarted = self.make_app(resolve_files=False)
 
         self.assertFalse(restarted._resource_file_resolution_session_enabled)
+
+    def test_backfill_does_not_report_success_when_projection_failed(self):
+        app = self.make_app()
+        app._finish_task = Mock()
+        app._rebuild_resource_backup_menu = Mock()
+        result = {
+            "state": "applied",
+            "source_complete": True,
+            "discovered_links": 2,
+            "inserted_links": 2,
+        }
+        projection = {
+            "state": "sync_delegated",
+            "obsidian": {"state": "projection_failed"},
+        }
+
+        with (
+            patch("app.load_config", return_value=app.config),
+            patch("app._notify") as notify,
+        ):
+            app._finish_link_backfill(result, projection)
+
+        self.assertEqual(notify.call_args.args[1], "历史链接未写完")
+        self.assertIn("projection_failed", notify.call_args.args[2])
 
     def test_disabled_background_worker_does_not_touch_source_or_backup(self):
         app = self.make_app()

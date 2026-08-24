@@ -81,6 +81,17 @@ source envelope 会保留 `local_id`、`server_id`、`sort_seq`、SQLite `rowid`
 `create_time` 与 `local_type`；缺失的 optional column 显式保持 null。稳定的
 `source_message_id` 由这些值和 chat username 的 hash 派生，不暴露 username 或 `wxid`。
 
+显式配置的 `db_dir` 即使 mount/container 暂时不可用也仍是 authority；auto-detect 只能填入锁内复核后
+仍为空的 canonical 值。Message shard identity 同时绑定 source namespace、key fingerprint 与稳定的
+database-generation evidence（file identity 加 encrypted-page salt/header prefix）。因此同一 relative path
+上的 DB 被替换或 rekey 后会得到新 shard cursor，不会沿用旧 generation。只有 decrypted cache、没有
+对应 live source 时会明确报告 `source_cache_only`，不能生成 applicable backfill plan。
+
+Encrypted WAL reconstruction 会验证 SQLite WAL header 与 cumulative frame checksum，只回放到最后一个
+valid commit marker，按 committed database-page count 截断，并丢弃 uncommitted tail。发布 decrypted
+cache 前还会重新核对 main/WAL identity；并发 checkpoint、reset 或 replacement 只做一次 bounded retry，
+再失败就报告 `source_snapshot_failed`，不会发布 mixed snapshot。
+
 File XML 与 image packed metadata 在 message text cleaning 之前解析。Resource envelope 可以保存
 原文件名、declared size、declared MD5/SHA-256、attach id、extension 或 image hash。
 AI formatter 只接收 sender 与 cleaned message text；source envelope 和 internal IDs 不会进入 AI prompt。
@@ -263,6 +274,7 @@ selection digest，并且不重新扫描 source。`backfill --all` 表示 known 
 本地 Obsidian index，然后才尝试 mounted handoff。`--resolve-files` 是显式授权。
 
 ```text
+<target>/wgo-resource-backup/.wgo-destination.json
 <target>/wgo-resource-backup/v3/
   objects/sha256/...
   snapshots/<snapshot-id>/{manifest.json,resources.jsonl,COMPLETE}
@@ -272,8 +284,10 @@ selection digest，并且不重新扫描 source。`backfill --all` 表示 known 
 Plan 与 run 都拒绝 filesystem root、与本地 source 相同/嵌套/祖先关系的 target、configured-target
 symlink，以及 planned object、snapshot、view、chat-index directory chain 中的 symlink/non-directory
 component。Snapshot/view 冲突返回 structured `target_failed`。第一次复制会边写边 hash，并立即
-readback target bytes。后续 scheduled run 只信任本地 delivery receipt、regular-file type 与 logical size，
-避免重新 hydrate streamed placeholder；显式 `verify` 才完整 rehash target。
+readback target bytes。Regular non-symlink destination marker 保存一个绑定 owning archive 的随机 UUID；
+target-side lock 会串行化指向同一 mount 的不同本地 ledger。Projection manifest 在任何 write/managed GC
+前同时验证 archive 与 destination identity。后续 scheduled run 在复用 receipt 前重新 hash target object，
+因此同尺寸替换物不能继承旧 receipt；显式 `verify` 会重验所选 snapshot 的全部 objects。
 
 `sync_delegated` 只表示 resolved bytes 已写入 mounted filesystem 并立即验证；它绝不表示 provider-side
 upload 或 remote checksum verification。如果仍有 eligible file unresolved，系统可以发布 hash-bound
@@ -300,7 +314,8 @@ revision、只 patch 所需字段，再用 same-directory atomic replace 发布�
 projection render、managed GC 与 mounted handoff 共用另一把 operation lock。
 
 File-byte resolution 默认关闭，必须经菜单确认，或在当前 CLI run 显式给出 `--resolve-files`。菜单授权
-只存在内存中，不写入 durable config，并在 app process 退出时归零。
+只存在内存中，不写入 durable config，并在 app process 退出时归零；每次 attachment-byte operation 前
+还会重新检查，关闭后下一份文件立即停止。
 旧 resource LaunchAgent 可被检测和移除，但新安装会因同一 process-lifetime consent 原因被拒绝。
 
 手动通知只有在 capture healthy、resolution healthy 或因未授权而显式 skipped、本地 projection 成功，

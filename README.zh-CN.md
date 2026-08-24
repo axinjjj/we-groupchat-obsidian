@@ -144,7 +144,8 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
 - 首次提取数据库 key，或微信更新后重新提取 key，可能需要对 `WeChat.app` 做 ad-hoc re-sign。脚本不会在普通双击启动时偷偷执行这一步，必须显式运行带 `--allow-wechat-resign` 的命令。
 - macOS 可能在每次菜单 app 进程启动时询问一次 WeChat App Data 权限。项目不会再调度短命 source/resource
   worker 反复消耗这个 process-lifetime consent；附件 bytes 解析是仅存在于内存、本次 app 会话有效的
-  显式授权，重启后必定归零，也不会从 config 恢复。Links-only backfill 不读取附件 cache。
+  显式授权，重启后必定归零，也不会从 config 恢复；关闭后，in-flight resolver 会在下一次读取附件
+  bytes 之前取消。Links-only backfill 不读取附件 cache。
 - 聊天内容会发送给你自己配置的 AI provider。使用 Ollama 本地模型时，内容可以完全不离开本机；使用云端 provider 时，请按对应服务的隐私规则自行判断。
 - API Key 存储在 macOS Keychain，不写入 repo。
 - 本地配置、书签、monitor state、数据库 key、日志、SQLite DB 和 Markdown 导出默认在 `~/.we-groupchat-obsidian/` 或你的 Obsidian vault 中，不应该提交到 git。旧 `~/.wechat-summary/` 只作为本机 migration/compatibility 路径保留。
@@ -352,7 +353,9 @@ Source guard 与 mounted-resource scheduling 都位于长驻菜单 app。旧 `in
 500-2,000 rows 的 bounded keyset page 写入 staging，不创建或推进 live cursor；apply 必须同时给出
 `--apply` 与 plan 返回的未过期 `--run-id`，只消费那一份 staged rows，不会确认后再扫描 source。
 普通 resource `run` 默认不解析附件；`--resolve-files` 只授权该次显式 CLI run，菜单授权仅持续当前
-app process。Drive `enable` 不会顺手 auth、选群、backfill 或 upload。Backup `verify`
+app process，并在每次附件 byte operation 前重新检查。每个 mounted target 都会得到一个绑定本地
+archive 的随机 destination marker；相同路径被新 target 替换、或另一 archive 误用同一目录时会
+fail closed，不复用 receipt 或 managed projection ownership。Drive `enable` 不会顺手 auth、选群、backfill 或 upload。Backup `verify`
 只验证 configured filesystem target 上看得到的 bytes，绝不宣称 provider-side upload 已完成。Drive
 mounted handoff、可选 Drive API、完整状态、resolver 规则、存储结构和失败边界见
 [来源可靠性指南](docs/source-reliability.zh-CN.md)。

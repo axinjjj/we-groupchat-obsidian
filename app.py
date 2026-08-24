@@ -112,10 +112,16 @@ from core.knowledge import (
     safe_obsidian_subdir,
 )
 from core.attachment_archive import process_pending_from_config
-from core.resource_backup import MountedResourceBackup
+from core.resource_backup import (
+    MountedResourceBackup,
+    evaluate_link_backfill_outcome,
+    evaluate_resource_backup_outcome,
+)
 from core.resource_capture import (
+    ResourceCaptureError,
     SelectedResourceCapture,
     resource_backup_chat_candidates,
+    update_resource_backup_selection,
 )
 from core.google_drive_auth import GoogleDriveAuthError, GoogleDriveOAuth
 from core.google_drive_client import GoogleDriveClient
@@ -288,6 +294,7 @@ class WeGroupchatObsidianApp(rumps.App):
                 pass
         self.config = load_config()
         self._resource_file_resolution_session_enabled = False
+        self._resource_file_resolution_session_epoch = 0
         self.db = None
         self.ai = None
         self._summarizing = False
@@ -715,6 +722,9 @@ class WeGroupchatObsidianApp(rumps.App):
             if not confirmed:
                 return
         self._resource_file_resolution_session_enabled = enabled
+        self._resource_file_resolution_session_epoch = (
+            int(getattr(self, "_resource_file_resolution_session_epoch", 0)) + 1
+        )
         self._rebuild_resource_backup_menu()
         if enabled and self.db:
             self._start_resource_backup_consumer(manual=True)
@@ -756,16 +766,35 @@ class WeGroupchatObsidianApp(rumps.App):
                 }
                 return
             capture = self._resource_capture_service(source=True, config=config)
-            capture_result = capture.run(
-                resolve_limit=50,
-                resolve_files=bool(
-                    self._resource_file_resolution_session_enabled
-                ),
+            consent_epoch = int(getattr(
+                self,
+                "_resource_file_resolution_session_epoch",
+                0,
+            ))
+            resolve_files = bool(
+                self._resource_file_resolution_session_enabled
             )
-            backup_result = MountedResourceBackup.from_config(
-                config,
-                capture=capture,
-            ).run()
+            capture_run_kwargs = dict(
+                resolve_limit=50,
+                resolve_files=resolve_files,
+            )
+            if resolve_files:
+                capture_run_kwargs["consent_check"] = (
+                    lambda: bool(self._resource_file_resolution_session_enabled)
+                    and int(getattr(
+                        self,
+                        "_resource_file_resolution_session_epoch",
+                        0,
+                    )) == consent_epoch
+                )
+            capture_result = capture.run(**capture_run_kwargs)
+            if capture_result.get("state") == "worker_busy":
+                backup_result = {"state": "not_run_worker_busy"}
+            else:
+                backup_result = MountedResourceBackup.from_config(
+                    config,
+                    capture=capture,
+                ).run()
             result = {"capture": capture_result, "backup": backup_result}
             print(
                 "[resource-backup] "
@@ -797,12 +826,7 @@ class WeGroupchatObsidianApp(rumps.App):
             (backup.get("obsidian") or {}).get("state") or "unknown"
         )
         handoff_state = str(backup.get("state") or "unknown")
-        completed = (
-            capture_state == "healthy"
-            and str(resolve.get("state") or "") in {"healthy", "skipped"}
-            and projection_state in {"written", "unchanged"}
-            and handoff_state in {"idle", "sync_delegated"}
-        )
+        completed = evaluate_resource_backup_outcome(capture, backup)["completed"]
         _notify(
             "资源索引与本地备份",
             "更新完成" if completed else "本轮未完成",
@@ -954,19 +978,21 @@ class WeGroupchatObsidianApp(rumps.App):
         self._finish_task()
         self.config = load_config()
         self._rebuild_resource_backup_menu()
-        if result.get("source_complete"):
+        outcome = evaluate_link_backfill_outcome(result, projection)
+        if outcome["completed"]:
             _notify(
                 "资源索引与本地备份",
                 "历史链接已补齐",
                 f"发现 {int(result.get('discovered_links') or 0)} · "
                 f"新增 {int(result.get('inserted_links') or 0)} · "
-                f"projection={projection.get('state') or 'unknown'}",
+                f"projection={outcome['projection_state']} · "
+                f"handoff={outcome['handoff_state']}",
             )
         else:
             _notify(
                 "资源索引与本地备份",
                 "历史链接未写完",
-                f"state={result.get('state') or 'failed'} · error={result.get('error_code') or 'none'}",
+                f"state={outcome['state']} · error={result.get('error_code') or 'none'}",
             )
 
     def _select_resource_backup_chats(self, _):
@@ -1022,10 +1048,21 @@ class WeGroupchatObsidianApp(rumps.App):
             }
             for index in indexes
         ]
-        self._update_config(patch={
-            "resource_backup_selected_chats": selected_chats,
-        })
-        self._resource_capture_service().initialize_selected_chat_cursors()
+        try:
+            updated, _initialized = update_resource_backup_selection(
+                self.config,
+                selected_chats,
+            )
+            self.config = updated
+        except ResourceCaptureError as exc:
+            if exc.code == "capture_worker_busy":
+                _notify(
+                    "资源索引与本地备份",
+                    "当前更新尚未结束",
+                    "群聊选择没有改变，请稍后再试。",
+                )
+                return
+            raise
         self._rebuild_resource_backup_menu()
         _notify("资源索引与本地备份", "群聊选择已保存", f"当前选择 {len(indexes)} 个群。")
 
