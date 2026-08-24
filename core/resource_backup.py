@@ -1278,9 +1278,6 @@ class MountedResourceBackup:
                     raise ResourceBackupError("target_object_conflict")
                 if int(target_stat.st_size) != size:
                     raise ResourceBackupError("target_object_conflict")
-                target_size, target_digest = _hash_path(target_path)
-                if target_size != size or target_digest != digest:
-                    raise ResourceBackupError("target_object_conflict")
                 return "already_delegated", relpath
 
         source_path = self._source_path(occurrence)

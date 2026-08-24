@@ -459,32 +459,26 @@ class ResourceBackupTests(unittest.TestCase):
         self.assertIn("[[猫猫研究群/00-资源索引|猫猫研究群]]", text)
         self.assertIn("2 个链接 · 2 个文件", text)
 
-    def test_ordinary_rerun_rehashes_receipted_target_before_reuse(self):
+    def test_ordinary_receipt_backed_rerun_does_not_read_target_or_source_bytes(self):
         capture = self._ready_capture()
         backup = self._backup(capture)
         first = backup.run()
         self.assertEqual(first["copied"], 2)
 
-        original_hash = __import__(
-            "core.resource_backup", fromlist=["_hash_path"]
-        )._hash_path
         with patch(
             "core.resource_backup._hash_path",
-            wraps=original_hash,
-        ) as hash_path:
+            side_effect=AssertionError("receipt reuse hashed target bytes"),
+        ) as hash_path, patch.object(
+            backup,
+            "_source_path",
+            side_effect=AssertionError("receipt reuse opened the source CAS"),
+        ) as source_path:
             second = backup.run()
         self.assertEqual(second["state"], "idle")
         self.assertEqual(second["copied"], 0)
         self.assertEqual(second["reused"], 2)
-        target_hashes = [
-            call.args[0]
-            for call in hash_path.call_args_list
-            if os.path.commonpath((
-                os.path.abspath(call.args[0]),
-                backup.backup_root,
-            )) == backup.backup_root
-        ]
-        self.assertGreaterEqual(len(target_hashes), 2)
+        hash_path.assert_not_called()
+        source_path.assert_not_called()
 
     def test_explicit_verify_rehashes_and_detects_target_corruption(self):
         capture = self._ready_capture()
@@ -1310,7 +1304,7 @@ class ResourceBackupTests(unittest.TestCase):
         self.assertEqual(result["state"], "worker_busy")
         self.assertEqual(projection_files(), before)
 
-    def test_same_size_target_corruption_invalidates_delivery_receipt(self):
+    def test_explicit_verify_detects_same_size_target_corruption(self):
         capture = self._ready_capture()
         backup = self._backup(capture)
         first = backup.run()
@@ -1321,10 +1315,36 @@ class ResourceBackupTests(unittest.TestCase):
         with open(path, "wb") as handle:
             handle.write(b"x" * size)
 
-        second = backup.run()
+        verified = backup.verify(first["snapshot"]["snapshot_id"])
+
+        self.assertEqual(verified["state"], "target_failed")
+        self.assertEqual(verified["failed"], 1)
+        self.assertFalse(verified["remote_verified"])
+
+    def test_delivery_receipt_rejects_target_size_mismatch_without_reading_bytes(self):
+        capture = self._ready_capture()
+        backup = self._backup(capture)
+        first = backup.run()
+        self.assertEqual(first["state"], "sync_delegated")
+        delivery = next(iter(backup._delivery_map().values()))
+        path = os.path.join(backup.backup_root, delivery["target_relpath"])
+        with open(path, "ab") as handle:
+            handle.write(b"x")
+
+        with patch(
+            "core.resource_backup._hash_path",
+            side_effect=AssertionError("size mismatch hashed target bytes"),
+        ) as hash_path, patch.object(
+            backup,
+            "_source_path",
+            side_effect=AssertionError("size mismatch opened the source CAS"),
+        ) as source_path:
+            second = backup.run()
 
         self.assertEqual(second["state"], "target_failed")
         self.assertIn("target_object_conflict", second["error_codes"])
+        hash_path.assert_not_called()
+        source_path.assert_not_called()
 
     def test_target_marker_rejects_a_different_archive_at_same_mount_root(self):
         first_capture = self._ready_capture()
