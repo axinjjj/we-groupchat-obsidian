@@ -215,22 +215,26 @@ or the [Chinese README](https://github.com/IndelibleVivi/we-groupchat-obsidian/b
 Do not re-zip a checkout that you have already run; it may contain `.venv`,
 local runtime state, caches, logs, or private debugging material.
 
-For a shareable source zip, build from the exact committed Git tree. The package
-contains a v2, hash-bound `share-manifest.json`. Payload files come from the
-exact commit tree; the generated `群友使用说明.md` comes from the exact-commit
-`docs/share-package-guide.zh-CN.md` template and is recorded under
-`controls.guide` with its mode and SHA-256; `source_commit` must be a 40- or
-64-hex immutable object ID. A copied tree without `.git` can build only from
-that manifest allowlist and guide control, and fails closed if a bound member is
-missing, modified, secret-bearing, symlinked, or non-regular:
+The public repository is the canonical distribution and update path. The zip
+builder is retained only as a historical offline fallback for environments
+without Git/network access, or when an exact-commit archival artifact is
+required; it is not the normal way to share this project. If that fallback is
+needed, build only from an exact committed Git tree. The package contains a v2,
+hash-bound `share-manifest.json`; payload files, the generated
+`群友使用说明.md`, and its source template
+`docs/share-package-guide.zh-CN.md` are exact-commit/hash/secret-scan bound.
+`source_commit` must be a 40- or 64-hex immutable object ID. A copied tree
+without `.git` can build only from that manifest allowlist and guide control,
+and fails closed if a bound member is missing, modified, secret-bearing,
+symlinked, or non-regular:
 
 ```bash
 .venv/bin/python scripts/build_share_package.py
 ```
 
-The generated zip includes an extra `群友使用说明.md` quick-start file and
-omits internal handoff docs such as `docs/working-continuity.md` and
-`docs/superpowers/`.
+The fallback zip includes a compatibility-named `群友使用说明.md` offline
+quick-start file and omits internal handoff docs such as
+`docs/working-continuity.md` and `docs/superpowers/`.
 
 ## Requirements
 
@@ -256,14 +260,27 @@ cd we-groupchat-obsidian
 
 On the first run, or after `requirements.txt` changes, `启动.command` asks before
 creating/updating `.venv` and installing dependencies. It proceeds only after an
-explicit `y`; declining exits without installing anything. Distribution remains
-source-only and CLI-based, with no `.dmg` or bundled Python runtime.
+explicit `y`; declining exits without installing anything. This is a
+source-distributed macOS menu-bar app, with no signed installer, `.dmg`, or
+bundled Python runtime.
 
 If WeChat was updated or key extraction needs a fresh authorization:
 
 ```bash
 ./启动.command --allow-wechat-resign
 ```
+
+### Documentation map
+
+- `README.md` / `README.zh-CN.md`: current user, operator, privacy, and project
+  overview authority.
+- `使用说明.txt`: bundled/offline quick start; intentionally shorter than the
+  README.
+- `功能说明.txt`: concise current capability index, not an operational contract.
+- `docs/source-reliability*.md`: detailed source guard, archive, mounted backup,
+  Drive, backup, and rollout contract.
+- `docs/resource-capture-and-mounted-backup-spec.md`: formal resource occurrence,
+  selection, projection, handoff, status, and failure semantics.
 
 ## Useful Commands
 
@@ -567,9 +584,10 @@ Default Obsidian note layout:
 Single knowledge notes use resource-aware title markers: no prefix for ordinary
 topics, `[链接]` for links, `[文件]` for files, and `[链接+文件]` when both are
 present. The Markdown retains the summary, key facts, resources, related
-topics, and source window. File entries record filename, message time, sender
-clue, and—when available—a shortcut to the local WeChat month directory; they
-do not copy attachments or promise a unique exact-file locator.
+topics, and source window. File entries always retain metadata and may include a
+WeChat month-directory hint. When the separately opt-in local archive
+successfully preserves an occurrence, the note may also link to the private CAS
+object. Attachment bytes are never copied into the vault itself.
 
 The `00-按日期.md` files are lightweight link-only date maps. They live at the root of each monitored scope and do not create monthly archive folders. Managed date index files are rewritten only when they carry a `we-groupchat-obsidian:managed-date-index` marker; older generated files with `wechat-summary:managed-date-index` are still recognized for compatibility. User-owned conflicting files fall back to `*.generated.md`.
 
@@ -702,7 +720,11 @@ This fork started from the same core idea as the upstream project: read the user
 - Resource-lead handling keeps "can private-share / will share later / repo not public yet" opportunities visible even before a file or link appears.
 - Obsidian output is treated as a first-class local knowledge base: notes are organized by chat/category, include safer resource sections, generate root-level link-only date maps, and can be re-exported without re-calling the AI provider.
 - Daily digest and actionable review queue support were added so high-signal notes stay browsable in Obsidian while only concrete follow-up, import, reference-evaluation, or risk-review work becomes pending queue work.
-- The public branch removes personal runtime defaults and adds tests around config sanitization, health checks, LaunchAgent discovery, monitor behavior, review queue, daily digest, notification targets, date indexes, and knowledge export contracts.
+- Source reliability no longer guesses through ambiguous process state: plaintext snapshots use SQLite Online Backup, source/message identities are namespaced by source root, and the optional long-lived source guard uses grace, budgets, backoff, and content-free receipts.
+- Attachment durability is split into a catalog, session-local byte consent, private CAS, and filesystem snapshots. Identical bytes deduplicate; images are a separate opt-in; archive failure does not roll back a knowledge event or monitor checkpoint.
+- The default no-OAuth selected-resource lane preserves exact link/file occurrences and hands ready-local CAS objects, a privacy-bounded catalog, and resource indexes to a mounted filesystem. Selection mutation, archive claims, projection roots, handoff targets, and manifest archive identity have explicit cross-process ownership/CAS boundaries.
+- Direct Google Drive API sync is a separate opt-in advanced backend with its own selection, OAuth, durable queue, server-confirmed resumable upload, chat/month shortcuts, and reconciliation semantics.
+- The public repository removes personal runtime defaults and carries regression coverage for config, source snapshots/guard, attachment archive/backup, resource capture/projection/handoff, Drive, monitor, review queue, daily digest, notifications, MCP confirmation, and exact-commit publication contracts.
 
 ## Upstream
 

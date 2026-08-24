@@ -177,14 +177,16 @@ rg -n "sk-|api[_-]?key|secret|token|password|BEGIN .*PRIVATE|wxid_|chatroom|\\.w
 不要重新压缩自己正在运行的 checkout；其中可能已经出现 `.venv`、本机 runtime、
 cache、日志或私有调试材料。
 
-如果只是把源码包发给朋友，建议用 sanitized share zip，而不是直接压缩当前工作目录：
+公开 repo 是正式分发与更新入口。zip builder 只作为没有 Git/网络条件，或必须保留
+exact-commit archival artifact 时的历史 offline fallback；它不是给群友分享项目的正常路径。
+如果确实需要这个 fallback，只能从 exact committed Git tree 构建：
 
 ```bash
 .venv/bin/python scripts/build_share_package.py
 ```
 
 生成的 zip 严格取当前 commit 的 Git tree，并附带 hash-bound v2 `share-manifest.json`。Payload 来自
-exact commit tree；生成的 `群友使用说明.md` 来自同一 commit 的
+exact commit tree；compatibility name 仍为 `群友使用说明.md` 的离线说明来自同一 commit 的
 `docs/share-package-guide.zh-CN.md`，其 mode 与 SHA-256 记录在 `controls.guide`，`source_commit` 必须是
 40/64 位 hex immutable object ID。没有 `.git` 的复制目录
 只能按该 manifest allowlist 与 guide control 构建；bound member 缺失、被修改、命中 secret scan、是
@@ -221,7 +223,7 @@ cd we-groupchat-obsidian
 ./启动.command
 ```
 
-第一次运行或 `requirements.txt` 更新时，`启动.command` 会先询问是否创建/更新 `.venv` 并安装 dependencies；只有明确输入 `y` 才会继续，不同意则直接退出。项目仍是 source-only CLI 分发，不提供 `.dmg` 或 bundled Python runtime。若 macOS 阻止打开 `.command` 文件，右键它，选择“打开”，再确认打开。
+第一次运行或 `requirements.txt` 更新时，`启动.command` 会先询问是否创建/更新 `.venv` 并安装 dependencies；只有明确输入 `y` 才会继续，不同意则直接退出。项目是 source-distributed macOS menu-bar app，目前不提供已签名 installer、`.dmg` 或 bundled Python runtime。若 macOS 阻止打开 `.command` 文件，右键它，选择“打开”，再确认打开。
 
 如果提示微信需要重新授权，请阅读终端说明后手动运行：
 
@@ -230,6 +232,16 @@ cd we-groupchat-obsidian
 ```
 
 这一步可能会退出微信，并要求输入 Mac 登录密码。输入密码时终端不显示字符是正常的。
+
+### 文档地图
+
+- `README.md` / `README.zh-CN.md`：当前用户、operator、隐私和项目概览 authority。
+- `使用说明.txt`：随源码和本地 `.app` bundle 保留的离线快速入门，刻意比 README 短。
+- `功能说明.txt`：当前能力的简明索引，不替代操作 contract。
+- `docs/source-reliability*.md`：source guard、archive、mounted backup、Drive、
+  filesystem snapshot 和 safe rollout 的详细 contract。
+- `docs/resource-capture-and-mounted-backup-spec.md`：resource occurrence、selection、
+  projection、handoff、status 与 failure semantics 的 formal spec。
 
 ## 常用命令
 
@@ -490,9 +502,10 @@ Review Queue 文件保存在 `~/.we-groupchat-obsidian/review_queue/`；里面�
 
 单篇知识笔记会按资源形态使用不同的标题标记：普通主题不加前缀，链接使用
 `[链接]`，文件使用 `[文件]`，同一主题同时包含两者时使用 `[链接+文件]`。
-Markdown 正文会保留摘要、关键事实、资源、相关主题和来源窗口。文件条目只记录
-文件名、消息时间、发送者线索，以及可用时的本机微信月份目录 shortcut；它不会
-复制附件，也不承诺直接定位到唯一 attachment。
+Markdown 正文会保留摘要、关键事实、资源、相关主题和来源窗口。文件条目始终保留
+文件名、消息时间、发送者线索，并可提供本机微信月份目录 hint。独立 opt-in 的本地
+archive 成功归档 occurrence 后，note 还可以链接到私有 CAS object；
+attachment bytes 仍不会复制进 vault 本身。
 
 每个群聊文件夹也会生成一个 `00-按日期.md`，总目录会生成 `微信群聊/关注推送/00-按日期.md`。这些日期视图只保存 wiki links，不复制笔记正文；目前完整历史会保留在这两个 root-level link map 中，不再创建 `按日期/YYYY-MM.md` 月度 archive 文件夹。旧版 managed archive 文件夹只会作为清理对象处理。
 
@@ -600,31 +613,24 @@ mcp_server.py            # FastMCP Server 入口
 setup.py                 # py2app 打包入口
 ai/                      # 可替换 AI provider 适配层
 core/
-  wechat_db.py           # 微信数据库读取和消息格式化
-  decryptor.py           # SQLCipher 解密
-  key_extractor.py       # 微信 DB key 提取
-  config.py              # 配置和路径管理
-  keychain.py            # macOS Keychain
-  knowledge.py           # 关注推送知识库和 Markdown 导出
-  monitor.py             # 关注推送检查逻辑
-  daily_digest.py        # 每日摘要
-  review_queue.py        # 本地待审阅队列
-  notification_target.py # 通知点击打开本地文件
-  google_drive_auth.py    # Installed-app OAuth + Keychain refresh token
-  google_drive_client.py  # Google Drive v3 REST wrapper
-  google_drive_file_sync.py # selected-chat queue、CAS 与 Drive projection
-  sender.py              # 微信 UI 发送消息，可选且默认关闭
+  config.py / app_runtime.py     # main-config 与 menu-process ownership
+  wechat_db.py / source_contract.py # source、snapshot、shard/message identity
+  monitor.py / knowledge.py     # 关注推送 durable ledger 与 Markdown projection
+  attachment_archive.py         # attachment occurrence、resolver 与私有 CAS
+  attachment_backup.py          # archive filesystem snapshot / verify / restore plan
+  resource_capture.py           # selected-chat exact occurrence capture/backfill
+  resource_backup.py            # mounted target projection、handoff 与 receipts
+  wechat_source_guard.py        # 长驻 app 内的 optional source guard
+  google_drive_*.py             # 独立 advanced Drive API queue/OAuth/projection
+  mcp_send_*.py / sender.py     # 两步确认 policy 与可选 UI send
 ui/                      # 可复用 macOS UI 组件
 scripts/
-  configure_monitor.py   # CLI 配置关注推送
-  google_drive_file_sync.py # Google Drive 文件同步的显式 one-shot actions
-  health_check.py        # privacy-safe 健康检查
-  refresh_data_source.py # CLI 刷新数据库 key
-  backfill_history.py    # 历史回填到 Obsidian
-  organize_obsidian.py   # 重导出/整理 Markdown
-  daily_digest.py        # 手动生成 Daily Digest
-  review_queue.py        # 查看/标记 Review Queue
-  autostart.py           # LaunchAgent 安装/卸载
+  configure_monitor.py / health_check.py / refresh_data_source.py
+  backfill_history.py / catch_up_monitor.py / organize_obsidian.py
+  attachment_archive.py / attachment_backup.py / resource_backup.py
+  google_drive_file_sync.py / wechat_source_guard.py
+  daily_digest.py / review_queue.py / repair_relations.py
+  autostart.py / build_share_package.py
 launchers/               # canonical Finder 双击 .command entrypoints
 tests/                   # 可 import 的 unittest package
 c_src/                   # key scanner C 代码
@@ -741,7 +747,11 @@ macOS 菜单栏图标太多、刘海区域或菜单栏管理工具都可能把�
 - 资源线索不会因为暂时没有文件/链接而丢掉：`resource_lead` 会把“可以私发 / 晚点发 / repo 还没公开 / 求一份”这类机会作为 `follow_up_resource` 留进 Review Queue。
 - Obsidian 输出被当作本地知识库来维护：按群聊/分类组织笔记，文件名和 frontmatter 更稳定，资源区更安全，生成 root-level link-only 日期 overview，也支持不重新调用 AI 的重导出整理。
 - 新增 Daily Digest 和派生 Review Queue：只有 `follow_up_resource`、`import_resource`、`evaluate_reference`、`review_risk` 这类有明确动作的条目才进入 Review Queue；队列文件保存派生标题、摘要、资源线索、链接和笔记路径，不复制 raw chat bodies；高信号但无下一步动作的内容会保存在知识库和 Daily Digest，但不进入 Review Queue，单条通知仍按 `P1/P2/P3` gating 判断。
-- 为公开使用做了清理和测试：移除个人 runtime 默认值，补了 config sanitization、health check、LaunchAgent discovery、monitor、review queue、daily digest、notification target、date index、knowledge export 等测试。
+- Source reliability 不再依赖猜测进程状态：plaintext snapshot 使用 SQLite Online Backup，source/message identity 按 source root namespace；可选 source guard 由长驻 app 持有 consent 与 timer，并以 grace、budget、backoff、receipt fail closed。
+- Attachment durability 被拆成 catalog、session-local byte consent、private CAS 与 filesystem snapshot。相同 bytes dedup；image 独立 opt-in；archive 失败不回滚 knowledge event 或 monitor checkpoint。
+- 默认 no-OAuth selected-resource lane 保存 exact link/file occurrence，并把 ready-local CAS object、privacy-bounded catalog 与 resource indexes 交给 mounted filesystem；selection mutation、archive occurrence、projection root、handoff target 和 manifest archive identity 都有跨进程 ownership/CAS 边界。
+- Direct Google Drive API 是另一个独立 opt-in advanced backend：拥有自己的 selection、OAuth、durable queue、server-confirmed resumable upload、per-chat/month shortcut 和 reconcile，不与 mounted backup 混用成功语义。
+- 为公开使用做了清理和完整 regression coverage：移除个人 runtime defaults，并覆盖 config、source snapshot/guard、attachment archive/backup、resource capture/projection/handoff、Drive、monitor、Review Queue、Daily Digest、notification、MCP confirmation 与 exact-commit publication contracts。
 
 ## 致谢
 

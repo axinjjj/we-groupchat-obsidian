@@ -1,6 +1,12 @@
-# we-groupchat-obsidian 群友使用说明
+# we-groupchat-obsidian 离线源码包备用说明
 
-这是一份给群友看的快速说明。完整隐私边界、MCP 发送规则、Obsidian 工作流和开发说明请看 `README.zh-CN.md`。
+公开 repo 是项目的正式分发与更新入口：
+
+<https://github.com/IndelibleVivi/we-groupchat-obsidian>
+
+这份文件只随 exact-commit sanitized zip 生成，用于没有 Git/网络条件或需要冻结
+archival artifact 的历史 offline fallback。完整隐私边界、MCP 发送规则、Obsidian
+工作流和开发说明请看 `README.zh-CN.md`。
 
 ## 先确认
 
@@ -22,7 +28,8 @@ macOS 可能在菜单 app 启动后询问一次 WeChat App Data 访问。请确�
 source guard 和资源索引都在这只长驻 app 内运行，不会每 300 秒启动一只新 Python 来重复询问。
 历史补链接不读取附件 bytes；附件解析只接受本次 app 会话授权，CLI 则必须在单次 `run` 上显式传 `--resolve-files`。
 
-这是 source-only CLI 分发，不包含 `.dmg` 或 bundled Python runtime。
+这是 source-distributed macOS menu-bar app，不包含已签名 installer、`.dmg` 或
+bundled Python runtime。
 
 如果微信更新后需要重新授权，普通启动不会偷偷重签名。确认要继续时再运行：
 
@@ -65,4 +72,6 @@ source guard 和资源索引都在这只长驻 app 内运行，不会每 300 秒
 - `*.log`
 - API Key、截图里的 token、真实聊天导出、Obsidian 私人 vault 内容
 
-这个 zip 只包含生成时冻结的 `share-manifest.json` allowlist。无 `.git` 的解压目录再次打包时也只会复制该 manifest 中逐项校验过的文件。
+这个 zip 只包含生成时冻结的 `share-manifest.json` allowlist。无 `.git` 的解压目录
+再次打包时也只会复制该 manifest 中逐项校验过的文件。能访问 GitHub 时，请改用
+公开 repo 的 `git clone` / `git pull --ff-only`，不要继续转发或二次维护 zip。

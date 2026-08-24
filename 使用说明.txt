@@ -1,177 +1,135 @@
 ============================================
-    微信群聊 AI 总结 - 使用说明
+    we-groupchat-obsidian - 快速使用说明
 ============================================
 
-这是最小入门说明。完整功能、隐私边界、关注推送、实际 Obsidian 输出截图和公开
-fork 说明，请优先阅读 README.zh-CN.md。
+这是随源码和本地 .app bundle 保留的离线快速入门，不是完整手册。
+当前公开说明、隐私边界和所有 operator 命令以 README.zh-CN.md 为准：
 
+  https://github.com/IndelibleVivi/we-groupchat-obsidian/blob/main/README.zh-CN.md
 
-【安装（只需一次）】
-
-第一步：从公开 repo 获取源码
-
-  打开 Terminal，运行：
-
-    git clone https://github.com/IndelibleVivi/we-groupchat-obsidian.git
-    cd we-groupchat-obsidian
-    ./启动.command
-
-  项目是 source-only CLI 分发，不提供 .dmg 或 bundled Python runtime。
-
-
----------------------------------------------
-⚠ 遇到安全提示怎么办？
----------------------------------------------
-
-如果 macOS 拦截 .command 文件，可以按下面的方法解除：
-
-  方法一（推荐）：右键打开
-
-    1. 在「启动.command」文件上 右键（或两根手指点触控板）
-    2. 选择「打开」
-    3. 弹窗里再点「打开」
-
-    * 只有第一次需要这样做，以后双击就能直接打开。
-
-  方法二：从系统设置解除
-
-    如果方法一没用：
-
-    1. 打开 系统设置 → 隐私与安全性
-    2. 往下滚，找到「启动.command 已被阻止」的提示
-    3. 点右边的「仍要打开」
-    4. 输入电脑密码确认
-
-
----------------------------------------------
-第二步：确认 dependencies 安装
----------------------------------------------
-
-首次运行或 requirements.txt 更新时，脚本会询问是否：
-
-  1. 在当前文件夹创建或更新独立的 Python 环境（.venv）
-  2. 安装 Python dependencies
-  3. 检查微信数据目录和授权状态
-
-  输入 y 才会继续安装；不同意就退出，不会偷偷改环境。
-  * .venv 是项目自己的运行环境，不会污染你电脑里别的 Python。
-  * 如果需要重新提取数据库 key 或重新授权，脚本会明确提示你使用
-    「launchers/刷新数据源.command」或带 --allow-wechat-resign 的命令，不会在普通启动时偷偷重签名。
-
-
----------------------------------------------
-第三步：设置 API Key
----------------------------------------------
-
-  1. 菜单栏出现 💬 图标后（在屏幕上方），点击它
-  2. 选择「设置」
-  3. 填入你的 AI 服务 API Key
-
-支持的 AI 服务：
-
-  通义千问（默认）  → dashscope.console.aliyun.com
-  DeepSeek          → platform.deepseek.com
-  Claude            → console.anthropic.com
-  OpenAI            → platform.openai.com
-  Ollama 本地       → 无需 Key，需先安装 Ollama
-
-  * 云端 provider 会收到你要求总结的聊天文本；如果需要内容完全留在本机，请使用 Ollama。
-
+这个项目是 source-distributed macOS menu-bar app。公开 repo 是正式分发入口；
+目前不提供已签名 installer、.dmg 或 bundled Python runtime。
 
 
 ============================================
-    日常使用
+    第一次运行
 ============================================
 
-  1. 确保微信已启动并登录
-  2. 双击「启动.command」
-  3. 菜单栏出现 💬 图标
-  4. 点击图标 → 选择群聊 → 查看/生成总结
+1. 从公开 repo clone：
 
-配置文件位置：
-  ~/.we-groupchat-obsidian/config.json
+     git clone https://github.com/IndelibleVivi/we-groupchat-obsidian.git
+     cd we-groupchat-obsidian
+     ./启动.command
 
-总结和缓存位置：
-  ~/.we-groupchat-obsidian/
+2. 首次运行或 requirements.txt 变化时，启动脚本会先询问是否创建/更新
+   当前 checkout 自己的 .venv 并安装 dependencies。只有输入 y 才继续；
+   拒绝就退出，不会静默安装。
 
+3. 如果 macOS 拦截 .command：
+
+   - 在 Finder 里右键「启动.command」并选择“打开”；或
+   - 到“系统设置 -> 隐私与安全性”确认“仍要打开”。
+
+4. 菜单栏出现 💬 图标后，在“设置”里选择 AI provider 并填写 API Key。
+
+支持通义千问（新安装默认）、DeepSeek、Claude、OpenAI、Ollama 和自定义
+OpenAI-compatible endpoint。API Key 存在 macOS Keychain，不写入 repo。
+云端 provider 会收到你要求总结/判断的聊天文本；需要本地 AI 时使用 Ollama。
+
+macOS 可能在菜单 app 启动后询问一次 WeChat App Data 访问。source guard、
+monitor 与 mounted-resource timer 都由这只长驻 app 负责，不会靠每几分钟启动
+短命 worker 来反复索取授权。附件 bytes 解析还需要单独开启，授权只在当前
+app process/session 内存里有效，重启后自动关闭。
+
+普通启动不会偷偷 re-sign WeChat。只有健康检查确认需要、并且你接受终端里
+说明的影响时，才显式运行：
+
+     ./启动.command --allow-wechat-resign
+
+这一步可能退出微信并请求 Mac 登录密码。sudo 输入密码时不显示字符或星号是正常的。
 
 
 ============================================
-    常见问题
+    日常入口
 ============================================
 
-Q：提示「未找到 Python3」或「Python 版本太低」？
-A：本工具需要 Python 3.10 以上版本。
-   启动脚本会自动检测版本，如果版本太低且已安装 Homebrew，
-   会先征求同意，再尝试安装 Python 3.12。
-   如果不想让脚本安装或安装不成功，请手动安装：
-   · 方法一（推荐）：去 python.org/downloads 下载最新版本
-   · 方法二：运行 brew install python@3.12
+启动菜单栏 app：
 
-Q：提示「重签名失败」/ Operation not permitted？
-A：这是因为 macOS 没有授权终端修改应用。
-   1. 先完全退出微信
-   2. 打开「系统设置」→「隐私与安全性」
-   3. 往下滚，找到「App 管理」
-   4. 打开「终端」的开关（需要输入密码）
-   5. 重新运行「launchers/刷新数据源.command」或刚才带 --allow-wechat-resign 的命令
-   如果找不到「App 管理」，就找「完全磁盘访问权限」，打开「终端」的开关。
+     ./启动.command
 
-Q：终端提示输入密码，但打字看不见，是不是卡住了？
-A：不是。macOS 的 sudo 输入密码时本来就不会显示字符，也不会显示星号。
-   直接输入电脑登录密码，然后按回车即可。
+前台启动时关闭该 Terminal 或按 Ctrl+C 会结束这次 app process。需要登录自启时，
+请使用下面的安装入口；不要自己复制或改写 LaunchAgent plist。
 
-Q：微信更新后读不到记录了？
-A：先双击「launchers/健康检查.command」查看 DB/key、re-sign、missing keys 和 LaunchAgent 状态。
-   如果提示需要刷新，运行「launchers/刷新数据源.command」。
-   这一步可能会要求输入 Mac 登录密码，也可能会退出微信，请先读终端提示。
+常用 Finder/Terminal helper：
 
-Q：关闭终端窗口会怎样？
-A：关闭终端窗口会退出程序。想退出时直接关窗口或按 Ctrl+C。
+     ./launchers/配置关注推送.command
+     ./launchers/健康检查.command
+     ./launchers/刷新数据源.command
+     ./launchers/历史总结到Obsidian.command
+     ./launchers/整理Obsidian输出.command
+     ./launchers/补跑遗漏笔记.command
+     ./launchers/安装自动启动.command
+     ./launchers/卸载自动启动.command
 
-Q：公开 repo 更新后怎么升级？
-A：先确认当前 checkout 没有需要保留的未提交修改，然后在项目目录运行：
+微信更新后先跑“健康检查”，只有它提示 DB key / re-sign / missing shard 问题时，
+再运行“刷新数据源”。普通健康检查默认 redacted；只有本机私下排查才考虑
+加 --sensitive。
+
+
+============================================
+    主要数据位置
+============================================
+
+配置、运行状态、普通总结 .txt、SQLite ledger、日志和默认 Markdown：
+
+     ~/.we-groupchat-obsidian/
+
+旧 ~/.wechat-summary/ 只作为本机 migration/compatibility 路径保留。
+如果配置了 Obsidian vault，Markdown projection 会写入你选择的 vault 子目录。
+
+附件 archive、backup manifest、mounted target receipt、OAuth client JSON、聊天
+数据库/key、日志和真实 Markdown vault 都是 private runtime data；不要提交或转发。
+附件 archive 默认关闭。开启后，resolved bytes 进入本机 SHA-256 content-addressed
+archive；Obsidian note 可以链接到私有归档 object，但附件 bytes 不会被复制进 vault。
+
+
+============================================
+    功能与安全边界
+============================================
+
+- 群聊总结、按天回顾、批量总结和关键词搜索。
+- 关注推送、SQLite knowledge ledger、Obsidian Markdown、Daily Digest 和
+  actionable Review Queue。
+- 可选 source guard、本地附件 CAS、filesystem snapshot、selected-resource
+  mounted backup，以及独立 opt-in 的 Google Drive API advanced lane。
+- 默认关闭远程 URL preview、附件 bytes 解析、archive、resource backup、
+  source guard 和 MCP 真实发送；不要因为看到命令存在就把它们当成已经启用。
+- Mounted target 只证明目标 filesystem bytes/readback，不证明云端 provider 已上传。
+- 历史 resource backfill 先生成 bounded plan，再用同一个未过期 run_id apply；
+  不会在确认后重新无限 rescan。
+- MCP 读取会把本机 chat-derived data 暴露给 MCP client。真实发送默认 disabled，
+  必须显式选择 allowlist/enabled，并走 prepare_send_message -> 人工确认 ->
+  confirm_send_message 的 nonce 流程。
+
+更完整的能力索引见 功能说明.txt；准确的 architecture、commands 和 privacy contract
+仍请以 README.zh-CN.md、docs/source-reliability.zh-CN.md 和
+docs/resource-capture-and-mounted-backup-spec.md 为准。
+
+
+============================================
+    更新与分享
+============================================
+
+公开 repo 是正常更新和分享方式：
 
      git pull --ff-only
      ./启动.command
 
-   如果 requirements.txt 有变化，启动脚本会再次询问是否更新 .venv 和 dependencies。
-
-Q：可以保留后台监控，但关掉系统通知吗？
-A：可以。在菜单栏打开「关注推送」，点击「后台通知：开/关」。关闭后监控、
-   Obsidian 写入和 Daily Digest 仍会继续，只静音自动 banner；手动操作反馈和
-   「测试系统通知」仍然可用。
-
-Q：数据存在哪里？
-A：配置、密钥缓存、总结记录都在 ~/.we-groupchat-obsidian/ 目录。
-   旧 ~/.wechat-summary/ 只作为本机迁移/兼容路径保留。
-   Python 依赖环境在当前项目文件夹的 .venv/ 目录。
-
-Q：通过 MCP 发送微信消息失败？
-A：MCP 默认只读。发送消息需要先在 ~/.we-groupchat-obsidian/config.json 里显式选择：
-   "mcp_send_mode": "dry_run" / "allowlist" / "enabled"
-   然后再授予辅助功能权限。
-   1. 打开「系统设置」→「隐私与安全性」→「辅助功能」
-   2. 找到你运行 MCP Server 的应用（终端、Claude.app 等）
-   3. 打开它的开关（需要输入密码）
-   4. 重新启动该应用
-   发送时微信必须已登录且在运行中，AI 会自动操作微信界面完成发送，
-   发送后会自动验证消息是否成功写入数据库。
-
-Q：我要把这个工具分享给别人，发什么？
-A：直接发送公开 repo 或中文版 README 链接：
+分享给别人时只发送公开 repo 或中文版 README 链接：
 
      https://github.com/IndelibleVivi/we-groupchat-obsidian
      https://github.com/IndelibleVivi/we-groupchat-obsidian/blob/main/README.zh-CN.md
 
-   不要重新压缩自己正在运行的 checkout；其中可能已经出现 .venv、本机 runtime、
-   cache、日志或私有调试材料。
-
-   如果需要发送独立源码包，请在干净的 committed checkout 运行：
-
-     .venv/bin/python scripts/build_share_package.py
-
-   它会从当前 commit 的 exact Git tree 生成 sanitized zip，只包含源码、README、常用命令、测试和
-   给朋友看的「群友使用说明.md」，并写入每个 payload file 的 SHA-256 manifest。
-   没有 .git 的复制目录只能按这份 manifest allowlist 重建；listed file 缺失、被修改或是 symlink
-   时会直接拒绝。包里不会包含 .venv、.git、notes、build/dist、__pycache__ 或 internal continuity docs。
+不要压缩已经运行过的 checkout；它可能包含 .venv、runtime state、cache、日志或
+私有调试材料。scripts/build_share_package.py 只保留为无 Git/网络环境和 exact-commit
+归档所需的历史 offline fallback，不是群友分发主路。
