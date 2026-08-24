@@ -41,7 +41,11 @@
   lost.
 - Resource projection manifests own generated-path GC. Empty selections still
   render an explicit root; GC may remove only app-owned generated files and must
-  run under the projection/handoff operation lock.
+  hold canonical capture/selection authority, then the DB-scoped backup lock
+  plus the real-path-keyed output-root lock. Mounted handoff also takes its
+  target-side lock. Distinct capture databases/path aliases cannot concurrently
+  own the same projection or mount, and local generated descendants must not
+  follow symlinks.
 - Editable architecture truth lives in `docs/architecture/*.excalidraw`; SVGs
   under `docs/assets/architecture/` are portable generated exports and must be
   regenerated and visually inspected after source changes.
@@ -52,8 +56,10 @@
   identities/bodies, account identifiers, local paths, credentials, private
   continuity and live runtime data.
 - `scripts/build_share_package.py` packages the exact Git commit tree. Its
-  no-Git path is manifest-only and hash-verifies regular non-symlink entries;
-  do not reintroduce recursive fallback scanning.
+  generated guide comes from an exact-commit tracked template and is mode/hash
+  bound under manifest `controls`; the no-Git path is manifest-only and
+  hash-verifies regular non-symlink payload/control entries. Do not reintroduce
+  recursive fallback scanning or live-runtime control text.
 
 ## Verification and deployment
 

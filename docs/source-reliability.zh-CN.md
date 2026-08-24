@@ -166,7 +166,8 @@ Object 存在：
 Root 与 object directory 是 `0700`，final object 和 worker lock 是 `0600`。Copy 先写私有 partial，
 边写边算 SHA-256，读取前后检查 source identity/size/mtime，随后 `fsync` 并 atomic rename。
 Crash 后如果 final object 已存在但 catalog row 还没提交，下次可按 digest 复用；worker-owned partial
-不会被当作 object。
+不会被当作 object。Partial recovery 只会在进程真正取得 archive lock 后开始，因此 losing worker
+返回 `worker_busy` 前不能删除 active writer 的 temp file。
 
 SHA-256 是 identity，所以不同文件名引用同一份 bytes 时只保留一个 immutable object。
 Markdown 的资源区会显示 catalog status、可用时的本地 object link，以及既有月份目录 hint。
@@ -265,7 +266,8 @@ worker 不会在 mount 缺失时把那个路径重新创建成普通本地目录
 ```
 
 `init` 只初始化 from-now cursors。每次 selection 都有 UUID epoch，因此同一秒内停选/重选也不会复用
-旧身份或吞回停选 gap。历史 backfill 是 identity-bound staged plan/apply，不移动 live cursor。Plan 冻结
+旧身份或吞回停选 gap。Schema upgrade 后，unchanged legacy selection 第一次补 UUID 时只 adopt identity，
+不推进 epoch，也不清空 shard cursor。历史 backfill 是 identity-bound staged plan/apply，不移动 live cursor。Plan 冻结
 selection/source manifest，以 500-2,000 rows 的 bounded keyset page 写 staging，且不改 canonical
 chat、cursor 或 occurrence；apply 必须使用 exact unexpired `run-id`，复核 candidate digest 与 current
 selection digest，并且不重新扫描 source。`backfill --all` 表示 known local WeChat shards 中仍然可读的
@@ -311,16 +313,25 @@ Ordinary status 只有在 current catalog、target objects、有效 latest `COMP
 菜单 app 在 source 初始化前取得 process-lifetime singleton。Main config writer 会在 lock 内重读最新
 revision、只 patch 所需字段，再用 same-directory atomic replace 发布；app 监听 revision 并在不重启的
 情况下 reconcile timers。显式 operator CLI source run 仍保留，但和 app 共用跨进程 capture lock；
-projection render、managed GC 与 mounted handoff 共用另一把 operation lock。
+projection render、managed GC 与 mounted handoff 会重新取得这把 capture lock、reload canonical
+selection，并在整个 output phase 保持 authority，再取得 DB-scoped backup lock。本地 projection
+另外按 output root real path 取得私有 `0600` root-identity lock，mounted handoff 则取得 target-side
+lock；因此不同 capture DB 或 path alias 也不能并发管理同一个 projection / target。Managed
+descendant 若为 symlink 或非目录，会在 write / GC 前 fail closed。
+
+Capture constructor 本身不写 SQLite：schema / archive identity 只在取得 capture operation lock 后
+初始化，backup delivery tables 也只在 backup-DB lock 内初始化。Attachment occurrence transition
+会消费 status + revision compare-and-set 的真实结果；claim 被拒绝时报告 `superseded` / degraded，
+不会被 stale worker 虚增为 ready 或 failed。
 
 File-byte resolution 默认关闭，必须经菜单确认，或在当前 CLI run 显式给出 `--resolve-files`。菜单授权
 只存在内存中，不写入 durable config，并在 app process 退出时归零；每次 attachment-byte operation 前
 还会重新检查，关闭后下一份文件立即停止。
 旧 resource LaunchAgent 可被检测和移除，但新安装会因同一 process-lifetime consent 原因被拒绝。
 
-手动通知只有在 capture healthy、resolution healthy 或因未授权而显式 skipped、本地 projection 成功，
+手动通知只有在 nested source scan 明确 healthy、capture healthy、resolution healthy 或因未授权而显式 skipped、本地 projection 成功，
 且 handoff 为 `idle` / `sync_delegated` 时才写“更新完成”。Source、resolution、projection 或 target 任一
-phase degraded 都会报告未完成，不会压扁成 success。
+phase degraded、`worker_busy` 或 unknown 都会报告未完成，不会压扁成 success。
 
 ## 5. 可选 advanced selected-chat Google Drive API 直传
 

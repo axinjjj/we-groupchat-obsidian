@@ -102,7 +102,9 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
 - 默认 selected-resource backup lane 不需要 OAuth：它取 active monitor chats 与独立显式 selection 的交集，
   捕获 exact link / file metadata occurrences；只有显式开启时才把文件解析进共享 CAS，再把 immutable objects、privacy-bounded catalog
   与 Markdown views 交给 Google Drive for Desktop 等现有 mounted folder。`sync_delegated` 只证明 target bytes，
-  不证明 provider-side upload。
+  不证明 provider-side upload。Scan、backfill、projection 与 handoff 会在 capture lock 下持有 canonical selection；
+  real-output-root 与 target lock 会串行化 path aliases 和 cross-database writers。Busy、unknown 或 nested failure
+  都会 fail closed，不会被推断成 success。
 - Direct Google Drive 文件同步是另一条可选 advanced lane：只扫描用户选定群聊，以 per-chat ×
   message-shard cursor 防止 partial shard read 推进遗漏。File message 不需要 Knowledge hit 就会进入
   durable queue 和 archive-owned provider-neutral CAS catalog；每个 digest 只上传一次，>5 MiB upload 按
@@ -181,10 +183,13 @@ cache、日志或私有调试材料。
 .venv/bin/python scripts/build_share_package.py
 ```
 
-生成的 zip 严格取当前 commit 的 Git tree，并附带 hash-bound `share-manifest.json`。没有 `.git` 的复制目录
-只能按该 manifest allowlist 构建；listed file 缺失、被修改、是 symlink 或非 regular file 时都会 fail closed。
-包仍会排除本机 runtime、`.venv`、build/cache 产物和 internal continuity docs，并额外附带一份
-`群友使用说明.md` 快速入门。
+生成的 zip 严格取当前 commit 的 Git tree，并附带 hash-bound v2 `share-manifest.json`。Payload 来自
+exact commit tree；生成的 `群友使用说明.md` 来自同一 commit 的
+`docs/share-package-guide.zh-CN.md`，其 mode 与 SHA-256 记录在 `controls.guide`，`source_commit` 必须是
+40/64 位 hex immutable object ID。没有 `.git` 的复制目录
+只能按该 manifest allowlist 与 guide control 构建；bound member 缺失、被修改、命中 secret scan、是
+symlink 或 non-regular file 时都会 fail closed。包仍会排除本机 runtime、`.venv`、build/cache 产物和
+internal continuity docs。
 
 ## 安装
 
@@ -367,7 +372,10 @@ WeChat 有 observed title 时使用 title；没有 title 时直接把完整 exac
 sender、hash、source-message identity 和 handoff 详情继续留在私有 catalog，不挤进阅读层。
 这些文件即使名字里没有 `.generated`，也仍然是
 app-owned generated Markdown；只有首选文件名已被猫手写内容占用、程序必须避免覆盖时，
-才会退到 `00-资源索引.generated.md` 或月份 `.generated.md`。
+才会退到 `00-资源索引.generated.md` 或月份 `.generated.md`。Projection writer 会在整个
+render/handoff 期间持有 canonical selected-chat authority，再按 output root 的 real path 取得私有
+root-identity lock；因此不同 capture DB 或不同 path alias 指向同一 root 时也会串行化。若 managed
+descendant 已是 symlink 或非目录，会在写 generated file 或 target bytes 前 fail closed。
 
 菜单栏的 `关注推送 -> 后台通知：开/关` 是自动 banner 总开关。关闭后，
 后台监控、知识库写入和 Daily Digest 仍会继续运行，只是不再显示自动命中、

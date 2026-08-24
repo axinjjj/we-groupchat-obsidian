@@ -125,6 +125,10 @@ Its most important boundaries are:
   delegates immutable objects plus privacy-bounded catalogs and Markdown views
   to an existing mounted folder such as Google Drive for Desktop. A
   `sync_delegated` receipt proves target bytes, not provider-side upload.
+  Scan, backfill, projection, and handoff hold canonical selection under the
+  capture lock; real-output-root and target locks serialize aliases and
+  cross-database writers. Busy, unknown, or nested failure states fail closed
+  instead of being inferred as successful.
 - Direct Google Drive file sync is a separate, optional advanced path. It scans
   only user-selected chats with per-chat x message-shard cursors so a partial
   shard read cannot skip files. File messages need no Knowledge hit and enter
@@ -212,9 +216,13 @@ Do not re-zip a checkout that you have already run; it may contain `.venv`,
 local runtime state, caches, logs, or private debugging material.
 
 For a shareable source zip, build from the exact committed Git tree. The package
-contains a hash-bound `share-manifest.json`; a copied tree without `.git` can
-build only from that manifest allowlist and fails closed if a listed file is
-missing, modified, symlinked, or non-regular:
+contains a v2, hash-bound `share-manifest.json`. Payload files come from the
+exact commit tree; the generated `群友使用说明.md` comes from the exact-commit
+`docs/share-package-guide.zh-CN.md` template and is recorded under
+`controls.guide` with its mode and SHA-256; `source_commit` must be a 40- or
+64-hex immutable object ID. A copied tree without `.git` can build only from
+that manifest allowlist and guide control, and fails closed if a bound member is
+missing, modified, secret-bearing, symlinked, or non-regular:
 
 ```bash
 .venv/bin/python scripts/build_share_package.py
@@ -409,6 +417,12 @@ source-message identity, and handoff details remain in private catalogs instead
 of the reading surface. These are generated, app-owned Markdown files
 even when their names do not contain `.generated`; that suffix is used only when
 the preferred filename already belongs to the user and must not be overwritten.
+Projection writers hold canonical selected-chat authority for the complete
+render/handoff operation, then take a private root-identity lock keyed by the
+real output path. This serializes app and CLI writers even when different
+capture databases or path aliases point at the same root. Existing symlink or
+non-directory descendants fail closed before generated files or target bytes
+are written.
 
 ### Guarded exact relation Markdown cleanup
 

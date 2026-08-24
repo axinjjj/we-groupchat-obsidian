@@ -16,6 +16,7 @@ import os
 import random
 import re
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -229,8 +230,10 @@ class SelectedResourceCapture:
             retry_max_seconds=self.config.get("attachment_archive_retry_max_seconds", 6 * 60 * 60),
             now_func=now_func,
         )
-        self._ensure_schema()
-        self.archive_id = self._ensure_archive_id()
+        self._operation_depth = 0
+        self._operation_owner = None
+        self._initialized = False
+        self._archive_id = ""
 
     @classmethod
     def from_config(cls, config, **kwargs):
@@ -245,9 +248,47 @@ class SelectedResourceCapture:
 
     @contextmanager
     def _operation_lock(self):
-        """Serialize source/cursor work across app and explicit CLI runs."""
-        with resource_capture_operation_lock(self.config):
+        """Own the canonical selection and ledger for one complete operation."""
+        owner = threading.get_ident()
+        if self._operation_depth and self._operation_owner == owner:
             yield
+            return
+        with resource_capture_operation_lock(self.config):
+            self._operation_depth = 1
+            self._operation_owner = owner
+            try:
+                self._reload_canonical_config_locked()
+                self._ensure_initialized_locked()
+                yield
+            finally:
+                self._operation_depth = 0
+                self._operation_owner = None
+
+    def _owns_operation(self):
+        return bool(
+            self._operation_depth
+            and self._operation_owner == threading.get_ident()
+        )
+
+    @contextmanager
+    def canonical_operation(self):
+        """Hold canonical selection authority across a downstream operation."""
+        with self._operation_lock():
+            yield self
+
+    def _ensure_initialized_locked(self):
+        if self._initialized:
+            return
+        self._ensure_schema()
+        self._archive_id = self._ensure_archive_id()
+        self._initialized = True
+
+    @property
+    def archive_id(self):
+        if not self._initialized:
+            with self._operation_lock():
+                pass
+        return self._archive_id
 
     def _reload_canonical_config_locked(self):
         if self.config_loader is None:
@@ -508,7 +549,7 @@ class SelectedResourceCapture:
             f"{CHAT_ID_DOMAIN}{self.archive_id}\0{username}".encode("utf-8")
         ).hexdigest()
 
-    def selected_chats(self):
+    def _selected_chats_locked(self):
         return [
             {
                 "username": chat["username"],
@@ -519,6 +560,10 @@ class SelectedResourceCapture:
             }
             for chat in eligible_selected_chats(self.config)
         ]
+
+    def selected_chats(self):
+        with self._operation_lock():
+            return self._selected_chats_locked()
 
     def selected_chat_keys(self):
         return [chat["chat_key"] for chat in self.selected_chats()]
@@ -543,7 +588,7 @@ class SelectedResourceCapture:
         default_start = int(
             self.now_func() if start_timestamp is None else start_timestamp
         )
-        chats = self.selected_chats()
+        chats = self._selected_chats_locked()
         inserted = 0
         reselected = 0
         conn = self._connect()
@@ -575,15 +620,39 @@ class SelectedResourceCapture:
                     )
                     inserted += 1
                 else:
+                    existing_selection_id = str(existing["selection_id"] or "")
+                    existing_selected_since = int(existing["selected_since"] or 0)
+                    adopt_legacy_selection_id = bool(
+                        selection_id
+                        and not existing_selection_id
+                        and selected_since == existing_selected_since
+                    )
                     epoch_changed = bool(
-                        (selection_id and str(existing["selection_id"] or "") != selection_id)
+                        (
+                            selection_id
+                            and not adopt_legacy_selection_id
+                            and existing_selection_id != selection_id
+                        )
                         or (
                             not selection_id
                             and selected_since
-                            and int(existing["selected_since"] or 0) != selected_since
+                            and existing_selected_since != selected_since
                         )
                     )
-                    if epoch_changed:
+                    if adopt_legacy_selection_id:
+                        conn.execute(
+                            """
+                            UPDATE resource_chats
+                            SET chat_key = ?, chat_alias = ?, selection_id = ?,
+                                updated_at = ?
+                            WHERE chat_username = ?
+                            """,
+                            (
+                                chat["chat_key"], chat["alias"], selection_id,
+                                self.now_func(), chat["username"],
+                            ),
+                        )
+                    elif epoch_changed:
                         conn.execute(
                             """
                             UPDATE resource_chats
@@ -1100,6 +1169,9 @@ class SelectedResourceCapture:
         ])
 
     def cleanup_backfill_runs(self):
+        if not self._owns_operation():
+            with self._operation_lock():
+                return self.cleanup_backfill_runs()
         conn = self._connect()
         try:
             cursor = conn.execute(
@@ -1671,6 +1743,7 @@ class SelectedResourceCapture:
         processed = 0
         ready_local = 0
         failed = 0
+        superseded = 0
         for row in rows:
             if consent_check is not None and not bool(consent_check()):
                 return {
@@ -1685,7 +1758,7 @@ class SelectedResourceCapture:
             status = str(result.get("status") or "retry_wait")
             method = str(result.get("resolution_method") or "")
             if status == "ready_local":
-                self._set_file_state(
+                changed = self._set_file_state(
                     row["occurrence_id"],
                     "ready_local",
                     method=method,
@@ -1697,48 +1770,67 @@ class SelectedResourceCapture:
                     expected_status=row["status"],
                     expected_updated_at=row["updated_at"],
                 )
-                ready_local += 1
+                if changed:
+                    ready_local += 1
+                else:
+                    superseded += 1
             elif status == "missing_retryable":
-                self._set_file_state(
+                changed = self._set_file_state(
                     row["occurrence_id"], "waiting_cache",
                     method=method, error_code=status,
                     expected_status=row["status"],
                     expected_updated_at=row["updated_at"],
                 )
-                failed += 1
+                if changed:
+                    failed += 1
+                else:
+                    superseded += 1
             elif status in {"ambiguous", "object_too_large", "source_rejected"}:
-                self._set_file_state(
+                changed = self._set_file_state(
                     row["occurrence_id"], status,
                     method=method, error_code=status,
                     expected_status=row["status"],
                     expected_updated_at=row["updated_at"],
                 )
-                failed += 1
+                if changed:
+                    failed += 1
+                else:
+                    superseded += 1
             elif status == "insufficient_local_space":
-                self._set_file_state(
+                changed = self._set_file_state(
                     row["occurrence_id"], status,
                     method=method, error_code=status,
                     expected_status=row["status"],
                     expected_updated_at=row["updated_at"],
                 )
-                failed += 1
+                if changed:
+                    failed += 1
+                else:
+                    superseded += 1
             else:
-                self._set_file_state(
+                changed = self._set_file_state(
                     row["occurrence_id"], "retry_wait",
                     method=method,
                     error_code=str(result.get("error_code") or status),
                     expected_status=row["status"],
                     expected_updated_at=row["updated_at"],
                 )
-                failed += 1
+                if changed:
+                    failed += 1
+                else:
+                    superseded += 1
         return {
-            "state": "healthy" if failed == 0 else "degraded",
+            "state": "healthy" if failed == 0 and superseded == 0 else "degraded",
             "processed": processed,
             "ready_local": ready_local,
             "failed": failed,
+            "superseded": superseded,
         }
 
     def occurrences(self, *, selected_only=True):
+        if not self._owns_operation():
+            with self._operation_lock():
+                return self.occurrences(selected_only=selected_only)
         params = []
         where = ""
         if selected_only:
@@ -1765,7 +1857,22 @@ class SelectedResourceCapture:
             conn.close()
 
     def status(self):
-        chats = self.selected_chats()
+        if not self._owns_operation():
+            try:
+                with self._operation_lock():
+                    return self.status()
+            except ResourceCaptureError as exc:
+                if exc.code == "capture_worker_busy":
+                    return {
+                        "state": "worker_busy",
+                        "selected_chats": 0,
+                        "counts": {},
+                        "pending_files": 0,
+                        "last_scan_at": "",
+                        "error_code": exc.code,
+                    }
+                raise
+        chats = self._selected_chats_locked()
         keys = [chat["chat_key"] for chat in chats]
         counts = {}
         pending_files = 0
@@ -1850,26 +1957,50 @@ class SelectedResourceCapture:
                 "failed": 0,
             }
             return {"state": "worker_busy", "scan": scan, "resolve": resolve}
-        scan_state = str(scan.get("state") or "")
-        resolve_state = str(resolve.get("state") or "")
-        if scan_state in {"no_selected_chats", "source_unavailable", "worker_busy"}:
-            state = scan_state
-        elif resolve_state == "consent_revoked":
-            state = "consent_revoked"
-        elif scan_state == "source_degraded" or resolve_state == "degraded":
+        scan_state = str(scan.get("state") or "unknown")
+        resolve_state = str(resolve.get("state") or "unknown")
+        if scan_state != "healthy":
+            state = "degraded" if scan_state == "source_degraded" else scan_state
+        elif resolve_state in {"healthy", "skipped"}:
+            state = "healthy"
+        elif resolve_state == "degraded":
             state = "degraded"
         else:
-            state = "healthy"
+            state = resolve_state
         return {"state": state, "scan": scan, "resolve": resolve}
 
 
 def update_resource_backup_selection(config, selected_chats):
     """Patch selection and initialize its epoch under one capture operation lock."""
-    with resource_capture_operation_lock(config):
-        updated = update_config(patch={
-            "resource_backup_selected_chats": list(selected_chats or []),
-        })
-        capture = SelectedResourceCapture.from_config(updated)
-        capture._reload_canonical_config_locked()
-        initialized = capture._initialize_selected_chat_cursors_locked()
-        return updated, initialized
+    del config  # Caller snapshots are never lock or write authority.
+    for _attempt in range(2):
+        canonical = load_config()
+        locked_db_path = _capture_db_path(canonical)
+        try:
+            with resource_capture_operation_lock(canonical):
+                def patch_current(current):
+                    if _capture_db_path(current) != locked_db_path:
+                        raise ResourceCaptureError("capture_config_changed")
+                    current["resource_backup_selected_chats"] = list(
+                        selected_chats or []
+                    )
+                    return current
+
+                updated = update_config(mutator=patch_current)
+                if _capture_db_path(updated) != locked_db_path:
+                    raise ResourceCaptureError("capture_config_changed")
+                capture = SelectedResourceCapture.from_config(updated)
+                capture._operation_depth = 1
+                capture._operation_owner = threading.get_ident()
+                try:
+                    capture._reload_canonical_config_locked()
+                    capture._ensure_initialized_locked()
+                    initialized = capture._initialize_selected_chat_cursors_locked()
+                finally:
+                    capture._operation_depth = 0
+                    capture._operation_owner = None
+                return updated, initialized
+        except ResourceCaptureError as exc:
+            if exc.code != "capture_config_changed":
+                raise
+    raise ResourceCaptureError("capture_config_changed")

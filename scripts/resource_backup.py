@@ -371,12 +371,13 @@ def main(argv=None):
                 capture=capture,
                 link_export_mode=args.link_export_mode,
             ).run()
-        state = evaluate_resource_backup_outcome(
+        outcome = evaluate_resource_backup_outcome(
             capture_result,
             backup_result,
-        )["state"]
+        )
         result = {
-            "state": state,
+            "state": outcome["state"],
+            "completed": outcome["completed"],
             "capture": capture_result,
             "backup": backup_result,
         }
@@ -389,6 +390,8 @@ def main(argv=None):
         return 1
 
     _print(result)
+    if args.command == "run":
+        return 0 if bool(result.get("completed")) else 2
     return _exit_code(result)
 
 

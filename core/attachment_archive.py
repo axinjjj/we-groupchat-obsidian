@@ -387,12 +387,12 @@ class AttachmentArchive:
             conn.close()
 
     def ensure_layout(self):
+        """Create private archive directories and catalogs without deleting data."""
         _ensure_private_dir(self.archive_root)
         _ensure_private_dir(os.path.join(self.archive_root, "objects"))
         _ensure_private_dir(os.path.join(self.archive_root, "objects", "sha256"))
         _ensure_private_dir(os.path.join(self.archive_root, "tmp"))
         self._ensure_cas_catalog()
-        self.recover_partials()
 
     def _enforce_object_policy(self, size):
         size = max(0, int(size))
@@ -402,8 +402,8 @@ class AttachmentArchive:
         if free - size < self.min_free_bytes:
             raise ArchiveError("insufficient_archive_space")
 
-    def recover_partials(self):
-        """Remove only worker-owned incomplete files; final objects are immutable."""
+    def _recover_partials_locked(self):
+        """Remove worker partials only while locked; final objects are immutable."""
         tmp_root = os.path.join(self.archive_root, "tmp")
         if not os.path.isdir(tmp_root):
             return 0
@@ -432,6 +432,7 @@ class AttachmentArchive:
                 if exc.errno in {errno.EACCES, errno.EAGAIN}:
                     raise ArchiveError("worker_busy") from exc
                 raise
+            self._recover_partials_locked()
             yield
         finally:
             try:

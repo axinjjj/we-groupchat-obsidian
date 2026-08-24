@@ -1,5 +1,6 @@
 import hashlib
 import json
+import multiprocessing
 import os
 import sqlite3
 import stat
@@ -15,6 +16,68 @@ from core.attachment_archive import (
 )
 from core.image_decoder import V2_MAGIC
 from core.knowledge import KnowledgeStore
+
+
+def _hold_archive_partial(
+    knowledge_db,
+    archive_root,
+    db_dir,
+    ready_event,
+    release_event,
+    result_queue,
+):
+    archive = AttachmentArchive(
+        knowledge_db,
+        archive_root,
+        db_dir=db_dir,
+        archive_kinds=("file",),
+        min_free_bytes=0,
+    )
+    try:
+        with archive._worker_lock():
+            partial = os.path.join(
+                archive_root,
+                "tmp",
+                ".partial-live-writer",
+            )
+            with open(partial, "wb") as handle:
+                handle.write(b"live private attachment bytes")
+                handle.flush()
+                os.fsync(handle.fileno())
+            ready_event.set()
+            release_event.wait(10)
+            result_queue.put({"state": "released", "partial_exists": os.path.exists(partial)})
+    except Exception as exc:  # pragma: no cover - returned to the parent process
+        ready_event.set()
+        result_queue.put({"state": type(exc).__name__, "error": str(exc)})
+
+
+def _contend_archive_lock(
+    knowledge_db,
+    archive_root,
+    db_dir,
+    ready_event,
+    result_queue,
+):
+    ready_event.wait(10)
+    archive = AttachmentArchive(
+        knowledge_db,
+        archive_root,
+        db_dir=db_dir,
+        archive_kinds=("file",),
+        min_free_bytes=0,
+    )
+    try:
+        with archive._worker_lock():
+            state = "acquired"
+    except ArchiveError as exc:
+        state = exc.code
+    result_queue.put({
+        "state": state,
+        "partial_exists": os.path.exists(
+            os.path.join(archive_root, "tmp", ".partial-live-writer")
+        ),
+    })
 
 
 def candidate(title="Attachment fixture", topic_key="attachment-fixture"):
@@ -498,7 +561,8 @@ class AttachmentArchiveTests(unittest.TestCase):
         partial = os.path.join(self.archive_root, "tmp", ".partial-crash-fixture")
         with open(partial, "wb") as file:
             file.write(b"incomplete private bytes")
-        self.assertEqual(archive.recover_partials(), 1)
+        with archive._worker_lock():
+            pass
         self.assertFalse(os.path.exists(partial))
 
         with archive._worker_lock():
@@ -507,6 +571,53 @@ class AttachmentArchiveTests(unittest.TestCase):
 
         with open(os.path.join(self.archive_root, ".archive.lock"), encoding="utf-8") as lock:
             self.assertEqual(lock.read(), "")
+
+    def test_losing_process_cannot_recover_the_active_writers_partial(self):
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        release = context.Event()
+        holder_results = context.Queue()
+        contender_results = context.Queue()
+        holder = context.Process(
+            target=_hold_archive_partial,
+            args=(
+                self.db_path,
+                self.archive_root,
+                self.db_dir,
+                ready,
+                release,
+                holder_results,
+            ),
+        )
+        contender = context.Process(
+            target=_contend_archive_lock,
+            args=(
+                self.db_path,
+                self.archive_root,
+                self.db_dir,
+                ready,
+                contender_results,
+            ),
+        )
+        holder.start()
+        try:
+            self.assertTrue(ready.wait(10))
+            contender.start()
+            contender.join(10)
+            self.assertEqual(contender.exitcode, 0)
+            contender_result = contender_results.get(timeout=2)
+            self.assertEqual(contender_result["state"], "worker_busy")
+            self.assertTrue(contender_result["partial_exists"])
+        finally:
+            release.set()
+            if contender.pid is not None:
+                contender.join(5)
+            holder.join(10)
+
+        self.assertEqual(holder.exitcode, 0)
+        holder_result = holder_results.get(timeout=2)
+        self.assertEqual(holder_result["state"], "released")
+        self.assertTrue(holder_result["partial_exists"])
 
     def test_config_consumer_bootstraps_catalog_for_crash_recovery(self):
         fresh_db = os.path.join(self.tmp.name, "fresh", "knowledge.db")

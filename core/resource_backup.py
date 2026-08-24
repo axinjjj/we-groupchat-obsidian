@@ -27,13 +27,14 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from .attachment_archive import ArchiveError
 from .config import DATA_DIR
-from .resource_capture import SelectedResourceCapture
+from .resource_capture import ResourceCaptureError, SelectedResourceCapture
 
 
 BACKUP_SCHEMA = "we-groupchat-obsidian.resource-backup.v3"
 INDEX_MARKER = "<!-- we-groupchat-obsidian:resource-index v1 -->"
 INDEX_MANIFEST_NAME = ".resource-index-manifest.json"
 INDEX_MANIFEST_SCHEMA = "we-groupchat-obsidian.resource-index-manifest.v1"
+PROJECTION_LOCK_DIR = os.path.join(DATA_DIR, "resource-projection-locks")
 DESTINATION_MARKER_NAME = ".wgo-destination.json"
 DESTINATION_MARKER_SCHEMA = "we-groupchat-obsidian.destination.v1"
 SETTINGS_FILE = os.path.join(DATA_DIR, "resource_backup.json")
@@ -71,6 +72,9 @@ def evaluate_resource_backup_outcome(capture_result, backup_result):
     capture_result = capture_result or {}
     backup_result = backup_result or {}
     capture_state = str(capture_result.get("state") or "unknown")
+    scan_state = str(
+        (capture_result.get("scan") or {}).get("state") or "unknown"
+    )
     resolve_state = str(
         (capture_result.get("resolve") or {}).get("state") or "unknown"
     )
@@ -80,6 +84,7 @@ def evaluate_resource_backup_outcome(capture_result, backup_result):
     handoff_state = str(backup_result.get("state") or "unknown")
     completed = (
         capture_state == "healthy"
+        and scan_state == "healthy"
         and resolve_state in {"healthy", "skipped"}
         and projection_state in {"written", "unchanged"}
         and handoff_state in {"idle", "sync_delegated"}
@@ -88,6 +93,8 @@ def evaluate_resource_backup_outcome(capture_result, backup_result):
         state = "ok"
     elif capture_state != "healthy":
         state = capture_state
+    elif scan_state != "healthy":
+        state = scan_state
     elif resolve_state not in {"healthy", "skipped"}:
         state = resolve_state
     elif projection_state not in {"written", "unchanged"}:
@@ -98,6 +105,7 @@ def evaluate_resource_backup_outcome(capture_result, backup_result):
         "completed": completed,
         "state": state,
         "capture_state": capture_state,
+        "scan_state": scan_state,
         "resolve_state": resolve_state,
         "projection_state": projection_state,
         "handoff_state": handoff_state,
@@ -531,6 +539,10 @@ class MountedResourceBackup:
         self.obsidian_subdir = _safe_subdir(
             self.config.get("monitor_obsidian_subdir") or "微信群聊/关注推送"
         )
+        self.projection_lock_dir = os.path.abspath(os.path.expanduser(
+            self.config.get("resource_projection_lock_dir")
+            or PROJECTION_LOCK_DIR
+        ))
         self.min_free_bytes = max(0, int(
             self.config.get(
                 "resource_backup_min_free_bytes",
@@ -546,7 +558,7 @@ class MountedResourceBackup:
             raise ValueError("link_export_mode must be full, redacted, or off")
         self.link_export_mode = mode
         self._destination_uuid = ""
-        self._ensure_schema()
+        self._schema_ready = False
 
     @classmethod
     def from_config(cls, config, **kwargs):
@@ -583,6 +595,8 @@ class MountedResourceBackup:
         return conn
 
     def _ensure_schema(self):
+        if self._schema_ready:
+            return
         conn = self._connect()
         try:
             conn.executescript(
@@ -609,6 +623,7 @@ class MountedResourceBackup:
             conn.commit()
         finally:
             conn.close()
+        self._schema_ready = True
 
     @contextmanager
     def _worker_lock(self):
@@ -633,6 +648,45 @@ class MountedResourceBackup:
                 pass
             os.close(fd)
 
+    @property
+    def obsidian_projection_root(self):
+        return os.path.join(self.obsidian_root, self.obsidian_subdir)
+
+    @contextmanager
+    def _projection_worker_lock(self):
+        """Serialize aliases of the same local projection root."""
+        _ensure_dir(self.projection_lock_dir)
+        root_key = os.path.realpath(self.obsidian_projection_root).encode("utf-8")
+        lock_path = os.path.join(
+            self.projection_lock_dir,
+            hashlib.sha256(root_key).hexdigest() + ".lock",
+        )
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(lock_path, flags, 0o600)
+        except OSError as exc:
+            raise ResourceBackupError("projection_lock_unavailable") from exc
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise ResourceBackupError("projection_lock_invalid")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                    raise ResourceBackupError("worker_busy") from exc
+                raise
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)
+
     @contextmanager
     def _target_worker_lock(self):
         if not self.target or not os.path.isdir(self.target):
@@ -647,15 +701,15 @@ class MountedResourceBackup:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise ResourceBackupError("target_lock_invalid")
             try:
-                os.fchmod(fd, 0o600)
-            except OSError:
-                pass
-            try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError as exc:
                 if exc.errno in {errno.EACCES, errno.EAGAIN}:
                     raise ResourceBackupError("worker_busy") from exc
                 raise
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
             yield
         finally:
             try:
@@ -842,6 +896,81 @@ class MountedResourceBackup:
             except OSError:
                 pass
 
+    def _ensure_projection_dir(self, path):
+        """Create a local projection directory without following child symlinks."""
+        anchor = os.path.abspath(self.obsidian_root)
+        path = os.path.abspath(path)
+        try:
+            if os.path.commonpath((path, anchor)) != anchor:
+                raise ResourceBackupError("projection_outside_configured_root")
+        except ValueError as exc:
+            raise ResourceBackupError("projection_outside_configured_root") from exc
+        _ensure_dir(anchor)
+        if not os.path.isdir(anchor):
+            raise ResourceBackupError("projection_root_unavailable")
+        anchor_real = os.path.realpath(anchor)
+        relative = os.path.relpath(path, anchor)
+        if relative == ".":
+            return
+        current = anchor
+        for part in relative.split(os.sep):
+            if part in {"", ".", ".."}:
+                raise ResourceBackupError("projection_path_invalid")
+            current = os.path.join(current, part)
+            if os.path.lexists(current):
+                try:
+                    mode = os.lstat(current).st_mode
+                except OSError as exc:
+                    raise ResourceBackupError(
+                        "projection_directory_unavailable"
+                    ) from exc
+                if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+                    raise ResourceBackupError("projection_directory_conflict")
+            else:
+                try:
+                    os.mkdir(current, 0o700)
+                except OSError as exc:
+                    raise ResourceBackupError(
+                        "projection_directory_unavailable"
+                    ) from exc
+            try:
+                if os.path.commonpath(
+                    (os.path.realpath(current), anchor_real)
+                ) != anchor_real:
+                    raise ResourceBackupError("projection_directory_escape")
+            except ValueError as exc:
+                raise ResourceBackupError("projection_directory_escape") from exc
+            try:
+                os.chmod(current, 0o700)
+            except OSError:
+                pass
+
+    def _projection_atomic_bytes(self, path, data, mode=0o600):
+        self._ensure_projection_dir(os.path.dirname(path))
+        if os.path.lexists(path):
+            try:
+                existing_mode = os.lstat(path).st_mode
+            except OSError as exc:
+                raise ResourceBackupError("projection_file_conflict") from exc
+            if stat.S_ISLNK(existing_mode) or not stat.S_ISREG(existing_mode):
+                raise ResourceBackupError("projection_file_conflict")
+        _atomic_bytes(path, data, mode=mode)
+        if not _within(path, self.obsidian_root):
+            raise ResourceBackupError("projection_file_escape")
+
+    def _projection_text_if_changed(self, path, text):
+        data = (str(text).rstrip() + "\n").encode("utf-8")
+        self._ensure_projection_dir(os.path.dirname(path))
+        if os.path.lexists(path):
+            current = self._read_regular_bytes(
+                path,
+                error_code="projection_file_conflict",
+            )
+            if current == data:
+                return False
+        self._projection_atomic_bytes(path, data)
+        return True
+
     @staticmethod
     def _read_regular_bytes(path, *, error_code="target_file_conflict"):
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -889,6 +1018,8 @@ class MountedResourceBackup:
         stem, extension = os.path.splitext(preferred_path)
         candidates = (preferred_path, stem + ".generated" + (extension or ".md"))
         for candidate in candidates:
+            if not target_view:
+                self._ensure_projection_dir(os.path.dirname(candidate))
             if not os.path.lexists(candidate):
                 return candidate
             try:
@@ -912,10 +1043,12 @@ class MountedResourceBackup:
         if target_view:
             changed = self._target_text_if_changed(actual_path, text)
         else:
-            changed = _atomic_text_if_changed(actual_path, text)
+            changed = self._projection_text_if_changed(actual_path, text)
         return actual_path, changed
 
     def _managed_projection_paths(self, base_root, *, target_view):
+        if not target_view:
+            self._ensure_projection_dir(base_root)
         manifest_path = os.path.join(base_root, INDEX_MANIFEST_NAME)
         if not os.path.lexists(manifest_path):
             if os.path.isdir(base_root):
@@ -996,6 +1129,8 @@ class MountedResourceBackup:
             path = os.path.abspath(os.path.join(base_root, relative))
             if not _within(path, base_root):
                 continue
+            if not target_view:
+                self._ensure_projection_dir(os.path.dirname(path))
             try:
                 data = (
                     self._read_regular_bytes(path)
@@ -1029,7 +1164,7 @@ class MountedResourceBackup:
         if target_view:
             self._target_atomic_bytes(manifest_path, payload)
         else:
-            _atomic_bytes(manifest_path, payload)
+            self._projection_atomic_bytes(manifest_path, payload)
 
     def _delivery_row(self, digest):
         conn = self._connect()
@@ -1527,7 +1662,7 @@ class MountedResourceBackup:
                 str(row.get("source_month") or "未标月份")
             ].append(row)
         chat_parts = self._chat_path_parts(occurrences)
-        delivery_map = self._delivery_map()
+        delivery_map = self._delivery_map() if target_view else {}
         written = 0
         managed_paths = []
         chat_summaries = []
@@ -1538,7 +1673,7 @@ class MountedResourceBackup:
             if target_view:
                 self._ensure_target_dir(index_dir)
             else:
-                _ensure_dir(index_dir)
+                self._ensure_projection_dir(index_dir)
             index_lines = [
                 INDEX_MARKER,
                 f"# {_single_line(chat_alias, '未命名群聊', 120)} · 资源索引",
@@ -1657,12 +1792,22 @@ class MountedResourceBackup:
 
     def render_obsidian_indexes(self):
         try:
-            with self._worker_lock():
-                return self._render_obsidian_indexes_owned()
-        except ResourceBackupError as exc:
-            if exc.code == "worker_busy":
+            with self.capture.canonical_operation():
+                with self._worker_lock():
+                    self._ensure_schema()
+                    with self._projection_worker_lock():
+                        return self._render_obsidian_indexes_owned()
+        except (ResourceBackupError, ResourceCaptureError) as exc:
+            if exc.code in {"worker_busy", "capture_worker_busy"}:
                 return {
                     "state": "worker_busy",
+                    "files_written": 0,
+                    "occurrences": 0,
+                    "error_code": exc.code,
+                }
+            if isinstance(exc, ResourceCaptureError):
+                return {
+                    "state": exc.code,
                     "files_written": 0,
                     "occurrences": 0,
                     "error_code": exc.code,
@@ -1671,8 +1816,8 @@ class MountedResourceBackup:
 
     def _render_obsidian_indexes_owned(self):
         occurrences = self.capture.occurrences(selected_only=True)
-        root = os.path.join(self.obsidian_root, self.obsidian_subdir)
-        _ensure_dir(root)
+        root = self.obsidian_projection_root
+        self._ensure_projection_dir(root)
         return {
             "state": "written",
             "files_written": self._render_indexes_at(root, occurrences, target_view=False),
@@ -1681,10 +1826,15 @@ class MountedResourceBackup:
 
     def _render_obsidian_indexes_safely(self):
         try:
-            return self._render_obsidian_indexes_owned()
+            with self._projection_worker_lock():
+                return self._render_obsidian_indexes_owned()
         except (OSError, ResourceBackupError) as exc:
             return {
-                "state": "projection_failed",
+                "state": (
+                    "worker_busy"
+                    if str(getattr(exc, "code", "")) == "worker_busy"
+                    else "projection_failed"
+                ),
                 "files_written": 0,
                 "occurrences": len(self.capture.occurrences(selected_only=True)),
                 "error_code": str(
@@ -1698,6 +1848,39 @@ class MountedResourceBackup:
         return self._render_indexes_at(root, occurrences, target_view=True)
 
     def plan(self):
+        try:
+            with self.capture.canonical_operation():
+                with self._worker_lock():
+                    self._ensure_schema()
+                    return self._plan_owned()
+        except (ResourceBackupError, ResourceCaptureError) as exc:
+            if exc.code in {"worker_busy", "capture_worker_busy"}:
+                return {
+                    "state": "worker_busy",
+                    "error_code": exc.code,
+                    "selected_chats": 0,
+                    "occurrences": 0,
+                    "links": 0,
+                    "file_occurrences": 0,
+                    "objects": 0,
+                    "pending_objects": 0,
+                    "unresolved_files": 0,
+                }
+            if isinstance(exc, ResourceCaptureError):
+                return {
+                    "state": exc.code,
+                    "error_code": exc.code,
+                    "selected_chats": 0,
+                    "occurrences": 0,
+                    "links": 0,
+                    "file_occurrences": 0,
+                    "objects": 0,
+                    "pending_objects": 0,
+                    "unresolved_files": 0,
+                }
+            raise
+
+    def _plan_owned(self):
         occurrences = self.capture.occurrences(selected_only=True)
         objects = self._object_rows(occurrences)
         boundary = self._target_boundary_error(occurrences, objects)
@@ -1769,10 +1952,15 @@ class MountedResourceBackup:
             "occurrences": 0,
         }
         try:
-            with self._worker_lock():
-                return self._run_owned()
-        except (ResourceBackupError, ArchiveError, OSError) as exc:
-            if str(getattr(exc, "code", "")) == "worker_busy":
+            with self.capture.canonical_operation():
+                with self._worker_lock():
+                    self._ensure_schema()
+                    return self._run_owned()
+        except (ResourceBackupError, ResourceCaptureError, ArchiveError, OSError) as exc:
+            if str(getattr(exc, "code", "")) in {
+                "worker_busy",
+                "capture_worker_busy",
+            }:
                 return {
                     "state": "worker_busy",
                     "copied": 0,
@@ -1780,6 +1968,15 @@ class MountedResourceBackup:
                     "obsidian": obsidian,
                 }
             code = str(getattr(exc, "code", "") or type(exc).__name__)
+            if isinstance(exc, ResourceCaptureError):
+                return {
+                    "state": code,
+                    "error_code": code,
+                    "copied": 0,
+                    "reused": 0,
+                    "failed": 0,
+                    "obsidian": obsidian,
+                }
             return {
                 "state": "target_failed",
                 "copied": 0,
@@ -1792,6 +1989,14 @@ class MountedResourceBackup:
     def _run_owned(self):
         """Render and hand off while holding the cross-process operation lock."""
         obsidian = self._render_obsidian_indexes_safely()
+        if str(obsidian.get("state") or "") not in {"written", "unchanged"}:
+            return {
+                "state": str(obsidian.get("state") or "projection_failed"),
+                "copied": 0,
+                "reused": 0,
+                "failed": 0,
+                "obsidian": obsidian,
+            }
         if not self.target:
             return {
                 "state": "target_not_configured",
@@ -1838,12 +2043,7 @@ class MountedResourceBackup:
                 object_rows=object_rows,
             )
 
-    def _run_locked(self, *, obsidian=None, occurrences=None, object_rows=None):
-        occurrences = (
-            self.capture.occurrences(selected_only=True)
-            if occurrences is None else occurrences
-        )
-        object_rows = self._object_rows(occurrences) if object_rows is None else object_rows
+    def _run_locked(self, *, obsidian, occurrences, object_rows):
         self._ensure_target_dir(self.backup_root)
         copied = 0
         reused = 0
@@ -1859,8 +2059,6 @@ class MountedResourceBackup:
             except (ResourceBackupError, ArchiveError, OSError) as exc:
                 failed += 1
                 error_codes.append(str(getattr(exc, "code", "") or type(exc).__name__))
-        if obsidian is None:
-            obsidian = self._render_obsidian_indexes_safely()
         if failed:
             return {
                 "state": "target_failed",
@@ -1932,6 +2130,29 @@ class MountedResourceBackup:
         return {"directory": directory, "manifest": manifest}
 
     def verify(self, snapshot_id=""):
+        try:
+            with self.capture.canonical_operation():
+                with self._worker_lock():
+                    self._ensure_schema()
+                    return self._verify_owned(snapshot_id)
+        except (ResourceBackupError, ResourceCaptureError) as exc:
+            if exc.code in {"worker_busy", "capture_worker_busy"}:
+                return {
+                    "state": "worker_busy",
+                    "verified": 0,
+                    "failed": 0,
+                    "error_code": exc.code,
+                }
+            if isinstance(exc, ResourceCaptureError):
+                return {
+                    "state": exc.code,
+                    "verified": 0,
+                    "failed": 0,
+                    "error_code": exc.code,
+                }
+            raise
+
+    def _verify_owned(self, snapshot_id=""):
         snapshot = self._load_snapshot(snapshot_id)
         if snapshot is None:
             return {"state": "snapshot_unavailable", "verified": 0, "failed": 0}
@@ -1963,6 +2184,14 @@ class MountedResourceBackup:
 
     def status(self):
         plan = self.plan()
+        if not self._schema_ready:
+            return {
+                **plan,
+                "latest_snapshot": "",
+                "handoff_semantics": str(plan.get("state") or "unavailable"),
+                "remote_verified": False,
+                "link_export_mode": self.link_export_mode,
+            }
         state = self._state_row() if self.destination_id else None
         plan_state = str(plan.get("state") or "")
         if plan_state != "ready":

@@ -198,7 +198,9 @@ are `0600`. Copying uses a private partial file, calculates SHA-256 while
 writing, checks source identity/size/mtime before and after the read, `fsync`s,
 and atomically renames the completed object. A final object without a catalog
 row is reusable after a crash; worker-owned partial files are recoverable and
-never treated as objects.
+never treated as objects. Partial recovery starts only after the process owns
+the archive lock, so a losing worker cannot delete the active writer's temp
+file before returning `worker_busy`.
 
 SHA-256 is the identity, so identical bytes referenced under different names
 use one immutable object. Markdown resource sections show the catalog status,
@@ -306,7 +308,9 @@ the worker never recreates a missing mount path.
 
 `init` seeds from-now cursors only. Each selection has a UUID epoch, so a rapid
 deselect/reselect cannot reuse a one-second timestamp identity or consume the
-unselected gap. Historical backfill is an identity-bound staged plan/apply and
+unselected gap. On schema upgrade, the first UUID assigned to an unchanged
+legacy selection is adopted without advancing its epoch or resetting shard
+cursors. Historical backfill is an identity-bound staged plan/apply and
 does not move live cursors. Planning freezes the selection/source manifest and
 writes bounded 500-2,000-row keyset pages; it does not mutate canonical chat,
 cursor, or occurrence rows. Apply requires the exact unexpired `run_id`, checks
@@ -369,7 +373,20 @@ initialization. Main config writers patch the latest locked revision and publish
 by same-directory atomic replace; the app watches revisions and reconciles
 timers without restart. Explicit operator CLI source runs remain available but
 share a cross-process capture lock with the app. Projection rendering, managed
-GC, and mounted handoff share a second operation lock.
+GC, and mounted handoff reacquire that capture lock and reload canonical
+selection before output, then take the DB-scoped backup lock. Local Obsidian
+projection additionally takes a private `0600` root-identity lock keyed by the
+real output path, while mounted handoff takes a target-side lock; distinct
+capture databases and path aliases therefore cannot concurrently manage the
+same projection or target. Local generated descendants are checked without
+following symlinks before write or managed GC.
+
+Capture construction is side-effect free: capture schema/archive identity are
+initialized only after the capture operation lock is held, and backup delivery
+tables are initialized only under the backup-DB lock. Attachment occurrence
+transitions consume the status-plus-revision compare-and-set result; a rejected
+claim is reported as `superseded`/degraded rather than counted as ready or
+failed by the stale worker.
 
 File-byte resolution remains off by default and requires the menu confirmation
 or `--resolve-files` on the current explicit CLI run. Menu consent exists only
@@ -379,10 +396,12 @@ file immediately. Old resource
 LaunchAgent installs are detected and removable, but new installation is
 refused for the same process-lifetime consent reason.
 
-Manual “update complete” notifications require healthy capture, healthy or
+Manual “update complete” notifications require an explicitly healthy nested
+source scan, healthy capture, healthy or
 explicitly skipped resolution, successful local projection, and an `idle` or
 `sync_delegated` handoff. Any degraded source, resolution, projection, or target
-phase is reported as incomplete rather than flattened into success.
+phase, `worker_busy`, or unknown state is reported as incomplete rather than
+flattened into success.
 
 ## 5. Optional advanced direct selected-chat Google Drive API sync
 

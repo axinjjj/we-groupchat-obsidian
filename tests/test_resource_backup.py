@@ -11,12 +11,14 @@ import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import scripts.resource_backup as resource_backup_cli
 from core.resource_backup import (
     MountedResourceBackup,
     _redact_url,
+    evaluate_resource_backup_outcome,
     load_resource_backup_settings,
     save_resource_backup_settings,
 )
@@ -25,6 +27,8 @@ from core.resource_capture import (
     SelectedResourceCapture,
     _exact_links,
     _url_sha256,
+    resource_capture_operation_lock,
+    update_resource_backup_selection,
 )
 from core.wechat_db import WeChatSourceDegraded
 
@@ -32,6 +36,63 @@ from core.wechat_db import WeChatSourceDegraded
 def _settings_patch_worker(path, patch_value, start_event):
     start_event.wait(5)
     save_resource_backup_settings(patch_value, path=path)
+
+
+def _render_projection_worker(
+    config,
+    archive_id,
+    settings_path,
+    start_event,
+    result_queue,
+):
+    start_event.wait(10)
+    try:
+        capture = SelectedResourceCapture(
+            config,
+            source=None,
+            archive_id_factory=lambda: archive_id,
+        )
+        backup = MountedResourceBackup(
+            config,
+            capture=capture,
+            settings_path=settings_path,
+        )
+        result_queue.put(backup.render_obsidian_indexes())
+    except Exception as exc:  # pragma: no cover - returned to the parent process
+        result_queue.put({"state": type(exc).__name__, "error": str(exc)})
+
+
+def _hold_backup_capture_operation(
+    config,
+    archive_id,
+    settings_path,
+    started,
+    release,
+    result_queue,
+):
+    capture = SelectedResourceCapture(
+        config,
+        source=None,
+        archive_id_factory=lambda: archive_id,
+    )
+    backup = MountedResourceBackup(
+        config,
+        capture=capture,
+        settings_path=settings_path,
+    )
+
+    def paused_run():
+        started.set()
+        release.wait(10)
+        return {
+            "state": "idle",
+            "copied": 0,
+            "failed": 0,
+            "obsidian": {"state": "written"},
+        }
+
+    backup._run_owned = paused_run
+    result_queue.put(backup.run())
 
 
 class FakeSource:
@@ -105,6 +166,10 @@ class ResourceBackupTests(unittest.TestCase):
             "monitor_knowledge_db": self.knowledge_db,
             "monitor_obsidian_root": self.obsidian_root,
             "monitor_obsidian_subdir": "微信群聊/关注推送",
+            "resource_projection_lock_dir": os.path.join(
+                self.root,
+                "projection-locks",
+            ),
             "resource_backup_target": self.target,
             "monitor_chats": [
                 {"username": self.selected, "name": "Selected Chat"},
@@ -344,6 +409,10 @@ class ResourceBackupTests(unittest.TestCase):
             or os.path.basename(path) == ".resource-index-manifest.json"
             for path in vault_files
         ))
+        lock_files = list(Path(self.config["resource_projection_lock_dir"]).glob("*.lock"))
+        self.assertEqual(len(lock_files), 1)
+        self.assertEqual(lock_files[0].read_bytes(), b"")
+        self.assertEqual(lock_files[0].stat().st_mode & 0o777, 0o600)
 
     def test_resource_index_prefers_observed_title_and_uses_exact_url_as_fallback(self):
         capture = self._ready_capture()
@@ -605,6 +674,59 @@ class ResourceBackupTests(unittest.TestCase):
             conn.close()
         self.assertEqual(row[0], "00000000-0000-0000-0000-000000000002")
         self.assertEqual(row[1], 2)
+
+    def test_legacy_empty_selection_id_is_adopted_without_resetting_cursors(self):
+        config = dict(self.config)
+        config["resource_backup_selected_chats"] = [{
+            "username": self.selected,
+            "alias": "猫猫研究群",
+            "selected_since": 100,
+        }]
+        first = SelectedResourceCapture(
+            config,
+            source=FakeSource({self.selected: []}),
+            now_func=lambda: 200,
+            archive_id_factory=lambda: "00000000-0000-0000-0000-000000000099",
+        )
+        first.initialize_selected_chat_cursors()
+        first.scan()
+        conn = sqlite3.connect(self.capture_db)
+        try:
+            before_shards = conn.execute(
+                "SELECT source_shard_id, cursor_timestamp "
+                "FROM resource_shards ORDER BY source_shard_id"
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertTrue(before_shards)
+
+        config["resource_backup_selected_chats"][0]["selection_id"] = (
+            "00000000-0000-0000-0000-000000000123"
+        )
+        upgraded = SelectedResourceCapture(
+            config,
+            source=FakeSource({self.selected: []}),
+            now_func=lambda: 300,
+        )
+        result = upgraded.initialize_selected_chat_cursors()
+
+        self.assertEqual(result["reselected_chats"], 0)
+        conn = sqlite3.connect(self.capture_db)
+        try:
+            row = conn.execute(
+                "SELECT selection_id, selection_epoch FROM resource_chats"
+            ).fetchone()
+            after_shards = conn.execute(
+                "SELECT source_shard_id, cursor_timestamp "
+                "FROM resource_shards ORDER BY source_shard_id"
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(row, (
+            "00000000-0000-0000-0000-000000000123",
+            1,
+        ))
+        self.assertEqual(after_shards, before_shards)
 
     def test_explicit_backfill_applies_history_without_moving_live_cursor(self):
         source = FakeSource({
@@ -959,9 +1081,110 @@ class ResourceBackupTests(unittest.TestCase):
         for thread in threads:
             thread.join(10)
 
-        self.assertEqual(errors, [])
-        self.assertEqual(len(results), 2)
-        self.assertEqual(len(set(results)), 1)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(
+            [str(getattr(exc, "code", "")) for exc in errors],
+            ["capture_worker_busy"],
+        )
+        retry = SelectedResourceCapture(
+            self.config,
+            source=None,
+            archive_id_factory=factory,
+        ).archive_id
+        self.assertEqual(retry, results[0])
+
+    def test_capture_constructor_does_not_write_before_operation_lock(self):
+        config = dict(self.config)
+        config["resource_capture_db"] = os.path.join(
+            self.root,
+            "constructor-isolation.db",
+        )
+        with resource_capture_operation_lock(config):
+            capture = SelectedResourceCapture(
+                config,
+                source=None,
+                archive_id_factory=(
+                    lambda: "00000000-0000-0000-0000-000000000099"
+                ),
+            )
+            self.assertFalse(os.path.exists(config["resource_capture_db"]))
+            self.assertEqual(capture.status()["state"], "worker_busy")
+            self.assertFalse(os.path.exists(config["resource_capture_db"]))
+
+    def test_capture_reentrancy_is_owned_by_one_thread(self):
+        capture = self._capture()
+        observed = []
+
+        with capture.canonical_operation():
+            thread = threading.Thread(
+                target=lambda: observed.append(capture.status()["state"])
+            )
+            thread.start()
+            thread.join(5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(observed, ["worker_busy"])
+
+    def test_backup_holds_capture_authority_against_selection_mutation(self):
+        capture = self._ready_capture()
+        context = multiprocessing.get_context("spawn")
+        started = context.Event()
+        release = context.Event()
+        results = context.Queue()
+        process = context.Process(
+            target=_hold_backup_capture_operation,
+            args=(
+                self.config,
+                capture.archive_id,
+                os.path.join(self.root, "spawned-backup-settings.json"),
+                started,
+                release,
+                results,
+            ),
+        )
+        try:
+            process.start()
+            self.assertTrue(started.wait(10))
+            with self.assertRaisesRegex(
+                ResourceCaptureError,
+                "capture_worker_busy",
+            ):
+                with resource_capture_operation_lock(self.config):
+                    pass
+            release.set()
+            process.join(10)
+            self.assertEqual(process.exitcode, 0)
+            self.assertEqual(results.get(timeout=2)["state"], "idle")
+        finally:
+            release.set()
+            if process.pid is not None:
+                process.join(5)
+
+    def test_selection_writer_ignores_stale_caller_lock_identity(self):
+        stale = dict(self.config)
+        stale["resource_capture_db"] = os.path.join(self.root, "stale.db")
+        canonical = dict(self.config)
+        canonical["resource_capture_db"] = os.path.join(
+            self.root,
+            "canonical.db",
+        )
+        with (
+            resource_capture_operation_lock(canonical),
+            patch(
+                "core.resource_capture.load_config",
+                return_value=canonical,
+            ),
+            patch("core.resource_capture.update_config") as update,
+        ):
+            with self.assertRaisesRegex(
+                ResourceCaptureError,
+                "capture_worker_busy",
+            ):
+                update_resource_backup_selection(stale, [])
+
+        update.assert_not_called()
+        self.assertFalse(os.path.exists(stale["resource_capture_db"]))
+        self.assertFalse(os.path.exists(canonical["resource_capture_db"]))
 
     def test_schema_too_new_is_rejected_without_relabeling(self):
         conn = sqlite3.connect(self.capture_db)
@@ -978,7 +1201,7 @@ class ResourceBackupTests(unittest.TestCase):
                 self.config,
                 source=None,
                 archive_id_factory=lambda: "00000000-0000-0000-0000-000000000001",
-            )
+            ).archive_id
 
         conn = sqlite3.connect(self.capture_db)
         try:
@@ -1029,6 +1252,64 @@ class ResourceBackupTests(unittest.TestCase):
 
         self.assertEqual(result["state"], "worker_busy")
 
+    def test_projection_root_lock_serializes_distinct_capture_databases(self):
+        first_capture = self._ready_capture()
+        self._backup(first_capture)
+        projection_root = os.path.join(
+            self.obsidian_root,
+            "微信群聊",
+            "关注推送",
+        )
+        os.makedirs(projection_root, exist_ok=True)
+        first_backup = self._backup(first_capture)
+
+        def projection_files():
+            result = {}
+            for root, _dirs, files in os.walk(projection_root):
+                for name in files:
+                    path = os.path.join(root, name)
+                    with open(path, "rb") as handle:
+                        result[os.path.relpath(path, projection_root)] = handle.read()
+            return result
+
+        before = projection_files()
+        second_config = dict(self.config)
+        second_config["resource_capture_db"] = os.path.join(
+            self.root,
+            "second-projection-capture.db",
+        )
+        second_config["attachment_archive_root"] = os.path.join(
+            self.root,
+            "second-projection-archive",
+        )
+        settings_path = os.path.join(self.root, "second-resource-backup.json")
+        context = multiprocessing.get_context("spawn")
+        start = context.Event()
+        results = context.Queue()
+        contender = context.Process(
+            target=_render_projection_worker,
+            args=(
+                second_config,
+                first_capture.archive_id,
+                settings_path,
+                start,
+                results,
+            ),
+        )
+        try:
+            with first_backup._projection_worker_lock():
+                contender.start()
+                start.set()
+                contender.join(10)
+                self.assertEqual(contender.exitcode, 0)
+                result = results.get(timeout=2)
+        finally:
+            if contender.pid is not None:
+                contender.join(5)
+
+        self.assertEqual(result["state"], "worker_busy")
+        self.assertEqual(projection_files(), before)
+
     def test_same_size_target_corruption_invalidates_delivery_receipt(self):
         capture = self._ready_capture()
         backup = self._backup(capture)
@@ -1058,6 +1339,10 @@ class ResourceBackupTests(unittest.TestCase):
         second_config["attachment_archive_root"] = os.path.join(
             self.root,
             "second-archive",
+        )
+        second_config["monitor_obsidian_root"] = os.path.join(
+            self.root,
+            "second-obsidian",
         )
         second_capture = SelectedResourceCapture(
             second_config,
@@ -1115,7 +1400,7 @@ class ResourceBackupTests(unittest.TestCase):
             conn.close()
 
         with self.assertRaisesRegex(Exception, "archive_identity_missing"):
-            self._capture()
+            self._capture().archive_id
 
     def test_capture_run_reports_source_unavailable_instead_of_healthy(self):
         capture = SelectedResourceCapture(
@@ -1150,6 +1435,35 @@ class ResourceBackupTests(unittest.TestCase):
         self.assertEqual(result["state"], "worker_busy")
         self.assertEqual(result["scan"]["state"], "worker_busy")
         self.assertEqual(result["resolve"]["state"], "not_run_worker_busy")
+
+    def test_capture_run_never_promotes_an_unknown_scan_state_to_healthy(self):
+        capture = self._capture()
+        with patch.object(
+            capture,
+            "_scan_locked",
+            return_value={"state": "future_scan_state"},
+        ):
+            result = capture.run(resolve_files=False)
+
+        self.assertEqual(result["state"], "future_scan_state")
+        self.assertEqual(result["scan"]["state"], "future_scan_state")
+
+    def test_shared_outcome_requires_nested_scan_success(self):
+        outcome = evaluate_resource_backup_outcome(
+            {
+                "state": "healthy",
+                "scan": {"state": "worker_busy"},
+                "resolve": {"state": "skipped"},
+            },
+            {
+                "state": "sync_delegated",
+                "obsidian": {"state": "written"},
+            },
+        )
+
+        self.assertFalse(outcome["completed"])
+        self.assertEqual(outcome["state"], "worker_busy")
+        self.assertEqual(outcome["scan_state"], "worker_busy")
 
     def test_file_state_compare_and_set_cannot_overwrite_newer_success(self):
         capture = self._capture()
@@ -1186,6 +1500,32 @@ class ResourceBackupTests(unittest.TestCase):
             )
         finally:
             conn.close()
+
+    def test_rejected_file_state_cas_is_not_counted_as_ready_or_failed(self):
+        capture = self._capture()
+        capture.initialize_selected_chat_cursors(start_timestamp=0)
+        capture.scan()
+        with (
+            patch.object(
+                capture.archive,
+                "preserve_file_mention",
+                return_value={
+                    "status": "ready_local",
+                    "resolution_method": "fixture",
+                    "sha256": "a" * 64,
+                    "size": 1,
+                    "object_relpath": "objects/aa/fixture",
+                },
+            ),
+            patch.object(capture, "_set_file_state", return_value=False),
+        ):
+            result = capture.resolve_pending_files(limit=1)
+
+        self.assertEqual(result["state"], "degraded")
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["ready_local"], 0)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(result["superseded"], 1)
 
     def test_capture_run_can_skip_attachment_cache_without_resolver_access(self):
         capture = self._capture()
@@ -1492,6 +1832,8 @@ class ResourceBackupTests(unittest.TestCase):
 
     def test_deselecting_last_chat_writes_empty_root_and_collects_only_managed_indexes(self):
         capture = self._ready_capture()
+        canonical = dict(self.config)
+        capture.config_loader = lambda: dict(canonical)
         backup = self._backup(capture)
         first = backup.render_obsidian_indexes()
         self.assertGreater(first["occurrences"], 0)
@@ -1505,7 +1847,7 @@ class ResourceBackupTests(unittest.TestCase):
         with open(user_file, "w", encoding="utf-8") as handle:
             handle.write("user-owned\n")
 
-        capture.config["resource_backup_selected_chats"] = []
+        canonical["resource_backup_selected_chats"] = []
         second = backup.render_obsidian_indexes()
         scope_root = os.path.join(
             self.obsidian_root,
@@ -1520,6 +1862,25 @@ class ResourceBackupTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(user_file))
         self.assertFalse(os.path.exists(os.path.join(chat_root, "00-资源索引.md")))
         self.assertFalse(os.path.exists(os.path.join(chat_root, "资源索引")))
+
+    def test_local_projection_rejects_child_symlink_without_outside_writes(self):
+        capture = self._ready_capture()
+        backup = self._backup(capture)
+        projection_root = backup.obsidian_projection_root
+        outside = os.path.join(self.root, "outside-projection")
+        os.makedirs(projection_root, exist_ok=True)
+        os.makedirs(outside, exist_ok=True)
+        os.symlink(outside, os.path.join(projection_root, "猫猫研究群"))
+
+        result = backup.run()
+
+        self.assertEqual(result["state"], "projection_failed")
+        self.assertEqual(
+            result["obsidian"]["error_code"],
+            "projection_directory_conflict",
+        )
+        self.assertEqual(os.listdir(outside), [])
+        self.assertFalse(os.path.exists(backup.backup_root))
 
     def test_utf8_component_budget_preserves_extension_and_stable_hash_suffix(self):
         capture = self._capture()
@@ -2155,7 +2516,10 @@ class ResourceBackupCliTests(unittest.TestCase):
             "resolve": {"state": "skipped"},
         }
         backup = unittest.mock.Mock()
-        backup.run.return_value = {"state": "idle"}
+        backup.run.return_value = {
+            "state": "idle",
+            "obsidian": {"state": "written"},
+        }
         with (
             patch.object(resource_backup_cli, "load_config", return_value=self.config),
             patch.object(resource_backup_cli, "_capture", return_value=capture),

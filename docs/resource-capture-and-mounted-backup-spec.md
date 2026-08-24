@@ -249,8 +249,21 @@ Each Obsidian and mounted-view surface has its own hidden ownership manifest
 containing `archive_id` and the exact managed path set. Every render writes an
 explicit scope root even when the selection is empty. Stale paths are removed
 only when the prior manifest or ownership marker proves they are app-generated;
-unmanaged files are preserved. Rendering and managed GC run under the same
-cross-process operation lock as mounted handoff.
+unmanaged files are preserved. Rendering, managed GC, and mounted handoff hold
+the capture operation lock so their selected-chat scope remains canonical for
+the complete output phase, then take the backup-DB lock. Local projection
+additionally takes a private root-identity lock keyed by the output root's real
+path; mounted handoff takes a target-side lock. These root locks serialize
+distinct capture databases and path aliases that target the same projection or
+mount. Local generated directories reject symlink/non-directory descendants
+before any managed write.
+
+Capture construction performs no SQLite write. Capture schema/archive identity
+are initialized only inside the capture operation lock, while backup delivery
+tables are initialized only inside the backup-DB lock. Attachment occurrence
+state updates consume their status-plus-revision compare-and-set result; a
+rejected claim is counted as superseded/degraded rather than as a successful or
+failed stale transition.
 
 ## 10. Mounted-filesystem handoff
 
@@ -399,8 +412,11 @@ Keys such as token, access_token, secret, password, signature, auth, authorizati
 - Target volume below the configured reserve: stop before copy with
   `insufficient_target_space`; do not publish a complete snapshot.
 - Target conflict: fail closed; do not overwrite unknown bytes.
-- Concurrent worker: a local non-blocking lock allows only one handoff/snapshot writer; a second worker returns `worker_busy`.
-- Process crash during copy: leave only a worker-owned partial file, which a later run may clean or replace.
+- Concurrent worker: DB-, projection-root-, and target-scoped non-blocking locks
+  permit only one owner for each affected surface; a contender returns
+  `worker_busy` without mutating that surface.
+- Process crash during copy: leave only a worker-owned partial file. A later
+  archive owner may clean it only after acquiring the archive lock.
 - Process crash after target publication but before receipt: the next run verifies the existing target object once and reconstructs the receipt.
 - Process crash before `COMPLETE`: the snapshot is incomplete and ignored.
 - Removing selection: do not delete prior target data.

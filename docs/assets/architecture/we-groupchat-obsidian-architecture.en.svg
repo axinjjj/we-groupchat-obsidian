@@ -29,7 +29,7 @@
   <text x="60" y="55" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="30" font-weight="800" font-style="normal" letter-spacing="0" fill="#0F172A" opacity="1.0">we-groupchat-obsidian | Local-first group-chat knowledge &amp; attention system</text>
   <text x="62" y="82" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="14" font-weight="550" font-style="normal" letter-spacing="0" fill="#475569" opacity="1.0">we-groupchat-obsidian&#xFF5C;&#x672C;&#x5730;&#x4F18;&#x5148;&#x7684;&#x7FA4;&#x804A;&#x77E5;&#x8BC6;&#x4E0E;&#x6CE8;&#x610F;&#x529B;&#x7CFB;&#x7EDF;</text>
   <text x="62" y="108" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="12.5" font-weight="500" font-style="normal" letter-spacing="0" fill="#334155" opacity="1.0">AI interprets; SQLite owns derived state; Obsidian provides rebuildable human-readable projections.  /  AI &#x8D1F;&#x8D23;&#x7406;&#x89E3;&#xFF1B;SQLite &#x6301;&#x6709;&#x6D3E;&#x751F;&#x72B6;&#x6001;&#xFF1B;Obsidian &#x63D0;&#x4F9B;&#x53EF;&#x91CD;&#x5EFA;&#x7684;&#x4EBA;&#x7C7B;&#x9605;&#x8BFB;&#x8868;&#x9762;&#x3002;</text>
-  <text x="1865" y="55" text-anchor="end" font-family="Noto Sans CJK SC, sans-serif" font-size="12" font-weight="650" font-style="normal" letter-spacing="0" fill="#475569" opacity="1.0">Architecture v3 &#xB7; 2026-08</text>
+  <text x="1865" y="55" text-anchor="end" font-family="Noto Sans CJK SC, sans-serif" font-size="12" font-weight="650" font-style="normal" letter-spacing="0" fill="#475569" opacity="1.0">Architecture v4 &#xB7; 2026-08</text>
   <rect x="60" y="130" width="1600" height="1710" rx="28" fill="#FFFFFF" fill-opacity="1.0" stroke="#94A3B8" stroke-width="2.2" stroke-dasharray="10 8"/>
   <rect x="90" y="145" width="250" height="34" rx="17.0" fill="#F1F5F9" fill-opacity="1.0" stroke="#94A3B8" stroke-width="1.5"/>
   <text x="215.0" y="166.25" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="12.5" font-weight="600" font-style="normal" letter-spacing="0" fill="#334155" opacity="1.0">Mac-local boundary &#xB7; Mac &#x672C;&#x5730;&#x8FB9;&#x754C;</text>
@@ -229,15 +229,15 @@
   <text x="1274" y="1310" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="13.2" font-weight="750" fill="#0F172A">Local attachment CAS</text>
   <text x="1274" y="1338" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="10.2" font-weight="500" fill="#475569">
     <tspan x="1274" dy="0">SHA-256 immutable objects</tspan>
-    <tspan x="1274" dy="14.075999999999999">provider-neutral catalog</tspan>
-    <tspan x="1274" dy="14.075999999999999">0700 / 0600 &#xB7; images off</tspan>
+    <tspan x="1274" dy="14.075999999999999">archive lock before partial recovery</tspan>
+    <tspan x="1274" dy="14.075999999999999">UTF-8 budget &#xB7; bytes opt-in</tspan>
   </text>
   <rect x="1690" y="1272" width="180" height="136" rx="17" fill="#FAF5FF" stroke="#7C3AED" stroke-width="2" stroke-dasharray="7 5"/>
   <text x="1780.0" y="1302" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="12.2" font-weight="750" fill="#0F172A">Optional filesystem target</text>
   <text x="1780.0" y="1334" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="9.8" font-weight="500" fill="#475569">
-    <tspan x="1780.0" dy="0">manifest + privacy catalog</tspan>
-    <tspan x="1780.0" dy="13.524">COMPLETE last</tspan>
-    <tspan x="1780.0" dy="13.524">target bytes only</tspan>
+    <tspan x="1780.0" dy="0">archive identity + root lock</tspan>
+    <tspan x="1780.0" dy="13.524">manifest archive_id</tspan>
+    <tspan x="1780.0" dy="13.524">copy + hash readback</tspan>
     <tspan x="1780.0" dy="13.524">cloud-upload state: unknown</tspan>
   </text>
   <text x="376.0" y="1320" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="8.2" font-weight="650" fill="#0F766E">normal open request</text>
@@ -247,7 +247,7 @@
   <text x="1609.0" y="1320" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="8.2" font-weight="650" fill="#7C3AED">explicit snapshot</text>
   <rect x="100" y="1510" width="1460" height="300" rx="22" fill="#EEF2FF" stroke="#4F46E5" stroke-width="2.2"/>
   <text x="124" y="1545" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="18" font-weight="780" fill="#0F172A">Selected-resource capture &#x2192; mounted Drive handoff</text>
-  <text x="1525" y="1544" text-anchor="end" font-family="Noto Sans CJK SC, sans-serif" font-size="10.5" font-weight="520" fill="#475569">No OAuth &#xB7; active monitor &#x2229; explicit selection &#xB7; optional Drive API lane remains separate</text>
+  <text x="1525" y="1544" text-anchor="end" font-family="Noto Sans CJK SC, sans-serif" font-size="10.5" font-weight="520" fill="#475569">Canonical selection under capture lock &#xB7; real-root + target locks serialize aliases &#xB7; Drive API stays separate</text>
   <polyline points="795,1405 795,1460 240,1460 240,1580" fill="none" stroke="#0891B2" stroke-width="2.4" stroke-dasharray="7 5" marker-end="url(#arrowTeal)"/>
   <text x="520" y="1453" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="8.2" font-weight="650" fill="#0891B2">active source envelopes</text>
   <polyline points="1395,1405 1395,1488 825,1488 825,1580" fill="none" stroke="#16A34A" stroke-width="2.4" stroke-dasharray="7 5" marker-end="url(#arrow)"/>
@@ -255,36 +255,36 @@
   <rect x="120" y="1580" width="240" height="125" rx="17" fill="#ECFEFF" stroke="#0891B2" stroke-width="2"/>
   <text x="134" y="1610" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="13.2" font-weight="750" fill="#0F172A">Selected-resource scanner</text>
   <text x="134" y="1638" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="10.2" font-weight="500" fill="#475569">
-    <tspan x="134" dy="0">active monitor &#x2229; explicit selection</tspan>
-    <tspan x="134" dy="14.1">shard-complete exact-link scan</tspan>
-    <tspan x="134" dy="14.1">atomic links-only backfill</tspan>
+    <tspan x="134" dy="0">selection reloaded under capture lock</tspan>
+    <tspan x="134" dy="14.1">complete pages &#xB7; run_id staging</tspan>
+    <tspan x="134" dy="14.1">mutation serialized &#xB7; no rescan</tspan>
   </text>
   <rect x="410" y="1580" width="240" height="125" rx="17" fill="#EFF6FF" stroke="#2563EB" stroke-width="2"/>
   <text x="424" y="1610" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="13.2" font-weight="750" fill="#0F172A">Resource occurrence ledger</text>
   <text x="424" y="1638" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="10.2" font-weight="500" fill="#475569">
-    <tspan x="424" dy="0">source message + resource index</tspan>
-    <tspan x="424" dy="14.1">exact URL or file metadata</tspan>
-    <tspan x="424" dy="14.1">privacy-safe degraded receipts</tspan>
+    <tspan x="424" dy="0">occurrence revision CAS</tspan>
+    <tspan x="424" dy="14.1">archive_id-bound identity</tspan>
+    <tspan x="424" dy="14.1">busy / unknown &#x2260; success</tspan>
   </text>
   <rect x="700" y="1580" width="250" height="125" rx="17" fill="#F0FDF4" stroke="#16A34A" stroke-width="2"/>
   <text x="714" y="1610" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="13.2" font-weight="750" fill="#0F172A">Exact resolver + shared CAS</text>
   <text x="714" y="1638" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="10.2" font-weight="500" fill="#475569">
-    <tspan x="714" dy="0">exact cache resolution + SHA-256</tspan>
-    <tspan x="714" dy="14.1">archive-owned shared CAS catalog</tspan>
-    <tspan x="714" dy="14.1">no KnowledgeStore gate</tspan>
+    <tspan x="714" dy="0">exact cache + SHA-256</tspan>
+    <tspan x="714" dy="14.1">archive lock before partial recovery</tspan>
+    <tspan x="714" dy="14.1">byte consent stays session-local</tspan>
   </text>
   <rect x="1000" y="1580" width="250" height="125" rx="17" fill="#FFF7ED" stroke="#EA580C" stroke-width="2"/>
   <text x="1014" y="1610" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="13.2" font-weight="750" fill="#0F172A">Long-lived mounted worker</text>
   <text x="1014" y="1638" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="10.2" font-weight="500" fill="#475569">
-    <tspan x="1014" dy="0">menu app timer &#xB7; explicit CLI</tspan>
-    <tspan x="1014" dy="14.1">file bytes are opt-in only</tspan>
-    <tspan x="1014" dy="14.1">target checks &#xB7; copy + readback</tspan>
+    <tspan x="1014" dy="0">menu timer &#xB7; explicit CLI</tspan>
+    <tspan x="1014" dy="14.1">capture + real-root / target locks</tspan>
+    <tspan x="1014" dy="14.1">symlink-safe copy + readback</tspan>
   </text>
   <rect x="1290" y="1580" width="240" height="125" rx="17" fill="#EEF2FF" stroke="#4F46E5" stroke-width="2"/>
   <text x="1304" y="1610" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="13.2" font-weight="750" fill="#0F172A">Catalog snapshot + views</text>
   <text x="1304" y="1638" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="10.2" font-weight="500" fill="#475569">
-    <tspan x="1304" dy="0">manifest + resources.jsonl</tspan>
-    <tspan x="1304" dy="14.1">Obsidian + mounted Markdown views</tspan>
+    <tspan x="1304" dy="0">archive_id manifest + resources.jsonl</tspan>
+    <tspan x="1304" dy="14.1">exhaustive outcome classifier</tspan>
     <tspan x="1304" dy="14.1">COMPLETE = catalog complete</tspan>
   </text>
   <polyline points="360,1642 410,1642" fill="none" stroke="#4F46E5" stroke-width="2.4" marker-end="url(#arrowBlue)"/>
@@ -301,9 +301,9 @@
   <text x="1780" y="1602" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="12.2" font-weight="750" fill="#0F172A">Mounted Drive folder</text>
   <text x="1780" y="1634" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="9.2" font-weight="500" fill="#475569">
     <tspan x="1780" dy="0">v3 objects / snapshots / views</tspan>
-    <tspan x="1780" dy="13.2">Google Drive Desktop uploads</tspan>
+    <tspan x="1780" dy="13.2">target identity + root lock</tspan>
     <tspan x="1780" dy="13.2">sync_delegated receipt</tspan>
-    <tspan x="1780" dy="13.2">explicit verify reads bytes</tspan>
+    <tspan x="1780" dy="13.2">copy + hash readback</tspan>
     <tspan x="1780" dy="13.2">not remote_verified</tspan>
     <tspan x="1780" dy="13.2">no delete</tspan>
   </text>
