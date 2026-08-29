@@ -20,6 +20,7 @@ from .contracts import (
     SecretStore,
 )
 from .factory import (
+    InvalidPlatformServicesProviderResult,
     PlatformFactoryMismatch,
     PlatformServicesUnavailable,
     create_platform_services,
@@ -34,6 +35,7 @@ __all__ = [
     "LockBusy",
     "LockHandle",
     "LockMode",
+    "InvalidPlatformServicesProviderResult",
     "NotificationService",
     "OpenTargetService",
     "PathIdentity",

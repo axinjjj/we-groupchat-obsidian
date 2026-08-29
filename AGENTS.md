@@ -33,9 +33,11 @@
 
 ## Windows port staging
 
-- Windows work follows `WGO-WIN-SPEC-1`. The current authorized phase is
-  `PR-W0.1` only: portability mapping, platform contracts/factory, dependency
-  markers, Windows import/compile CI and documentation.
+- The full Windows programme contract, `WGO-WIN-SPEC-1`, is owner-authorized
+  external material. For `PR-W0.1`, `docs/WINDOWS-PORT-MAP.md` is the sole
+  in-repository executable authority: portability mapping, platform
+  contracts/factory, dependency markers, Windows import/compile CI and
+  documentation only.
 - `app.py` remains the macOS shell. W0.1 must not add Windows source reads, key
   acquisition, monitor activation, attachment/backup behavior, tray UI,
   autostart, packaging or message sending.
@@ -44,9 +46,9 @@
   W0.2; secrets/open/notification adapters begin in W0.3; source adapters begin
   in W1.
 - `docs/WINDOWS-PORT-MAP.md` is the W0.1 module inventory. Every root,
-  `core/`, `ui/` and `scripts/` Python module must remain classified, and only
-  modules marked `windows-import-safe` enter the Windows import gate. Import
-  success is not evidence of Windows feature support.
+  `ai/`, `core/`, `ui/` and `scripts/` Python module must remain classified,
+  and only modules marked `windows-import-safe` enter the Windows import gate.
+  Import success is not evidence of Windows feature support.
 
 ## Durable and generated boundaries
 

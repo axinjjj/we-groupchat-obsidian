@@ -7,6 +7,7 @@ from core.platform.contracts import (
     PlatformServices,
 )
 from core.platform.factory import (
+    InvalidPlatformServicesProviderResult,
     PlatformFactoryMismatch,
     PlatformServicesUnavailable,
     _PLATFORM_FACTORIES,
@@ -14,11 +15,6 @@ from core.platform.factory import (
     detect_platform,
     register_platform_services,
 )
-
-
-class _Services:
-    def __init__(self, platform_name):
-        self.platform = platform_name
 
 
 class PlatformFactoryTests(unittest.TestCase):
@@ -34,14 +30,14 @@ class PlatformFactoryTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "platform_services_unavailable")
 
     def test_registered_provider_is_selected(self):
-        expected = _Services(PlatformName.WINDOWS)
+        expected = PlatformServices(platform=PlatformName.WINDOWS)
         with patch.dict(_PLATFORM_FACTORIES, {}, clear=True):
             register_platform_services(PlatformName.WINDOWS, lambda: expected)
             self.assertIs(create_platform_services(PlatformName.WINDOWS), expected)
 
     def test_duplicate_registration_requires_explicit_replacement(self):
-        first = _Services(PlatformName.WINDOWS)
-        second = _Services(PlatformName.WINDOWS)
+        first = PlatformServices(platform=PlatformName.WINDOWS)
+        second = PlatformServices(platform=PlatformName.WINDOWS)
         with patch.dict(_PLATFORM_FACTORIES, {}, clear=True):
             register_platform_services(PlatformName.WINDOWS, lambda: first)
             with self.assertRaises(ValueError):
@@ -57,11 +53,38 @@ class PlatformFactoryTests(unittest.TestCase):
         with patch.dict(_PLATFORM_FACTORIES, {}, clear=True):
             register_platform_services(
                 PlatformName.WINDOWS,
-                lambda: _Services(PlatformName.MACOS),
+                lambda: PlatformServices(platform=PlatformName.MACOS),
             )
             with self.assertRaises(PlatformFactoryMismatch) as raised:
                 create_platform_services(PlatformName.WINDOWS)
         self.assertEqual(raised.exception.code, "platform_factory_mismatch")
+
+    def test_unrelated_provider_result_is_rejected_with_stable_error(self):
+        with patch.dict(_PLATFORM_FACTORIES, {}, clear=True):
+            register_platform_services(PlatformName.WINDOWS, object)
+            with self.assertRaises(
+                InvalidPlatformServicesProviderResult
+            ) as raised:
+                create_platform_services(PlatformName.WINDOWS)
+        self.assertEqual(
+            raised.exception.code,
+            "invalid_platform_services_provider_result",
+        )
+        self.assertEqual(raised.exception.reason, "provider_result_type")
+
+    def test_malformed_platform_is_rejected_with_stable_error(self):
+        malformed = PlatformServices(platform="windows")
+        with patch.dict(_PLATFORM_FACTORIES, {}, clear=True):
+            register_platform_services(PlatformName.WINDOWS, lambda: malformed)
+            with self.assertRaises(
+                InvalidPlatformServicesProviderResult
+            ) as raised:
+                create_platform_services(PlatformName.WINDOWS)
+        self.assertEqual(
+            raised.exception.code,
+            "invalid_platform_services_provider_result",
+        )
+        self.assertEqual(raised.exception.reason, "platform_type")
 
     def test_partial_service_bundle_reports_capabilities_and_fails_closed(self):
         lock_service = object()

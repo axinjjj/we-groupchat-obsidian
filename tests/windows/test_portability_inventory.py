@@ -36,7 +36,7 @@ def python_inventory() -> set[str]:
         path.relative_to(REPOSITORY_ROOT).as_posix()
         for path in REPOSITORY_ROOT.glob("*.py")
     }
-    for directory in ("core", "ui", "scripts"):
+    for directory in ("ai", "core", "ui", "scripts"):
         files.update(
             path.relative_to(REPOSITORY_ROOT).as_posix()
             for path in (REPOSITORY_ROOT / directory).rglob("*.py")

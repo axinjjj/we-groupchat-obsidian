@@ -27,6 +27,14 @@ class PlatformFactoryMismatch(RuntimeError):
         super().__init__(f"{self.code}:{expected.value}:{actual.value}")
 
 
+class InvalidPlatformServicesProviderResult(RuntimeError):
+    code = "invalid_platform_services_provider_result"
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(f"{self.code}:{reason}")
+
+
 def detect_platform(system_name: str | None = None) -> PlatformName:
     normalized = str(system_name or runtime_platform.system()).strip().casefold()
     if normalized == "darwin":
@@ -59,6 +67,10 @@ def create_platform_services(
     if provider is None:
         raise PlatformServicesUnavailable(selected)
     services = provider()
+    if not isinstance(services, PlatformServices):
+        raise InvalidPlatformServicesProviderResult("provider_result_type")
+    if not isinstance(services.platform, PlatformName):
+        raise InvalidPlatformServicesProviderResult("platform_type")
     if services.platform is not selected:
         raise PlatformFactoryMismatch(selected, services.platform)
     return services

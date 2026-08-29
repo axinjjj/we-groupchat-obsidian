@@ -1,7 +1,9 @@
 # Windows portability map (W0.1)
 
-This document is the module-by-module import boundary for
-`WGO-WIN-SPEC-1`, phase `PR-W0.1`.
+The full Windows programme contract, `WGO-WIN-SPEC-1`, is owner-authorized
+external material and is not distributed with this repository. This document
+is the sole in-repository executable authority for its `PR-W0.1`
+module-by-module import boundary.
 
 ```text
 repository: IndelibleVivi/we-groupchat-obsidian
@@ -31,7 +33,7 @@ message sending. Existing macOS entrypoints and behavior remain authoritative.
   are not authorized on Windows in W0.1.
 
 `tests.windows.test_portability_inventory` enforces exact coverage of every
-root, `core/`, `ui/`, and `scripts/` Python module and imports every
+root, `ai/`, `core/`, `ui/`, and `scripts/` Python module and imports every
 `windows-import-safe` module in a fresh process on Windows.
 
 ## Module inventory
@@ -41,6 +43,12 @@ root, `core/`, `ui/`, and `scripts/` Python module and imports every
 | `app.py` | `macos-only` | rumps/AppKit/objc menu shell; reusable controllers are extracted in later staged PRs. |
 | `mcp_server.py` | `deferred-w0.2` | Imports `core.config`; Windows source factory activation belongs to W1.1/W2. |
 | `setup.py` | `macos-only` | py2app packaging entrypoint; Windows packaging is W6. |
+| `ai/__init__.py` | `windows-import-safe` | Empty shared provider package boundary. |
+| `ai/base.py` | `windows-import-safe` | Platform-neutral provider interface. |
+| `ai/claude_provider.py` | `windows-import-safe` | Provider adapter imports cleanly; credentials remain behind the W0.3 secret boundary. |
+| `ai/factory.py` | `windows-import-safe` | Imports cleanly on Windows; provider creation still reaches the macOS keychain and is not activated before W0.3. |
+| `ai/ollama_provider.py` | `windows-import-safe` | Platform-neutral HTTP provider adapter; runtime behavior is not a W0.1 claim. |
+| `ai/openai_provider.py` | `windows-import-safe` | Provider adapter imports cleanly; credentials remain behind the W0.3 secret boundary. |
 | `core/__init__.py` | `windows-import-safe` | Empty shared package boundary. |
 | `core/api_errors.py` | `windows-import-safe` | Provider-independent error normalization. |
 | `core/app_runtime.py` | `deferred-w0.2` | Direct `fcntl` singleton; central lock backend is W0.2. |

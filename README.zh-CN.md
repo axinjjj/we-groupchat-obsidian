@@ -7,9 +7,9 @@ operator CLI、持久化本地状态、recovery/backup workers 和完整 regress
 数据流和账号安全边界，再在真实聊天数据上使用。当前不分发 bundled Python runtime
 或已签名 installer。
 
-Windows 迁移当前只到 **W0 可移植性基础阶段**：仓库建立了明确的模块/import 边界和
-Windows CI，但 W0 不支持 Windows 微信发现、密钥、数据库读取、monitor、托盘、
-backup、自启、打包或发送。分阶段契约见
+Windows 迁移当前处于 **W0.1 模块清单与 import 边界阶段**；完整的 W0 可移植性基础
+尚未完成。仓库建立了明确的模块/import 边界和 Windows CI，但 W0.1 不支持 Windows
+微信发现、密钥、数据库读取、monitor、托盘、backup、自启、打包或发送。分阶段契约见
 [`docs/WINDOWS-PORT-MAP.md`](docs/WINDOWS-PORT-MAP.md)。
 
 一个本地优先的 macOS 微信群聊总结工具。它读取你电脑上的微信本地数据库，生成群聊摘要、关键词搜索结果，并把值得关注的新消息整理成 Obsidian-friendly Markdown 笔记。

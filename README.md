@@ -8,8 +8,9 @@ full regression suite; review the data-flow and account-safety notes before
 using it on real chat data. A bundled Python runtime or signed installer is not
 currently distributed.
 
-Windows port status: **W0 portability foundation only**. The repository now
-tracks an explicit module/import boundary and Windows CI, but W0 does not
+Windows port status: **W0.1 module inventory and import-boundary stage**. The
+complete W0 portability foundation is not yet finished. The repository now
+tracks an explicit module/import boundary and Windows CI, but W0.1 does not
 support Windows WeChat discovery, keys, database reads, monitoring, tray UI,
 backup, autostart, packaging, or sending. See
 [`docs/WINDOWS-PORT-MAP.md`](docs/WINDOWS-PORT-MAP.md) for the staged contract.
