@@ -43,7 +43,11 @@ def _first_pid(args):
 
 
 def process_lookup_available():
-    """Return whether this process can inspect macOS process names."""
+    """Return whether this process can inspect the platform process list."""
+    if sys.platform == "win32":
+        from .windows_key_extractor import process_lookup_available as windows_lookup
+
+        return windows_lookup()
     try:
         pid = str(os.getpid())
         result = subprocess.run(
@@ -60,6 +64,11 @@ def process_lookup_available():
 
 def get_wechat_pid():
     """Get WeChat main process PID for key scanning."""
+    if sys.platform == "win32":
+        from .windows_key_extractor import get_wechat_pids
+
+        pids = get_wechat_pids()
+        return pids[0] if pids else None
     for name in WECHAT_PROCESS_NAMES:
         pid = _first_pid(["pgrep", "-x", name])
         if pid:
@@ -80,6 +89,13 @@ def is_wechat_running():
 
 def get_wechat_app_path():
     """Get WeChat.app path, preferring system-installed location."""
+    if sys.platform == "win32":
+        candidates = (
+            os.path.join(os.environ.get("ProgramFiles", ""), "Tencent", "Weixin", "Weixin.exe"),
+            os.path.join(os.environ.get("ProgramFiles", ""), "Tencent", "WeChat", "WeChat.exe"),
+            os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Tencent", "WeChat", "WeChat.exe"),
+        )
+        return next((path for path in candidates if os.path.isfile(path)), None)
     try:
         result = subprocess.run(
             ["osascript", "-e", 'POSIX path of (path to application "WeChat")'],
@@ -105,6 +121,8 @@ def is_required_database(rel_path):
 
 def is_wechat_signed():
     """Check if WeChat has been re-signed (hardened runtime removed)."""
+    if sys.platform == "win32":
+        return True
     app_path = get_wechat_app_path()
     if not app_path:
         return False
@@ -125,6 +143,8 @@ def is_wechat_signed():
 
 def compile_scanner():
     """Compile C key scanner."""
+    if sys.platform == "win32":
+        return process_lookup_available()
     os.makedirs(DATA_DIR, exist_ok=True)
 
     if os.path.exists(C_BINARY):
@@ -146,12 +166,30 @@ def compile_scanner():
         return False
 
 
-def extract_keys():
-    """Run C scanner to extract keys, requires sudo.
+def extract_keys(raw_key_hex=None):
+    """Refresh platform database keys.
+
+    macOS runs the original C scanner with administrator authorization.
+    Windows requires an explicit raw key and derives verified page keys.
 
     Returns:
         dict: {db_rel_path: {"enc_key": hex_string}, ...} or None.
     """
+    if sys.platform == "win32":
+        if raw_key_hex is None:
+            return None
+        from .windows_key_extractor import extract_keys_from_raw_key
+
+        config = load_config()
+        db_dir = config.get("db_dir", "")
+        keys_path = config.get("keys_file") or KEYS_FILE
+        if not db_dir or not os.path.isdir(db_dir):
+            return None
+        return extract_keys_from_raw_key(raw_key_hex, db_dir, keys_path)
+
+    if raw_key_hex is not None:
+        raise RuntimeError("raw_key_import_is_windows_only")
+
     if not compile_scanner():
         return None
 
@@ -222,6 +260,13 @@ def extract_keys():
         return None
 
     return keys
+
+
+def extract_keys_from_raw_key(raw_key_hex):
+    """Explicitly derive Windows Weixin page keys from a user-supplied raw key."""
+    if sys.platform != "win32":
+        raise RuntimeError("raw_key_import_is_windows_only")
+    return extract_keys(raw_key_hex=raw_key_hex)
 
 
 def _parse_raw_keys_from_text(text):

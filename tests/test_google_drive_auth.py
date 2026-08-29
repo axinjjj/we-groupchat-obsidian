@@ -77,7 +77,12 @@ class GoogleDriveOAuthTests(unittest.TestCase):
         result = install_client_config(self.source, self.target)
 
         self.assertEqual(result, self.target)
-        self.assertEqual(stat.S_IMODE(os.stat(self.target).st_mode), 0o600)
+        if os.name == "nt":
+            from core.windows_permissions import is_private_to_current_user
+
+            self.assertTrue(is_private_to_current_user(self.target))
+        else:
+            self.assertEqual(stat.S_IMODE(os.stat(self.target).st_mode), 0o600)
         with open(self.target, encoding="utf-8") as handle:
             installed = json.load(handle)["installed"]
         self.assertEqual(

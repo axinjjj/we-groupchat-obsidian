@@ -1,4 +1,4 @@
-import fcntl
+from core import file_lock as fcntl
 import hashlib
 import io
 import json

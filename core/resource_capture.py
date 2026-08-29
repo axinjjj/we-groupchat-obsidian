@@ -9,7 +9,6 @@ string observed in the WeChat message, not an AI-produced summary.
 from __future__ import annotations
 
 import errno
-import fcntl
 import hashlib
 import json
 import os
@@ -18,6 +17,8 @@ import re
 import sqlite3
 import threading
 import time
+
+from . import file_lock as fcntl
 import uuid
 from contextlib import contextmanager
 from datetime import datetime

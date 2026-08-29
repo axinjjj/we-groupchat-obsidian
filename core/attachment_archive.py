@@ -7,7 +7,6 @@ rolling back a Knowledge event or causing another AI pass.
 from __future__ import annotations
 
 import errno
-import fcntl
 import glob
 import hashlib
 import json
@@ -20,6 +19,8 @@ import tempfile
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+
+from . import file_lock as fcntl
 from datetime import datetime
 
 from .config import DATA_DIR

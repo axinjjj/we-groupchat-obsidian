@@ -16,6 +16,16 @@ class McpIdentityTests(unittest.TestCase):
         self.assertNotIn('"wechat-summary"', desktop)
         self.assertIn("claude mcp add we-groupchat-obsidian", code)
 
+    def test_windows_claude_code_command_quotes_checkout_paths(self):
+        code = claude_code_add_command(
+            r"C:\Project Name\.venv\Scripts\python.exe",
+            r"C:\Project Name\mcp_server.py",
+            platform_name="win32",
+        )
+
+        self.assertIn(r'"C:\Project Name\.venv\Scripts\python.exe"', code)
+        self.assertIn(r'"C:\Project Name\mcp_server.py"', code)
+
 
 if __name__ == "__main__":
     unittest.main()

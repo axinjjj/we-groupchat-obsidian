@@ -1,5 +1,5 @@
 """Closed producer metadata contract for generated Markdown."""
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 SOURCE_APP = "we-groupchat-obsidian"
@@ -19,9 +19,14 @@ def _value(item, key, default=""):
         return default
 
 
+def local_datetime_from_timestamp(value):
+    """Convert epoch seconds without relying on the Windows pre-epoch CRT path."""
+    return datetime.fromtimestamp(float(value), timezone.utc).astimezone()
+
+
 def aware_iso_from_timestamp(value):
     """Return a seconds-precision aware ISO timestamp for a canonical row time."""
-    return datetime.fromtimestamp(float(value)).astimezone().isoformat(timespec="seconds")
+    return local_datetime_from_timestamp(value).isoformat(timespec="seconds")
 
 
 def atomic_source_lines(topic_id, generated_at):

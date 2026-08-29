@@ -58,6 +58,10 @@ def candidate(**overrides):
     return data
 
 
+def obsidian_relpath(*parts):
+    return "/".join(parts)
+
+
 class DailyDigestTests(unittest.TestCase):
     def test_day_bounds_follow_local_midnight_across_dst(self):
         timezone = ZoneInfo("America/New_York")
@@ -435,7 +439,7 @@ class DailyDigestTests(unittest.TestCase):
         )
         self.assertEqual(
             digest["obsidian_path"],
-            os.path.join("微信群聊", "关注推送", "Daily Digest", "2026-06-18 Daily Digest.md"),
+            obsidian_relpath("微信群聊", "关注推送", "Daily Digest", "2026-06-18 Daily Digest.md"),
         )
         with open(digest["path"], encoding="utf-8") as handle:
             self.assertIn("# WeChat Daily Digest - 2026-06-18", handle.read())
@@ -460,7 +464,7 @@ class DailyDigestTests(unittest.TestCase):
         )
         self.assertEqual(
             digest["obsidian_path"],
-            os.path.join(
+            obsidian_relpath(
                 "微信群聊",
                 "关注推送",
                 "Daily Digest",

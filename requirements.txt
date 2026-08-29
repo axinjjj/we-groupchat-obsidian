@@ -1,8 +1,12 @@
-rumps>=0.4.0
+rumps>=0.4.0; sys_platform == "darwin"
 pycryptodome>=3.20.0
 zstandard>=0.22.0
-pyobjc-framework-Cocoa>=10.0
+pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
 anthropic>=0.40.0
 openai>=1.50.0
 requests>=2.31.0
-mcp[cli]>=1.0.0
+mcp[cli]>=1.0.0,<2
+pywin32>=311; sys_platform == "win32"
+pystray>=0.19.5; sys_platform == "win32"
+Pillow>=10.4.0; sys_platform == "win32"
+tzdata>=2024.1; sys_platform == "win32"

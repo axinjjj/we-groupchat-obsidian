@@ -1,13 +1,16 @@
 """Configuration management - app config and WeChat data path detection."""
-import fcntl
+import glob
 import json
 import os
 import re
 import shlex
 import stat
+import sys
 import tempfile
+import time
 import uuid
 
+from . import file_lock as fcntl
 from .project_identity import DATA_DIR_NAME, LEGACY_DATA_DIR_NAME
 from .taxonomy_assignment import FREE_FORM_PROFILE
 
@@ -26,7 +29,7 @@ DEFAULT_CONFIG = {
     "keys_file": os.path.join(DATA_DIR, "all_keys.json"),
     "decrypted_dir": os.path.join(DATA_DIR, "decrypted"),
     "ai_provider": "qwen",  # Options: qwen, ollama, deepseek, claude, openai, custom
-    "ai_model": "",          # Empty uses default model; API key stored in macOS Keychain
+    "ai_model": "",          # Empty uses default model; API key uses the OS credential store
     "ollama_url": "http://localhost:11434",
     "ollama_model": "qwen3:8b",
     "auto_refresh_on_open": False,
@@ -121,6 +124,11 @@ class ConfigConflictError(ConfigError):
 def ensure_private_dir(path=DATA_DIR):
     """Create a local data directory and restrict it to the current user."""
     os.makedirs(path, exist_ok=True)
+    if os.name == "nt":
+        from .windows_permissions import restrict_path_to_current_user
+
+        restrict_path_to_current_user(path, is_directory=True)
+        return
     try:
         os.chmod(path, 0o700)
     except OSError:
@@ -129,6 +137,11 @@ def ensure_private_dir(path=DATA_DIR):
 
 def ensure_private_file(path):
     """Best-effort private permissions for local config/cache metadata."""
+    if os.name == "nt":
+        from .windows_permissions import restrict_path_to_current_user
+
+        restrict_path_to_current_user(path, is_directory=False)
+        return
     try:
         os.chmod(path, 0o600)
     except OSError:
@@ -164,7 +177,7 @@ def normalize_path_value(value):
     text = str(value or "").strip()
     if not text:
         return ""
-    if "\\" in text:
+    if os.name != "nt" and "\\" in text:
         try:
             parts = shlex.split(text)
             if len(parts) == 1:
@@ -172,6 +185,23 @@ def normalize_path_value(value):
         except ValueError:
             text = text.replace("\\ ", " ").replace("\\~", "~")
     return os.path.expanduser(text)
+
+
+def _atomic_replace(source, destination):
+    """Publish a file atomically, tolerating brief Windows reader handles."""
+    deadline = time.monotonic() + 2.0
+    while True:
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError as exc:
+            if (
+                os.name != "nt"
+                or getattr(exc, "winerror", None) not in {5, 32}
+                or time.monotonic() >= deadline
+            ):
+                raise
+            time.sleep(0.01)
 
 
 def _rebase_legacy_data_path(value):
@@ -540,7 +570,7 @@ class ConfigStore:
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temp_path, self.path)
+            _atomic_replace(temp_path, self.path)
             temp_path = ""
             ensure_private_file(self.path)
             try:
@@ -659,20 +689,63 @@ def _load_saved_config():
     return ConfigStore().update(lambda current: current)
 
 
-def auto_detect_db_dir():
-    """Auto-detect macOS WeChat database path."""
+def _windows_db_candidates(*, environ, home_dir):
+    roots = []
+    appdata = str(environ.get("APPDATA") or "").strip()
+    config_dir = os.path.join(appdata, "Tencent", "xwechat", "config")
+    if os.path.isdir(config_dir):
+        for ini_path in sorted(glob.glob(os.path.join(config_dir, "*.ini"))):
+            try:
+                with open(ini_path, "rb") as handle:
+                    raw = handle.read(4096)
+            except OSError:
+                continue
+            text = ""
+            for encoding in ("utf-8-sig", "gb18030"):
+                try:
+                    text = raw.decode(encoding).strip().strip('"')
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if text:
+                roots.append(os.path.expandvars(os.path.expanduser(text)))
+
+    roots.extend((home_dir, os.path.join(home_dir, "Documents")))
+    candidates = []
+    seen = set()
+    patterns = (
+        os.path.join("xwechat_files", "*", "db_storage"),
+        os.path.join("*", "db_storage"),
+    )
+    for root in roots:
+        root = os.path.abspath(str(root or ""))
+        if not os.path.isdir(root):
+            continue
+        for pattern in patterns:
+            for storage in glob.glob(os.path.join(root, pattern)):
+                storage = os.path.abspath(storage)
+                if not os.path.isdir(storage) or storage in seen:
+                    continue
+                seen.add(storage)
+                candidates.append(storage)
+    return candidates
+
+
+def _macos_db_candidates(*, home_dir):
     bases = [
-        os.path.expanduser(
-            "~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files"
+        os.path.join(
+            home_dir,
+            "Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files",
         ),
-        os.path.expanduser(
-            "~/Library/Containers/com.tencent.xinWeChat/Data/Documents"
+        os.path.join(
+            home_dir,
+            "Library/Containers/com.tencent.xinWeChat/Data/Documents",
         ),
-        os.path.expanduser(
-            "~/Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support"
+        os.path.join(
+            home_dir,
+            "Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support",
         ),
     ]
-
     candidates = []
     seen = set()
     for base in bases:
@@ -688,6 +761,18 @@ def auto_detect_db_dir():
                     continue
                 seen.add(storage)
                 candidates.append(storage)
+    return candidates
+
+
+def auto_detect_db_dir(*, platform_name=None, environ=None, home_dir=None):
+    """Auto-detect the current WeChat 4.x ``db_storage`` directory."""
+    platform_name = platform_name or sys.platform
+    environ = os.environ if environ is None else environ
+    home_dir = os.path.expanduser("~") if home_dir is None else os.path.abspath(home_dir)
+    if platform_name == "win32":
+        candidates = _windows_db_candidates(environ=environ, home_dir=home_dir)
+    else:
+        candidates = _macos_db_candidates(home_dir=home_dir)
 
     if not candidates:
         return None

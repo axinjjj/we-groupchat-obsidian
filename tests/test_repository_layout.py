@@ -44,6 +44,8 @@ class RepositoryLayoutTests(unittest.TestCase):
         }
 
         self.assertEqual(root_launchers, {"启动.command"})
+        self.assertTrue((REPO_ROOT / "启动.cmd").is_file())
+        self.assertTrue((REPO_ROOT / "launchers" / "启动.ps1").is_file())
         self.assertEqual(canonical_launchers, expected)
         self.assertTrue(all(
             os.access(REPO_ROOT / "launchers" / name, os.X_OK)

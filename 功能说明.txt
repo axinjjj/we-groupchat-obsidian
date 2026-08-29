@@ -2,11 +2,29 @@
     we-groupchat-obsidian - 简明功能索引
 ============================================
 
-这份 .txt 方便在 Finder 或离线源码里快速浏览当前能力，不承担完整 contract。
+这份 .txt 方便在文件管理器或离线源码里快速浏览当前能力，不承担完整 contract。
 用户与 operator authority 是 README.zh-CN.md；可靠性和资源流的 formal contract 是：
 
   docs/source-reliability.zh-CN.md
   docs/resource-capture-and-mounted-backup-spec.md
+
+
+============================================
+    平台支持边界
+============================================
+
+- macOS 是完整支持平台；Windows 微信 4.x 当前是 source-distributed 适配预览。
+- Windows 继续走原有 WeChatDB 解密、总结、搜索、monitor、Obsidian 与 MCP read 主链；
+  新增层只负责 db_storage discovery、raw key 逐库派生/验证、ACL、凭据管理器、托盘、
+  Unicode 剪贴板、PowerShell 启动器和当前用户登录自启。
+- Windows raw key 只通过遮蔽输入，不写 config/log/命令行/计划任务参数；普通刷新只进
+  内存。显式安装自启时可保存到 Windows 凭据管理器，用于新增 DB 自动续期；仓库不
+  捆绑或下载第三方 extractor，只持久化通过原 page HMAC 验证的逐库密钥 map。
+- Windows 自启使用当前用户计划任务，拒绝重复实例，并在异常退出后按一分钟间隔最多
+  重启三次；卸载时删除任务和记住的 raw key，不删除已派生逐库密钥。
+- 自动续期只会用已记住的 raw key 补齐新 DB 分片，不扫描内存或猜测已轮换的 raw key。
+- source guard、通知点击跳转、MCP 真实 UI 发送、py2app 与高级附件/mounted-backup
+  链在 Windows 上尚不宣称支持；默认关闭的 advanced lane 不因入口存在而视为可用。
 
 
 ============================================
@@ -80,7 +98,7 @@ monitor checkpoint 倒退成“没处理过”。
   sync_delegated 只证明目标 bytes/readback，不证明 provider-side upload。
 - 输出包括 immutable CAS object、privacy-bounded catalog snapshot、Markdown resource
   indexes 和 receipts；GC 只删除 manifest-owned generated paths。
-- Mounted 根部的 00-打开微信资源备份.md 是人类入口；菜单也可以直接在 Finder reveal。
+- Mounted 根部的 00-打开微信资源备份.md 是人类入口；菜单也可以直接在系统文件管理器中 reveal。
   入口下有文件备份、待补齐附件和资源总索引三套平行 view。文件备份按群聊/月列已交付
   digest，每个 object 一行并显示 occurrence 次数；待补齐页按 queued、cache unavailable、retry、
   local-space、attention、awaiting-handoff 与 unknown 分组，不生成 target link。三套 view 共用
@@ -105,7 +123,7 @@ monitor checkpoint 倒退成“没处理过”。
   namespace，避免不同账号/数据根互相碰撞。
 - 可选 source guard 运行在长驻菜单 app 内，受 grace、pause、restart budget、
   exponential backoff 和 content-free receipts 约束。
-- Source guard 只请求 macOS 正常打开微信；不会 kill、re-sign、登录或操作微信 UI，
+- Source guard 是 macOS-only，只请求系统正常打开微信；不会 kill、re-sign、登录或操作微信 UI，
   也不会把 process lookup unknown 猜成“微信没运行”。
 
 
@@ -123,7 +141,7 @@ MCP 可以让 Claude Desktop、Claude Code、Cursor、OpenClaw 等 client 查询
 - enabled 仍然拒绝空目标。
 - allowlist/enabled 必须先 prepare_send_message，给人核对 exact target/text，再以
   未过期 nonce 调 confirm_send_message；compatibility send_message 不会绕过确认。
-- 真实发送还需要 macOS Accessibility permission，并在写入后做数据库 readback。
+- 真实发送仍是 macOS-only，需要 Accessibility permission，并在写入后做数据库 readback。
 
 
 ============================================
@@ -137,6 +155,12 @@ MCP 可以让 Claude Desktop、Claude Code、Cursor、OpenClaw 等 client 查询
   ownership locks；worker_busy 或 unknown 不是 success。
 
 常用入口：
+
+  .\启动.cmd
+  .\启动.cmd --health-check
+  .\启动.cmd --refresh-data-source
+  .\启动.cmd --install-autostart
+  .\启动.cmd --uninstall-autostart
 
   ./启动.command
   ./launchers/配置关注推送.command

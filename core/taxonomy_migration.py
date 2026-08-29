@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import ctypes
 import errno
-import fcntl
 import hashlib
 import json
 import os
@@ -16,6 +15,8 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import quote
+
+from . import file_lock as fcntl
 
 from core.knowledge import KnowledgeStore
 

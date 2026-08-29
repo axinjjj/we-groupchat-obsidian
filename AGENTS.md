@@ -2,7 +2,9 @@
 
 ## Source ownership
 
-- `app.py` is the macOS menu-bar and py2app application entrypoint.
+- `app.py` is the shared macOS menu-bar / Windows tray application entrypoint
+  and remains the py2app target on macOS. `ui/windows_rumps.py` is only a thin
+  compatibility surface; do not fork the application workflow by platform.
 - `mcp_server.py` is the direct FastMCP entrypoint.
 - `setup.py` is the py2app packaging entrypoint. These are the only Python
   files that belong at repository root.
@@ -13,11 +15,18 @@
   saves or non-atomic config writes. `core/app_runtime.py` owns the menu-app
   process singleton.
 - `ai/` owns provider adapters; `ui/` owns reusable UI components.
+- Windows platform boundaries live in narrowly named `core/windows_*.py` or
+  generic `core/platform_*.py` adapters. Windows raw-key import must feed the
+  original verified per-database key map and `WeChatDB` decryption path. The raw
+  key may be retained only after explicit autostart enrollment and only in
+  Windows Credential Manager; never place it in config, logs, task arguments or
+  the repository, and never replace the canonical database/summary implementation.
 - `scripts/` contains thin operator entrypoints and compatibility cleanup
   commands. Put
   reusable behavior in the owning package rather than duplicating it in a CLI.
-- Source-guard and mounted-resource timers run inside the long-lived py2app
-  menu-bar process. macOS App Data consent is process-lifetime access, so their
+- Source-guard and mounted-resource timers run inside the long-lived menu-bar
+  process on supported platforms. Source guard and its App Data consent contract
+  are macOS-only, so Windows must keep that timer disabled. Their
   retired short-lived LaunchAgent modes must remain no-op cleanup surfaces and
   must not be reintroduced as Python or app-bundle interval workers.
 - Explicit resource CLI source operations remain operator entrypoints, but app
@@ -28,6 +37,13 @@
 - `launchers/` owns the canonical Finder-friendly `.command` entrypoints. The
   root `启动.command` is a compatibility stub for deployed source-mode
   LaunchAgents and must not grow a second implementation.
+- `launchers/启动.ps1` owns Windows setup/start orchestration and root `启动.cmd`
+  is its thin double-click stub. Keep `.cmd` as UTF-8 without BOM plus CRLF and
+  `.ps1` as UTF-8 with BOM plus CRLF for Windows PowerShell 5.1/non-ASCII paths.
+  Windows login autostart is a current-user Task Scheduler definition managed
+  only by `scripts/windows_autostart.py`; it must keep duplicate instances out,
+  use bounded abnormal-exit restart, and contain no credential. Implementation
+  and verification must not silently install it.
 - `tests/` is an importable unittest package. New tests belong there and use
   `tests.<module>` for focused invocation.
 
@@ -70,6 +86,19 @@ Run from repository root:
 .venv/bin/python -m compileall -q app.py mcp_server.py setup.py ai core ui scripts tests
 for launcher in 启动.command launchers/*.command; do bash -n "$launcher"; done
 ```
+
+On Windows, also run from the checkout root:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest tests.test_windows_key_extractor tests.test_windows_rumps tests.test_windows_launcher tests.test_windows_autostart tests.test_windows_runtime tests.test_windows_console
+.\.venv\Scripts\python.exe -m compileall -q app.py mcp_server.py setup.py ai core ui scripts tests
+cmd.exe /d /c "启动.cmd --setup-only --yes --no-pause"
+```
+
+Windows source acceptance is separate from synthetic decryption coverage: the
+privacy-safe readiness command may exit `2` until the operator privately supplies
+a valid raw key. Never print or commit raw keys, page keys, account paths, chat
+content or runtime config while diagnosing that gate.
 
 Use focused `tests.<module>` runs while iterating, then the full suite for
 shared code, packaging, public-boundary or runtime changes. Source completion,

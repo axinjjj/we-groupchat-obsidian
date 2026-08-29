@@ -6,6 +6,8 @@ import sqlite3
 import time
 from urllib.parse import quote
 
+from .config import ensure_private_file
+
 
 KNOWN_BROKEN_RELATION_REASON = (
     "关系判定失败，按新线索保守提醒: "
@@ -128,7 +130,7 @@ def repair_known_invalid_relations(db_path, *, backup_path, expected_count):
             source.backup(backup)
         finally:
             backup.close()
-        os.chmod(backup_path, 0o600)
+        ensure_private_file(backup_path)
 
         backup = sqlite3.connect(backup_path)
         try:

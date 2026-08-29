@@ -1,9 +1,9 @@
 """Long-lived menu-app process ownership."""
 from __future__ import annotations
 
-import fcntl
 import os
 
+from . import file_lock as fcntl
 from .config import DATA_DIR, ensure_private_dir
 
 

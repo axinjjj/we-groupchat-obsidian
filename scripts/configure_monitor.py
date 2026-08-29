@@ -20,7 +20,7 @@ from core.config import (
     update_config,
 )
 from core.key_extractor import get_cached_keys
-from core.keychain import load_key, save_key
+from core.keychain import credential_store_label, load_key, save_key
 from core.knowledge import (
     HUMAN_AI_INTIMACY_PROFILE,
     KnowledgeMetadataQueryError,
@@ -277,18 +277,20 @@ def configure(args: argparse.Namespace) -> int:
     if provider != "ollama":
         existing_key = load_key("ai-api-key")
         if existing_key:
-            if prompt_yes_no("Keychain 里已有 API key，要更新吗？", False):
+            store_label = credential_store_label()
+            if prompt_yes_no(f"{store_label}里已有 API key，要更新吗？", False):
                 key = getpass.getpass("输入新的 API key（不会显示）: ").strip()
                 if key and not save_key("ai-api-key", key):
-                    print("写入 Keychain 失败。")
+                    print(f"写入{store_label}失败。")
                     return 1
         else:
-            key = getpass.getpass("输入 API key（不会显示，会写入 macOS Keychain）: ").strip()
+            store_label = credential_store_label()
+            key = getpass.getpass(f"输入 API key（不会显示，会写入{store_label}）: ").strip()
             if not key:
                 print("没有 API key，无法启用云端模型。")
                 return 1
             if not save_key("ai-api-key", key):
-                print("写入 Keychain 失败。")
+                print(f"写入{store_label}失败。")
                 return 1
 
     print("\n关注描述")

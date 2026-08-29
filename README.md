@@ -2,15 +2,17 @@
 
 Local-first WeChat group chat summaries, monitor review, and Obsidian knowledge output.
 
-Status: functional, source-distributed macOS application. It has a menu-bar app,
-MCP server, operator CLIs, durable local state, recovery/backup workers and a
-full regression suite; review the data-flow and account-safety notes before
-using it on real chat data. A bundled Python runtime or signed installer is not
-currently distributed.
+Status: functional, source-distributed macOS application with a Windows 4.x
+compatibility preview. The original database, summary, monitor, Obsidian and MCP
+flows remain canonical; the Windows layer supplies source discovery, verified
+database-key derivation, a tray adapter, Credential Manager storage and native
+launch/autostart entrypoints. Review the platform limits and account-safety
+notes before using real chat data. No bundled Python runtime or signed installer
+is currently distributed.
 
-A local-first macOS tool for reading your own WeChat desktop database, summarizing group chats, searching messages, and turning high-value group-chat updates into an Obsidian-friendly Markdown knowledge base.
+A local-first desktop tool for reading your own WeChat database, summarizing group chats, searching messages, and turning high-value group-chat updates into an Obsidian-friendly Markdown knowledge base.
 
-This is not official WeChat/Tencent software, not a WeChat bot, not employee-monitoring software, and not fully offline when you enable cloud AI, remote link preview, or MCP sending. It does not use a WeChat API, does not run a remote service, and does not send your chat history to this project. The app reads local database files on your Mac and calls the AI provider you configure.
+This is not official WeChat/Tencent software, not a WeChat bot, not employee-monitoring software, and not fully offline when you enable cloud AI, remote link preview, or MCP sending. It does not use a WeChat API, does not run a remote service, and does not send your chat history to this project. The app reads local database files on your computer and calls the AI provider you configure.
 
 Project lineage: this standalone derivative builds on [Qizhan7/mac-wechat-summary](https://github.com/Qizhan7/mac-wechat-summary), which established the local macOS menu-bar summary and MCP foundation. This repository is not connected through GitHub's fork network and is not maintained as an upstream pull-request branch; it continues as a separate local-first Obsidian workflow project. See [NOTICE.md](NOTICE.md).
 
@@ -176,7 +178,7 @@ independently deployed microservices. Editable sources:
 ## Privacy and Safety
 
 - Runtime data is local by default: `~/.we-groupchat-obsidian/`.
-- API keys are stored in macOS Keychain, not in the repo.
+- API keys are stored in macOS Keychain or Windows Credential Manager, not in the repo.
 - WeChat database keys, logs, SQLite files, Markdown exports, and `.venv/` should never be committed.
 - The attachment catalog, local archive, source-guard state/receipts, and backup
   snapshot manifests/catalogs are private runtime data. Archive objects contain the original
@@ -187,7 +189,7 @@ independently deployed microservices. Editable sources:
   filesystem snapshot backend still has no provider API and cannot verify
   provider-side upload.
 - Direct Google Drive sync is a different opt-in backend. It requests only the
-  `drive.file` OAuth scope. The refresh token stays in macOS Keychain; access
+  `drive.file` OAuth scope. The refresh token stays in the platform credential store; access
   tokens stay in memory; the user's Installed desktop app OAuth client JSON is
   copied to private runtime storage with mode `0600` and must never be
   committed. For selected chats, the configured stable alias, file name, and
@@ -243,10 +245,9 @@ quick-start file and omits internal handoff docs such as
 
 ## Requirements
 
-- macOS 12+
+- macOS 12+ with WeChat for macOS, or Windows with Weixin 4.x
 - Python 3.10+
-- WeChat for macOS, logged in
-- Xcode Command Line Tools
+- Xcode Command Line Tools on macOS only
 - One AI provider API key, or local Ollama
 - Obsidian is optional
 
@@ -256,6 +257,8 @@ When DeepSeek is selected without an explicit `ai_model`, the current default
 is `deepseek-v4-flash`; a different compatible model can still be configured.
 
 ## Quick Start
+
+### macOS
 
 ```bash
 git clone https://github.com/IndelibleVivi/we-groupchat-obsidian.git
@@ -275,6 +278,56 @@ If WeChat was updated or key extraction needs a fresh authorization:
 ./启动.command --allow-wechat-resign
 ```
 
+### Windows compatibility preview
+
+```powershell
+git clone https://github.com/IndelibleVivi/we-groupchat-obsidian.git
+cd we-groupchat-obsidian
+.\启动.cmd
+```
+
+The launcher uses the checkout-local `.venv`, asks before installing or updating
+dependencies, auto-detects a Weixin 4.x `db_storage` root, and starts the same
+`app.py` through a Windows tray adapter. Windows PowerShell 5.1 and non-ASCII
+checkout paths are supported by the checked-in launcher encoding contract.
+
+Current Windows Weixin databases still need the account's 64-hex-character
+`raw key`. WGO deliberately does not download, bundle, or execute a third-party
+key extractor. Obtain the raw key using a tool and method you independently
+trust and are authorized to use, then enter it privately when the launcher asks,
+or run:
+
+```powershell
+.\启动.cmd --refresh-data-source
+```
+
+The raw key is read with masked input, is not accepted as a command-line value,
+and is never written to config, logs or Task Scheduler arguments. An ordinary
+refresh uses it only in memory. WGO derives a key for each existing database,
+accepts only keys that pass the original page-HMAC verification, and stores only
+that verified per-database map under the current user's protected runtime
+directory. A wrong raw key fails without replacing the existing map.
+
+`--install-autostart` is the explicit exception to non-retention: it first asks
+for and fully verifies the raw key, then stores it in Windows Credential Manager
+and creates a current-user Task Scheduler logon task. The task ignores duplicate
+instances and retries an abnormal exit up to three times at one-minute intervals.
+At startup, or when required database shards appear, WGO can use that remembered
+credential to re-derive and verify page keys without prompting. Autostart never
+silently updates a changed Python environment. Here, automatic renewal means
+deriving new database-shard page keys from the remembered raw key; WGO does not
+scan process memory or guess a rotated raw key. If the account raw key changes,
+run `--install-autostart` again to replace it through masked input. Run `启动.cmd`
+manually after a dependency change. `--uninstall-autostart` removes both the task
+and the remembered raw key while leaving already derived page keys untouched.
+
+Windows preview scope currently includes encrypted-source reading, tray summary
+and search, monitor/Obsidian output, MCP read tools, Unicode clipboard support,
+Windows Credential Manager and per-user login autostart. macOS WeChat re-signing,
+source guard, notification-click routing, real MCP UI sending, py2app packaging,
+and the advanced attachment/mounted-backup lanes remain macOS-only or
+macOS-validated; they are not claimed as Windows-supported.
+
 ### Documentation map
 
 - `README.md` / `README.zh-CN.md`: current user, operator, privacy, and project
@@ -288,6 +341,20 @@ If WeChat was updated or key extraction needs a fresh authorization:
   selection, projection, handoff, status, and failure semantics.
 
 ## Useful Commands
+
+Windows entrypoints:
+
+| Command | Purpose |
+| --- | --- |
+| `.\启动.cmd` | Check/install with consent, initialize the data source if needed, and start the tray app |
+| `.\启动.cmd --setup-only` | Check dependencies and print a privacy-safe source readiness summary |
+| `.\启动.cmd --health-check` | Run the Windows source readiness check |
+| `.\启动.cmd --refresh-data-source` | Privately prompt for the raw key and rebuild verified per-database keys |
+| `.\启动.cmd --install-autostart` | Verify/remember the raw key, then install current-user login start and bounded crash restart |
+| `.\启动.cmd --uninstall-autostart` | Remove the scheduled task and remembered raw key |
+| `.\启动.cmd --autostart-status` | Inspect the Windows scheduled task |
+
+macOS entrypoints:
 
 The canonical Finder helpers live in `launchers/` and can be double-clicked or
 run from Terminal. The root `启动.command` remains as the single compatibility
@@ -448,7 +515,7 @@ are written.
 
 The mounted target has a separate human-facing entrypoint at
 `<target>/wgo-resource-backup/00-打开微信资源备份.md`; the menu-bar command
-`📂 在 Finder 打开文件备份` reveals it directly. Its `文件备份` pages contain
+`📂 在文件夹中显示文件备份` reveals it directly. Its `文件备份` pages contain
 only delivered files, grouped by selected chat and month; each digest appears
 once with its occurrence count and links to the existing CAS object. A separate
 `待补齐附件` family groups queued, cache-unavailable, retry, local-space,
@@ -662,19 +729,20 @@ Real sends use a two-step confirmation flow. First call `prepare_send_message(te
 ## Repository Layout
 
 ```text
-app.py                   # macOS menu-bar application entrypoint
+app.py                   # shared menu-bar/tray application entrypoint
 mcp_server.py            # FastMCP server entrypoint
 setup.py                 # py2app packaging entrypoint
 ai/                      # replaceable AI provider adapters
 core/                    # domain logic, durable state, privacy and reliability contracts
-ui/                      # reusable UI components
+ui/                      # reusable UI components and Windows rumps adapter
 scripts/                 # thin operator entrypoints and legacy-agent cleanup
-launchers/               # canonical Finder-friendly .command entrypoints
+launchers/               # canonical macOS .command and Windows PowerShell entrypoints
 tests/                   # importable unittest package
 c_src/                   # macOS WeChat key scanner
 resources/               # app and menu-bar assets
 docs/                    # user, operator, architecture and formal-contract documentation
 启动.command             # root compatibility stub for existing installs/LaunchAgents
+启动.cmd                 # Windows double-click compatibility stub
 ```
 
 The three root-level Python files are deliberate application/build entrypoints,
@@ -732,6 +800,14 @@ surfaces target installed executables and a standalone bundle instead.
 .venv/bin/python -m unittest -v tests.test_resource_backup
 .venv/bin/python -m compileall -q app.py mcp_server.py setup.py ai core ui scripts tests
 for launcher in 启动.command launchers/*.command; do bash -n "$launcher"; done
+```
+
+On Windows, use the exact checkout interpreter and verify the native launcher:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest tests.test_windows_key_extractor tests.test_windows_rumps tests.test_windows_launcher tests.test_windows_autostart tests.test_windows_runtime tests.test_windows_console
+.\.venv\Scripts\python.exe -m compileall -q app.py mcp_server.py setup.py ai core ui scripts tests
+cmd.exe /d /c "启动.cmd --setup-only --yes --no-pause"
 ```
 
 ## What Changed in This Fork

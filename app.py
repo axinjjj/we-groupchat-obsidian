@@ -1,6 +1,4 @@
-"""
-WeChat Group Chat AI Summary - macOS menu bar tool
-"""
+"""WeChat Group Chat AI Summary desktop tray/menu-bar application."""
 import os
 import queue
 import re
@@ -18,7 +16,10 @@ _BACKGROUND_EXIT_CODE = dispatch_background_job(sys.argv[1:])
 if _BACKGROUND_EXIT_CODE is not None:
     raise SystemExit(_BACKGROUND_EXIT_CODE)
 
-import rumps
+if sys.platform == "win32":
+    from ui import windows_rumps as rumps
+else:
+    import rumps
 
 # --- For dialog top-most + custom dialogs ---
 try:
@@ -87,7 +88,9 @@ from core.notification_target import (
     notification_open_commands_for_path,
     target_path_from_notification,
 )
-from core.keychain import save_key, load_key
+from core.platform_open import open_target
+from core.platform_clipboard import copy_text
+from core.keychain import credential_store_label, save_key, load_key
 from core.key_extractor import (
     is_wechat_running,
     is_wechat_signed,
@@ -97,6 +100,7 @@ from core.key_extractor import (
     check_new_databases,
 )
 from core.wechat_db import WeChatDB
+from core.windows_key_extractor import WINDOWS_RAW_KEY_CREDENTIAL_ACCOUNT
 from core.wechat_source_guard import WeChatSourceGuard
 from core.bookmark import get_bookmark, set_bookmark, get_summary_time, clear_all_bookmarks
 from core.chat_groups import (
@@ -260,11 +264,11 @@ def _on_notification_click(notification):
         return
     for command in notification_open_commands_for_path(path):
         try:
-            result = subprocess.run(command, check=False)
+            result = open_target(command[1])
         except Exception as e:
             print(f"[notify] open target failed via {command[1]}: {e}")
             continue
-        if result.returncode == 0:
+        if result is None or result.returncode == 0:
             method = "Obsidian URI" if command[1].startswith("obsidian://") else "default open"
             print(f"[notify] opened target via {method}: {path}")
             return
@@ -273,6 +277,8 @@ def _on_notification_click(notification):
 
 
 def _wechat_signing_message():
+    if sys.platform == "win32":
+        return "请运行 启动.cmd --refresh-data-source，并安全输入当前账户 raw key"
     return "请重新双击启动.command，完成微信授权"
 
 
@@ -561,7 +567,10 @@ class WeGroupchatObsidianApp(rumps.App):
             except Exception:
                 pass
             self._source_guard_timer = None
-        if not self.config.get("wechat_source_guard_enabled", False):
+        if (
+            sys.platform == "win32"
+            or not self.config.get("wechat_source_guard_enabled", False)
+        ):
             return
         interval = max(
             60,
@@ -575,7 +584,7 @@ class WeGroupchatObsidianApp(rumps.App):
         print(f"[source-guard] long-lived timer started: every {interval} seconds")
 
     def _on_source_guard_timer(self, _):
-        if self.config.get("wechat_source_guard_enabled", False):
+        if sys.platform != "win32" and self.config.get("wechat_source_guard_enabled", False):
             self._start_source_guard_consumer()
 
     def _start_source_guard_consumer(self):
@@ -669,7 +678,7 @@ class WeGroupchatObsidianApp(rumps.App):
             callback=self._run_resource_backup_now,
         ))
         menu.add(rumps.MenuItem(
-            "📂 在 Finder 打开文件备份",
+            "📂 在文件夹中显示文件备份",
             callback=self._open_resource_backup_portal,
         ))
         menu.add(rumps.MenuItem(
@@ -739,7 +748,12 @@ class WeGroupchatObsidianApp(rumps.App):
             try:
                 confirmed = self._confirm_dialog(
                     "允许本次 app 会话解析微信附件？",
-                    "macOS 可能显示一次“访问其他 App 数据”提示。授权仅用于显式选中群聊的微信附件 cache；补链接不需要此权限。关闭本开关会立即停止新的文件解析。",
+                    (
+                        "macOS 可能显示一次“访问其他 App 数据”提示。"
+                        if sys.platform == "darwin" else
+                        "Windows 会直接读取当前账户目录中的微信附件 cache。"
+                    )
+                    + "授权仅用于显式选中群聊；补链接不需要此权限。关闭本开关会立即停止新的文件解析。",
                     ok="开启",
                 )
             finally:
@@ -776,7 +790,7 @@ class WeGroupchatObsidianApp(rumps.App):
                 "请先选择群聊并运行一次“立即更新资源索引”。",
             )
             return
-        subprocess.run(["open", "-R", portal_path])
+        open_target(portal_path, reveal=True)
 
     def _start_resource_backup_consumer(self, *, manual):
         threading.Thread(
@@ -1417,7 +1431,7 @@ class WeGroupchatObsidianApp(rumps.App):
                 "完成授权并至少成功运行一次后才能打开。",
             )
             return
-        subprocess.run(["open", link])
+        open_target(link)
 
     def _reauthorize_drive_sync(self, _):
         self._delayed_run(self._show_drive_sync_auth_dialog)
@@ -1448,7 +1462,7 @@ class WeGroupchatObsidianApp(rumps.App):
             _notify(
                 "Google Drive 群文件备份",
                 "授权完成",
-                "refresh token 已存入 macOS Keychain；sync 和群聊选择没有被改变。",
+                f"refresh token 已存入{credential_store_label()}；sync 和群聊选择没有被改变。",
             )
             print(f"[drive-sync] auth state={status.get('state')}")
         except GoogleDriveAuthError as exc:
@@ -1463,7 +1477,7 @@ class WeGroupchatObsidianApp(rumps.App):
     # ── Topic monitor menu ────────────────────────────────────
 
     def _build_monitor_menu(self):
-        """Build macOS notification monitor submenu."""
+        """Build the notification monitor submenu."""
         monitor = rumps.MenuItem("🔔 关注推送")
 
         enabled = self.config.get("monitor_enabled", False)
@@ -1829,7 +1843,7 @@ class WeGroupchatObsidianApp(rumps.App):
         ).start()
 
     def _test_monitor_notification(self, _):
-        _notify("关注推送", "系统通知可用", "如果你看到这条，macOS 通知链路是通的")
+        _notify("关注推送", "系统通知可用", "如果你看到这条，系统通知链路是通的")
 
     def _toggle_background_notifications(self, _):
         enabled = not bool(self.config.get("background_notifications_enabled", True))
@@ -2095,13 +2109,13 @@ class WeGroupchatObsidianApp(rumps.App):
 
     def _open_monitor_hits_dir(self, _):
         os.makedirs(HITS_DIR, exist_ok=True)
-        subprocess.run(["open", HITS_DIR])
+        open_target(HITS_DIR)
 
     def _open_monitor_knowledge_dir(self, _):
         root = self.config.get("monitor_obsidian_root") or OBSIDIAN_ROOT
         subdir = self.config.get("monitor_obsidian_subdir")
         ensure_obsidian_vault(root, obsidian_subdir=subdir)
-        subprocess.run(["open", os.path.join(os.path.expanduser(root), safe_obsidian_subdir(subdir))])
+        open_target(os.path.join(os.path.expanduser(root), safe_obsidian_subdir(subdir)))
 
     def _set_monitor_obsidian_root(self, _):
         self._delayed_run(self._show_monitor_obsidian_root_dialog)
@@ -2299,7 +2313,7 @@ class WeGroupchatObsidianApp(rumps.App):
     def _check_mcp_ready(self):
         """Check if MCP Server can start normally, return issue list (empty = ready)."""
         project_dir = os.path.dirname(os.path.abspath(__file__))
-        venv_python = os.path.join(project_dir, ".venv", "bin", "python3")
+        venv_python = self._project_python(project_dir)
         mcp_server = os.path.join(project_dir, "mcp_server.py")
 
         issues = []
@@ -2328,12 +2342,18 @@ class WeGroupchatObsidianApp(rumps.App):
     def _get_mcp_config_snippet(self, client="claude_desktop"):
         """Generate MCP client configuration."""
         project_dir = os.path.dirname(os.path.abspath(__file__))
-        venv_python = os.path.join(project_dir, ".venv", "bin", "python3")
+        venv_python = self._project_python(project_dir)
         mcp_server = os.path.join(project_dir, "mcp_server.py")
 
         if client == "claude_desktop":
             return claude_desktop_config(venv_python, mcp_server)
         return claude_code_add_command(venv_python, mcp_server)
+
+    @staticmethod
+    def _project_python(project_dir):
+        if sys.platform == "win32":
+            return os.path.join(project_dir, ".venv", "Scripts", "python.exe")
+        return os.path.join(project_dir, ".venv", "bin", "python3")
 
     def _build_mcp_menu(self):
         """Build MCP service submenu."""
@@ -2377,15 +2397,13 @@ class WeGroupchatObsidianApp(rumps.App):
 
     def _copy_claude_desktop_config(self, _):
         snippet = self._get_mcp_config_snippet("claude_desktop")
-        process = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-        process.communicate(snippet.encode("utf-8"))
+        copy_text(snippet)
         _notify("MCP 服务", "已复制到剪贴板",
                 "粘贴到 claude_desktop_config.json 即可")
 
     def _copy_claude_code_config(self, _):
         snippet = self._get_mcp_config_snippet("claude_code")
-        process = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-        process.communicate(snippet.encode("utf-8"))
+        copy_text(snippet)
         _notify("MCP 服务", "已复制到剪贴板",
                 "在终端粘贴执行即可添加 MCP 服务")
 
@@ -2395,7 +2413,7 @@ class WeGroupchatObsidianApp(rumps.App):
 
     def _do_mcp_test(self):
         project_dir = os.path.dirname(os.path.abspath(__file__))
-        venv_python = os.path.join(project_dir, ".venv", "bin", "python3")
+        venv_python = self._project_python(project_dir)
         mcp_server = os.path.join(project_dir, "mcp_server.py")
 
         if not os.path.isfile(venv_python):
@@ -2673,7 +2691,7 @@ class WeGroupchatObsidianApp(rumps.App):
         try:
             clicked, text = self._input_dialog(
                 "设置 API Key",
-                f"当前 AI 服务：{provider_name}\n{hint}\n\nKey 将安全存储在 macOS 钥匙串中",
+                f"当前 AI 服务：{provider_name}\n{hint}\n\nKey 将安全存储在{credential_store_label()}中",
                 ok="保存", width=380,
             )
 
@@ -2681,10 +2699,10 @@ class WeGroupchatObsidianApp(rumps.App):
                 key = text.strip()
                 if save_key("ai-api-key", key):
                     self.ai = None
-                    _notify("微信总结", "API Key 已保存", "密钥已安全存储在 macOS 钥匙串中")
+                    _notify("微信总结", "API Key 已保存", f"密钥已安全存储在{credential_store_label()}中")
                     self._rebuild_settings_menu()
                 else:
-                    _notify("微信总结", "保存失败", "无法写入钥匙串")
+                    _notify("微信总结", "保存失败", f"无法写入{credential_store_label()}")
         finally:
             self._release_front()
 
@@ -2713,27 +2731,61 @@ class WeGroupchatObsidianApp(rumps.App):
     def open_config_file(self, _):
         if not os.path.exists(CONFIG_FILE):
             self._update_config()
-        subprocess.run(["open", CONFIG_FILE])
+        open_target(CONFIG_FILE)
 
     def _open_summary_dir(self, _):
-        subprocess.run(["open", SUMMARY_DIR])
+        open_target(SUMMARY_DIR)
 
     # ── Initialization ──────────────────────────────────────────
+
+    def _refresh_windows_keys_from_credential(self, keys):
+        """Renew missing Windows page keys from an explicitly remembered raw key."""
+        if sys.platform != "win32":
+            return keys
+        db_dir = self.config.get("db_dir", "")
+        if not db_dir or not os.path.isdir(db_dir):
+            return keys
+        missing = check_new_databases(db_dir, keys or {})
+        if keys and not missing:
+            return keys
+        raw_key_hex = load_key(WINDOWS_RAW_KEY_CREDENTIAL_ACCOUNT)
+        if not raw_key_hex:
+            return keys
+        try:
+            refreshed = extract_keys(raw_key_hex=raw_key_hex)
+        finally:
+            raw_key_hex = None
+        if refreshed:
+            print(f"[init] Windows 数据源自动续期: {len(refreshed)} 个数据库")
+            return refreshed
+        print("[init] Windows 数据源自动续期失败；已保留现有逐库密钥")
+        return keys
 
     def _init_background(self):
         print("[init] 开始后台初始化...")
         self._set_status(ICON_LOADING)
 
-        keys = get_cached_keys()
+        keys = self._refresh_windows_keys_from_credential(get_cached_keys())
         print(f"[init] 缓存密钥: {'有' if keys else '无'}")
         signed = is_wechat_signed()
-        print(f"[init] 微信签名: {'正常' if signed else '需要重新授权'}")
+        if sys.platform == "win32":
+            print("[init] Windows 数据源不需要修改微信签名")
+        else:
+            print(f"[init] 微信签名: {'正常' if signed else '需要重新授权'}")
 
         if not signed and keys:
             _notify("微信总结", "检测到微信签名已失效",
                     f"当前缓存密钥仍可使用；如读不到新消息，{_wechat_signing_message()}")
 
         if not keys:
+            if sys.platform == "win32":
+                _notify(
+                    "微信总结",
+                    "需要初始化 Windows 数据源",
+                    _wechat_signing_message(),
+                )
+                self._set_status(ICON_ERROR)
+                return
             if not is_wechat_running():
                 _notify("微信总结", "初始化失败", "请先启动微信并登录")
                 self._set_status(ICON_ERROR)
@@ -2753,7 +2805,7 @@ class WeGroupchatObsidianApp(rumps.App):
                 self._set_status(ICON_ERROR)
                 return
 
-        print(f"[init] db_dir: {self.config.get('db_dir')}")
+        print("[init] db_dir: configured")
         if not self.config.get("db_dir") or not os.path.isdir(self.config["db_dir"]):
             _notify("微信总结", "未找到微信数据目录", "请检查配置")
             self._set_status(ICON_ERROR)
@@ -2765,7 +2817,7 @@ class WeGroupchatObsidianApp(rumps.App):
             self._start_attachment_archive_consumer()
         if self.config.get("resource_backup_enabled", False):
             self._start_resource_backup_consumer(manual=False)
-        if self.config.get("wechat_source_guard_enabled", False):
+        if sys.platform != "win32" and self.config.get("wechat_source_guard_enabled", False):
             self._start_source_guard_consumer()
         if (
             self.config.get("google_drive_file_sync_enabled", False)
@@ -3234,7 +3286,7 @@ class WeGroupchatObsidianApp(rumps.App):
                     f"{date_str} · {msg_count}条消息 · {total_chunks}段已总结")
             print(f"[daily] ✓ {group_name} {date_str} 总结完成")
 
-            subprocess.run(["open", summary_file])
+            open_target(summary_file)
             self._set_status(ICON_DONE)
 
         except UserCancelled:
@@ -3369,7 +3421,7 @@ class WeGroupchatObsidianApp(rumps.App):
             print(f"[summary] ✓ {group_name} 总结完成")
 
             # Auto-open summary file
-            subprocess.run(["open", summary_file])
+            open_target(summary_file)
 
             self._set_status(ICON_DONE)
 
@@ -3439,8 +3491,7 @@ class WeGroupchatObsidianApp(rumps.App):
     def _copy_summary(self, _):
         if not self._last_summary:
             return
-        process = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-        process.communicate(self._last_summary["text"].encode("utf-8"))
+        copy_text(self._last_summary["text"])
         _notify("微信总结", "已复制", "总结内容已复制到剪贴板")
 
     def _rebuild_summary_history(self):
@@ -3497,7 +3548,7 @@ class WeGroupchatObsidianApp(rumps.App):
 
     def _make_open_file_callback(self, filepath):
         def callback(_):
-            subprocess.run(["open", filepath])
+            open_target(filepath)
         return callback
 
     # ── Group management ────────────────────────────────────────
@@ -3812,7 +3863,7 @@ class WeGroupchatObsidianApp(rumps.App):
             print(f"[batch] ✓ 分组「{group_name}」总结完成")
 
             # Auto-open summary file
-            subprocess.run(["open", summary_file])
+            open_target(summary_file)
 
             self._set_status(ICON_DONE)
 
@@ -4185,7 +4236,7 @@ class WeGroupchatObsidianApp(rumps.App):
             _notify("微信总结", f"🔍 搜索完成", f"「{kw_str}」命中 {total_count} 条消息")
             print(f"[搜索] ✓ 搜索完成，结果已保存")
 
-            subprocess.run(["open", filepath])
+            open_target(filepath)
             self._set_status(ICON_DONE)
 
         except UserCancelled:
@@ -4282,6 +4333,9 @@ class WeGroupchatObsidianApp(rumps.App):
     @rumps.clicked("🔄 刷新数据源")
     def reextract_keys(self, _):
         print("[keys] 点击🔄 刷新数据源")
+        if sys.platform == "win32":
+            self._delayed_run(self._show_windows_raw_key_dialog)
+            return
         if not is_wechat_running():
             print("[keys] ✗ 微信未运行")
             _notify("微信总结", "微信未运行", "请先启动微信并登录")
@@ -4293,11 +4347,45 @@ class WeGroupchatObsidianApp(rumps.App):
         print("[keys] 开始刷新数据源...")
         threading.Thread(target=self._do_reextract, daemon=True).start()
 
-    def _do_reextract(self):
-        self._set_status(ICON_LOADING)
-        _notify("微信总结", "正在刷新数据源", "需要管理员权限...")
+    def _show_windows_raw_key_dialog(self):
+        self._bring_to_front()
         try:
-            keys = extract_keys()
+            window = rumps.Window(
+                message=(
+                    "输入当前 Windows 微信 4.x 账户 raw key。\n"
+                    "它只在内存中用于为现有数据库派生并验证页密钥，"
+                    "不会写入日志、配置或命令行。"
+                ),
+                title="刷新 Windows 数据源",
+                default_text="",
+                ok="派生并验证",
+                cancel="取消",
+                dimensions=(520, 24),
+                secure=True,
+            )
+            response = window.run()
+            if not response.clicked:
+                return
+            raw_key_hex = str(response.text or "").strip()
+            if not re.fullmatch(r"[0-9a-fA-F]{64}", raw_key_hex):
+                _notify("微信总结", "raw key 格式错误", "请输入 64 位十六进制字符")
+                return
+            threading.Thread(
+                target=self._do_reextract,
+                kwargs={"raw_key_hex": raw_key_hex},
+                daemon=True,
+            ).start()
+        finally:
+            self._release_front()
+
+    def _do_reextract(self, raw_key_hex=None):
+        self._set_status(ICON_LOADING)
+        if sys.platform == "win32":
+            _notify("微信总结", "正在刷新数据源", "正在派生并验证现有数据库密钥...")
+        else:
+            _notify("微信总结", "正在刷新数据源", "需要管理员权限...")
+        try:
+            keys = extract_keys(raw_key_hex=raw_key_hex)
             print(f"[keys] extract_keys 返回: {len(keys) if keys else 0} 个密钥")
             if keys:
                 self.db = WeChatDB(self.config["db_dir"], keys)

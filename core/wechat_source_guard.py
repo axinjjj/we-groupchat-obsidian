@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -18,6 +17,8 @@ import tempfile
 import time
 import uuid
 from typing import Callable
+
+from . import file_lock as fcntl
 
 from .key_extractor import get_cached_keys, is_wechat_running, process_lookup_available
 from .project_identity import data_dir

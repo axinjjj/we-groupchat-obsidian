@@ -21,7 +21,8 @@ class KeyExtractorTests(unittest.TestCase):
             stdout=f"{os.getpid()}\n",
             stderr="",
         )
-        with patch("core.key_extractor.subprocess.run", return_value=result) as run:
+        with patch("core.key_extractor.sys.platform", "darwin"), \
+             patch("core.key_extractor.subprocess.run", return_value=result) as run:
             self.assertTrue(process_lookup_available())
 
         run.assert_called_once_with(

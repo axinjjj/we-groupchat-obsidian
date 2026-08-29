@@ -12,6 +12,7 @@ from core.config import (
     DEFAULT_CONFIG,
     _sanitize_config,
     active_monitor_chats,
+    auto_detect_db_dir,
     merge_monitor_chat_preferences,
     load_config,
     selected_resource_backup_chats,
@@ -28,6 +29,52 @@ def _config_patch_worker(path, field, value, start_event, iterations=1):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_auto_detects_windows_weixin_db_from_utf8_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            appdata = os.path.join(tmp, "AppData", "Roaming")
+            config_dir = os.path.join(appdata, "Tencent", "xwechat", "config")
+            data_root = os.path.join(tmp, "WeixinData")
+            db_dir = os.path.join(
+                data_root, "xwechat_files", "account", "db_storage"
+            )
+            os.makedirs(os.path.join(db_dir, "contact"))
+            os.makedirs(os.path.join(db_dir, "session"))
+            os.makedirs(config_dir)
+            for rel_path in ("contact/contact.db", "session/session.db"):
+                with open(os.path.join(db_dir, *rel_path.split("/")), "wb") as handle:
+                    handle.write(b"fixture")
+            with open(os.path.join(config_dir, "storage.ini"), "w", encoding="utf-8") as handle:
+                handle.write(data_root)
+
+            detected = auto_detect_db_dir(
+                platform_name="win32",
+                environ={"APPDATA": appdata},
+                home_dir=os.path.join(tmp, "home"),
+            )
+
+            self.assertEqual(detected, db_dir)
+
+    def test_auto_detects_windows_weixin_db_from_gb18030_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            appdata = os.path.join(tmp, "AppData", "Roaming")
+            config_dir = os.path.join(appdata, "Tencent", "xwechat", "config")
+            data_root = os.path.join(tmp, "微信数据")
+            db_dir = os.path.join(
+                data_root, "xwechat_files", "account", "db_storage"
+            )
+            os.makedirs(os.path.join(db_dir, "message"))
+            os.makedirs(config_dir)
+            with open(os.path.join(config_dir, "storage.ini"), "wb") as handle:
+                handle.write(data_root.encode("gb18030"))
+
+            detected = auto_detect_db_dir(
+                platform_name="win32",
+                environ={"APPDATA": appdata},
+                home_dir=os.path.join(tmp, "home"),
+            )
+
+            self.assertEqual(detected, db_dir)
+
     def test_auto_detect_install_does_not_overwrite_concurrent_explicit_source(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "config.json")
@@ -123,8 +170,15 @@ class ConfigTests(unittest.TestCase):
             start.set()
             observed = 0
             while writer.is_alive():
-                with open(path, encoding="utf-8") as handle:
-                    value = json.load(handle)
+                try:
+                    with open(path, encoding="utf-8") as handle:
+                        value = json.load(handle)
+                except (FileNotFoundError, PermissionError):
+                    if os.name != "nt":
+                        raise
+                    # A lock-free Windows reader may briefly lose the rename
+                    # race. ConfigStore readers synchronize on the lock file.
+                    continue
                 self.assertIn(value["monitor_interval_minutes"], {1, 2})
                 observed += 1
             writer.join(10)

@@ -8,7 +8,6 @@ it does not claim that a cloud provider has completed remote synchronization.
 from __future__ import annotations
 
 import errno
-import fcntl
 import hashlib
 import json
 import os
@@ -20,6 +19,8 @@ import tempfile
 import time
 import unicodedata
 import uuid
+
+from . import file_lock as fcntl
 from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timezone

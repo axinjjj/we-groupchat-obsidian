@@ -9,7 +9,12 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import DATA_DIR, ensure_private_dir, ensure_private_file
-from .knowledge import _obsidian_link, ensure_obsidian_vault, safe_obsidian_subdir
+from .knowledge import (
+    _obsidian_link,
+    _obsidian_relpath,
+    ensure_obsidian_vault,
+    safe_obsidian_subdir,
+)
 from .review_queue import QUEUE_ACTIONABILITIES, ReviewQueue, priority_for_item
 from .source_contract import projection_source_lines
 
@@ -416,8 +421,8 @@ def _obsidian_digest_root(config: dict) -> tuple[str, str]:
     if not obsidian_root:
         return "", ""
     obsidian_subdir = safe_obsidian_subdir(config.get("monitor_obsidian_subdir"))
-    relative_root = os.path.join(obsidian_subdir, "Daily Digest")
-    return os.path.join(obsidian_root, relative_root), relative_root
+    relative_root = _obsidian_relpath(obsidian_subdir, "Daily Digest")
+    return os.path.join(obsidian_root, *relative_root.split("/")), relative_root
 
 
 def _digest_month(date_label: str) -> str:
@@ -479,9 +484,9 @@ def digest_output_path(
         current_month = _now_dt(config, now_func=now_func).strftime("%Y-%m")
         if month and month != current_month:
             digest_root = os.path.join(digest_root, month)
-            relative_root = os.path.join(relative_root, month)
+            relative_root = _obsidian_relpath(relative_root, month)
         filename = f"{date_label} Daily Digest.md"
-        obsidian_path = os.path.join(relative_root, filename)
+        obsidian_path = _obsidian_relpath(relative_root, filename)
         return os.path.join(digest_root, filename), obsidian_path
 
     return os.path.join(DAILY_DIGEST_DIR, f"{date_label}-daily-digest.md"), ""

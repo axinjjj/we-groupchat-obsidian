@@ -180,7 +180,12 @@ class RelationAuditTests(unittest.TestCase):
         self.assertEqual(result["fts_before"], result["fts_after"])
         self.assertEqual(result["integrity_before"], "ok")
         self.assertEqual(result["integrity_after"], "ok")
-        self.assertEqual(os.stat(backup_path).st_mode & 0o777, 0o600)
+        if os.name == "nt":
+            from core.windows_permissions import is_private_to_current_user
+
+            self.assertTrue(is_private_to_current_user(backup_path))
+        else:
+            self.assertEqual(os.stat(backup_path).st_mode & 0o777, 0o600)
 
         backup_audit = audit_relations(backup_path)
         source_audit = audit_relations(self.db_path)

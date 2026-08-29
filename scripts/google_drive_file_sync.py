@@ -14,6 +14,7 @@ if str(PROJECT_DIR) not in sys.path:
 
 from core.config import load_config, update_config
 from core.google_drive_auth import GoogleDriveAuthError, GoogleDriveOAuth
+from core.keychain import credential_store_label
 from core.google_drive_client import GoogleDriveClient
 from core.google_drive_file_sync import GoogleDriveFileSync
 from core.key_extractor import get_cached_keys
@@ -115,7 +116,10 @@ def main(argv=None):
         return _print_result(GoogleDriveOAuth().status(validate=True))
     if args.command == "disconnect":
         GoogleDriveOAuth().disconnect()
-        print("Google Drive refresh token removed from Keychain. Queue and remote files were not deleted.")
+        print(
+            "Google Drive refresh token removed from "
+            f"{credential_store_label()}. Queue and remote files were not deleted."
+        )
         return 0
     if args.command == "enable":
         config = _set_config(

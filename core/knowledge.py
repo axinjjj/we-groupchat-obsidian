@@ -10,15 +10,16 @@ import threading
 import time
 import unicodedata
 from datetime import datetime
-from urllib.parse import quote
+from pathlib import Path
 
-from .config import DATA_DIR
+from .config import DATA_DIR, _atomic_replace
 from .link_preview import is_wechat_record_url
 from .project_identity import PROJECT_SLUG
 from .source_contract import (
     atomic_source_lines,
     aware_iso_from_timestamp,
     is_history_summary,
+    local_datetime_from_timestamp,
     projection_source_lines,
 )
 from .taxonomy_assignment import TaxonomyResolution, resolve_taxonomy_profile
@@ -453,7 +454,19 @@ def _file_url(path):
     text = str(path or "").strip()
     if not text:
         return ""
-    return "file://" + quote(text)
+    return Path(os.path.abspath(os.path.expanduser(text))).as_uri()
+
+
+def _obsidian_relpath(*parts):
+    """Return an Obsidian vault-relative path, independent of host separators."""
+    logical_parts = []
+    for value in parts:
+        logical_parts.extend(
+            part
+            for part in re.split(r"[/\\]+", str(value or ""))
+            if part
+        )
+    return "/".join(logical_parts)
 
 
 def _month_from_time(value):
@@ -464,9 +477,10 @@ def _month_from_time(value):
 def _file_month_dir(config, month):
     if not month:
         return ""
-    db_dir = os.path.abspath(os.path.expanduser(str(config.get("db_dir") or "")))
-    if not db_dir:
+    db_value = str(config.get("db_dir") or "").strip()
+    if not db_value:
         return ""
+    db_dir = os.path.abspath(os.path.expanduser(db_value))
     wxid_dir = os.path.dirname(db_dir.rstrip(os.sep))
     candidate = os.path.join(wxid_dir, "msg", "file", month)
     return candidate if os.path.isdir(candidate) else ""
@@ -590,7 +604,7 @@ def _note_heading(topic):
 def _obsidian_link(obsidian_path, title):
     if not obsidian_path:
         return f"[[{title}]]"
-    target = os.path.splitext(obsidian_path)[0]
+    target = os.path.splitext(_obsidian_relpath(obsidian_path))[0]
     return f"[[{target}|{title}]]"
 
 
@@ -724,7 +738,7 @@ def safe_obsidian_subdir(value):
         clean = safe_path_part(part, "", max_len=80)
         if clean and clean not in {".", ".."}:
             parts.append(clean)
-    return os.path.join(*parts) if parts else OBSIDIAN_SUBDIR
+    return _obsidian_relpath(*parts) if parts else OBSIDIAN_SUBDIR
 
 
 def build_message_hash(messages):
@@ -1375,7 +1389,11 @@ class KnowledgeStore:
             conn.close()
 
     def full_obsidian_path(self, obsidian_path):
-        return os.path.join(self.obsidian_root, obsidian_path) if obsidian_path else ""
+        logical_path = _obsidian_relpath(obsidian_path)
+        return (
+            os.path.join(self.obsidian_root, *logical_path.split("/"))
+            if logical_path else ""
+        )
 
     @staticmethod
     def _prepare_candidate_for_context(candidate, ctx, config):
@@ -1813,7 +1831,9 @@ class KnowledgeStore:
         lines.extend(["", "## 来源"])
         for event in events:
             senders = ", ".join(_json_loads(event["senders_json"]))
-            when = event["window_end"] or datetime.fromtimestamp(event["created_at"]).strftime("%Y-%m-%d %H:%M")
+            when = event["window_end"] or local_datetime_from_timestamp(
+                event["created_at"]
+            ).strftime("%Y-%m-%d %H:%M")
             label = RELATION_LABELS.get(event["relation"], event["relation"])
             window = f"{event['window_start']} ~ {event['window_end']}".strip(" ~")
             lines.append(f"- {when} · {label} · {senders or '未知'} · {window}")
@@ -1841,7 +1861,8 @@ class KnowledgeStore:
         current_path="",
         reserved_paths=None,
     ):
-        reserved_paths = set(reserved_paths or [])
+        reserved_paths = {_obsidian_relpath(path) for path in (reserved_paths or [])}
+        current_path = _obsidian_relpath(current_path)
         chat_part = safe_path_part(vault_chat_name or source_chat, "未命名群聊", max_len=80)
         category_part = safe_path_part(category)
         links = []
@@ -1855,10 +1876,15 @@ class KnowledgeStore:
             files = _normalize_file_refs(_json_loads(row["files_json"]))
         title_part = safe_path_part(_display_title(title, links, files), "关注内容", max_len=90)
         filename = title_part
-        rel_path = os.path.join(self.obsidian_subdir, chat_part, category_part, f"{filename}.md")
+        rel_path = _obsidian_relpath(
+            self.obsidian_subdir, chat_part, category_part, f"{filename}.md",
+        )
         existing = conn.execute(
-            "SELECT topic_id FROM topics WHERE obsidian_path = ? AND topic_id != ?",
-            (rel_path, topic_id),
+            """
+            SELECT topic_id FROM topics
+            WHERE obsidian_path IN (?, ?) AND topic_id != ?
+            """,
+            (rel_path, rel_path.replace("/", "\\"), topic_id),
         ).fetchone()
         full_path = self.full_obsidian_path(rel_path)
         if (
@@ -1871,10 +1897,18 @@ class KnowledgeStore:
         date_part = safe_path_part(_compact_path_date(first_seen), "", max_len=5)
         if date_part:
             dated_filename = f"{date_part} {title_part}".strip()
-            dated_rel_path = os.path.join(self.obsidian_subdir, chat_part, category_part, f"{dated_filename}.md")
+            dated_rel_path = _obsidian_relpath(
+                self.obsidian_subdir,
+                chat_part,
+                category_part,
+                f"{dated_filename}.md",
+            )
             dated_existing = conn.execute(
-                "SELECT topic_id FROM topics WHERE obsidian_path = ? AND topic_id != ?",
-                (dated_rel_path, topic_id),
+                """
+                SELECT topic_id FROM topics
+                WHERE obsidian_path IN (?, ?) AND topic_id != ?
+                """,
+                (dated_rel_path, dated_rel_path.replace("/", "\\"), topic_id),
             ).fetchone()
             dated_full_path = self.full_obsidian_path(dated_rel_path)
             if (
@@ -1883,7 +1917,12 @@ class KnowledgeStore:
                 and (not os.path.exists(dated_full_path) or dated_rel_path == current_path)
             ):
                 return dated_rel_path
-        return os.path.join(self.obsidian_subdir, chat_part, category_part, f"{filename}-{topic_id}.md")
+        return _obsidian_relpath(
+            self.obsidian_subdir,
+            chat_part,
+            category_part,
+            f"{filename}-{topic_id}.md",
+        )
 
     def _chat_folder_from_path(self, obsidian_path):
         parts = [p for p in re.split(r"[/\\]+", str(obsidian_path or "")) if p]
@@ -1953,8 +1992,7 @@ class KnowledgeStore:
             "scope": scope,
             "chat": chat,
             "month": "",
-            "rel_path": os.path.join(self.obsidian_subdir, chat, OBSIDIAN_DATE_INDEX_FILENAME)
-            if chat else os.path.join(self.obsidian_subdir, OBSIDIAN_DATE_INDEX_FILENAME),
+            "rel_path": _obsidian_relpath(self.obsidian_subdir, chat, OBSIDIAN_DATE_INDEX_FILENAME),
             "topics": topics,
             "include_chat": include_chat,
             "archives": [],
@@ -1962,8 +2000,8 @@ class KnowledgeStore:
 
     def _date_index_archive_dir_rel_path(self, chat):
         if chat:
-            return os.path.join(self.obsidian_subdir, chat, "按日期")
-        return os.path.join(self.obsidian_subdir, "按日期")
+            return _obsidian_relpath(self.obsidian_subdir, chat, "按日期")
+        return _obsidian_relpath(self.obsidian_subdir, "按日期")
 
     def _date_index_specs(self, topics=None):
         if topics is None:
@@ -2191,7 +2229,7 @@ class KnowledgeStore:
                     handle.write(text)
                     handle.flush()
                     os.fsync(handle.fileno())
-                os.replace(tmp_path, target)
+                _atomic_replace(tmp_path, target)
                 tmp_path = ""
             finally:
                 if fd >= 0:
@@ -3310,7 +3348,7 @@ class KnowledgeStore:
 
     @staticmethod
     def _now_text(ts):
-        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+        return local_datetime_from_timestamp(ts).strftime("%Y-%m-%d %H:%M")
 
 
 def normalize_candidate(decision):

@@ -3,7 +3,7 @@ import io
 import json
 import os
 import errno
-import fcntl
+from core import file_lock as fcntl
 import shutil
 import sqlite3
 import stat

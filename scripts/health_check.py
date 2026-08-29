@@ -191,6 +191,10 @@ def _sensitive_log_status(delete: bool = False) -> tuple[str, bool]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if sys.platform == "win32":
+        from scripts.windows_setup import main as windows_main
+
+        return windows_main()
     parser = argparse.ArgumentParser(description="Print local we-groupchat-obsidian health status.")
     parser.add_argument(
         "--sensitive",

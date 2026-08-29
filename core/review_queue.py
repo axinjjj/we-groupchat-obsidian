@@ -15,6 +15,7 @@ from typing import Iterable
 
 from .config import DATA_DIR, ensure_private_dir, ensure_private_file
 from .link_preview import is_wechat_record_url
+from .source_contract import local_datetime_from_timestamp
 
 QUEUE_DIR = os.path.join(DATA_DIR, "review_queue")
 PENDING_FILE = "pending.jsonl"
@@ -154,7 +155,7 @@ P2_KEYWORDS = (
 
 
 def _now_text(now_func=time.time) -> str:
-    return datetime.fromtimestamp(now_func()).isoformat(timespec="seconds")
+    return local_datetime_from_timestamp(now_func()).isoformat(timespec="seconds")
 
 
 def _clean_text(value, limit=400) -> str:

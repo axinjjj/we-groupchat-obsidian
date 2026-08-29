@@ -18,6 +18,7 @@ from urllib.parse import quote
 import zstandard as zstd
 
 from .decryptor import WALSnapshotError, decrypt_database, decrypt_wal
+from .config import _atomic_replace, ensure_private_dir, ensure_private_file
 
 _zstd_dctx = zstd.ZstdDecompressor()
 
@@ -342,12 +343,8 @@ class WeChatDB:
             source_identity.encode("utf-8")
         ).hexdigest()
         self.cache_dir = os.path.join(self.CACHE_DIR, self.cache_namespace)
-        os.makedirs(self.cache_dir, exist_ok=True)
-        try:
-            os.chmod(self.CACHE_DIR, 0o700)
-            os.chmod(self.cache_dir, 0o700)
-        except OSError:
-            pass
+        ensure_private_dir(self.CACHE_DIR)
+        ensure_private_dir(self.cache_dir)
 
     @staticmethod
     def _file_identity(path):
@@ -442,10 +439,7 @@ class WeChatDB:
                 destination.close()
             if source is not None:
                 source.close()
-        try:
-            os.chmod(pinned, 0o600)
-        except OSError:
-            pass
+        ensure_private_file(pinned)
         self._source_snapshot_paths[rel_path] = pinned
         return pinned
 
@@ -536,12 +530,10 @@ class WeChatDB:
                     or self._file_identity(wal_path) != wal_identity
                 ):
                     continue
-                try:
-                    os.chmod(temp_path, 0o600)
-                except OSError:
-                    pass
-                os.replace(temp_path, cache_path)
+                ensure_private_file(temp_path)
+                _atomic_replace(temp_path, cache_path)
                 temp_path = ""
+                ensure_private_file(cache_path)
             except WALSnapshotError as exc:
                 raise WeChatSourceDegraded("source_snapshot_failed") from exc
             finally:

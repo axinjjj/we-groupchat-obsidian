@@ -1,4 +1,4 @@
-"""Installed-app Google Drive OAuth with PKCE and Keychain refresh-token storage."""
+"""Installed-app Google Drive OAuth with PKCE and OS credential storage."""
 from __future__ import annotations
 
 import base64
@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 
-from .config import DATA_DIR, ensure_private_dir
+from .config import DATA_DIR, _atomic_replace, ensure_private_dir, ensure_private_file
 from .keychain import delete_key, load_key, save_key
 
 
@@ -59,9 +59,9 @@ def _atomic_private_json(path: str, payload: dict) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_path, path)
+        _atomic_replace(temp_path, path)
         temp_path = ""
-        os.chmod(path, 0o600)
+        ensure_private_file(path)
     finally:
         if fd >= 0:
             os.close(fd)

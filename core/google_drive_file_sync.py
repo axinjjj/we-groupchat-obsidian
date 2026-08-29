@@ -1,7 +1,6 @@
 """Selected-chat file discovery, shared-CAS preservation, and Google Drive projection."""
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import mimetypes
@@ -15,6 +14,8 @@ import urllib.parse
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
+
+from . import file_lock as fcntl
 
 from .attachment_archive import AttachmentArchive
 from .config import DATA_DIR, selected_drive_sync_chats

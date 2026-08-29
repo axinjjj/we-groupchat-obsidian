@@ -14,7 +14,10 @@ class NotificationTargetTests(unittest.TestCase):
     def test_notification_data_for_path_expands_to_absolute_path(self):
         data = notification_data_for_path("~/note.md")
 
-        self.assertEqual(data["open_path"], os.path.expanduser("~/note.md"))
+        self.assertEqual(
+            data["open_path"],
+            os.path.abspath(os.path.expanduser("~/note.md")),
+        )
 
     def test_target_path_from_notification_returns_existing_path_only(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -40,9 +43,10 @@ class NotificationTargetTests(unittest.TestCase):
         self.assertEqual(commands[1], ["open", path])
 
     def test_non_markdown_notification_targets_keep_default_open(self):
-        commands = notification_open_commands_for_path("/tmp/export.txt")
+        path = os.path.abspath(os.path.join(tempfile.gettempdir(), "export.txt"))
+        commands = notification_open_commands_for_path(path)
 
-        self.assertEqual(commands, [["open", "/tmp/export.txt"]])
+        self.assertEqual(commands, [["open", path]])
 
 
 if __name__ == "__main__":

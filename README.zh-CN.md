@@ -2,19 +2,21 @@
 
 本地优先的微信群聊总结、关注推送与 Obsidian 知识库工具。
 
-当前状态：可完整运行的 source-distributed macOS app。它已经拥有菜单栏 app、MCP Server、
-operator CLI、持久化本地状态、recovery/backup workers 和完整 regression suite；请先读完
-数据流和账号安全边界，再在真实聊天数据上使用。当前不分发 bundled Python runtime
-或已签名 installer。
+当前状态：可完整运行的 source-distributed macOS app，并提供 Windows 微信 4.x 适配预览。
+原有数据库、总结、关注推送、Obsidian 与 MCP 主链仍是 canonical implementation；Windows
+只补 source discovery、经验证的逐库密钥派生、托盘适配、凭据管理器和启动/自启边界。
+请先读完平台限制、数据流和账号安全边界，再在真实聊天数据上使用。当前不分发 bundled
+Python runtime 或已签名 installer。
 
-一个本地优先的 macOS 微信群聊总结工具。它读取你电脑上的微信本地数据库，生成群聊摘要、关键词搜索结果，并把值得关注的新消息整理成 Obsidian-friendly Markdown 笔记。
+一个本地优先的桌面微信群聊总结工具。它读取你电脑上的微信本地数据库，生成群聊摘要、关键词搜索结果，并把值得关注的新消息整理成 Obsidian-friendly Markdown 笔记。
 
-它不是微信/Tencent 官方软件，不是微信机器人，不是员工监控工具；当你启用云端 AI、远程链接预览或 MCP 发送时，它也不是完全离线工具。它不接入微信官方/非官方接口，也不会替你把聊天记录上传到项目作者的服务器。所有运行状态、数据库 key、知识库和导出文件默认都保存在你自己的 Mac 上。
+它不是微信/Tencent 官方软件，不是微信机器人，不是员工监控工具；当你启用云端 AI、远程链接预览或 MCP 发送时，它也不是完全离线工具。它不接入微信官方/非官方接口，也不会替你把聊天记录上传到项目作者的服务器。所有运行状态、数据库 key、知识库和导出文件默认都保存在你自己的电脑上。
 
 项目来源说明：本项目是基于 [Qizhan7/mac-wechat-summary](https://github.com/Qizhan7/mac-wechat-summary) 的 standalone derivative。原项目打下了 macOS 菜单栏总结、本地微信数据库读取和 MCP 访问的基础；这个仓库没有挂在 GitHub fork network 里，也不作为 upstream PR 分支维护，而是继续发展成一个独立的 local-first Obsidian workflow 项目。见 [NOTICE.md](NOTICE.md)。
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue)
-![macOS](https://img.shields.io/badge/macOS-only-lightgrey)
+![macOS](https://img.shields.io/badge/macOS-supported-brightgreen)
+![Windows](https://img.shields.io/badge/Windows-preview-yellow)
 ![License](https://img.shields.io/badge/License-AGPL--3.0-blue)
 
 ## Obsidian 输出预览
@@ -152,7 +154,7 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
   显式授权，重启后必定归零，也不会从 config 恢复；关闭后，in-flight resolver 会在下一次读取附件
   bytes 之前取消。Links-only backfill 不读取附件 cache。
 - 聊天内容会发送给你自己配置的 AI provider。使用 Ollama 本地模型时，内容可以完全不离开本机；使用云端 provider 时，请按对应服务的隐私规则自行判断。
-- API Key 存储在 macOS Keychain，不写入 repo。
+- API Key 存储在 macOS 钥匙串或 Windows 凭据管理器，不写入 repo。
 - 本地配置、书签、monitor state、数据库 key、日志、SQLite DB 和 Markdown 导出默认在 `~/.we-groupchat-obsidian/` 或你的 Obsidian vault 中，不应该提交到 git。旧 `~/.wechat-summary/` 只作为本机 migration/compatibility 路径保留。
 - Attachment catalog、本地 archive、source-guard state/receipts 和 backup snapshot manifest/catalog 都是私有 runtime data。
   Archive object 含原始附件 bytes，绝不能提交或公开。
@@ -160,7 +162,7 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
   对应 provider 可能按自己的隐私规则接收附件 bytes 和 manifest。Filesystem snapshot backend 仍然没有
   provider API，也不能验证 provider-side upload 是否完成。
 - Direct Google Drive sync 是不同的 opt-in backend，只请求 `drive.file` OAuth scope。Refresh token 只在
-  macOS Keychain，access token 只在内存；用户自己的 Installed desktop app OAuth client JSON 会复制到
+  平台凭据存储，access token 只在内存；用户自己的 Installed desktop app OAuth client JSON 会复制到
   `0600` private runtime storage，绝不能提交。被选群聊的 configured stable alias、文件名与文件 bytes 会
   上传到用户自己的 Drive；raw `@chatroom` username、消息 body/XML、`source_message_id`、`wxid` 与
   WeChat cache path 不进入 Drive metadata。程序不删除 Drive 文件、微信 cache 或本地 CAS object。
@@ -200,11 +202,11 @@ internal continuity docs。
 
 ### 前置条件
 
-- macOS 12+
+- macOS 12+ 与 macOS 微信，或 Windows 与 Windows 微信 4.x
 - Python 3.10+
-- 微信桌面版，并已登录
+- 微信桌面版已登录并完成本地数据同步
 - 至少一个 AI provider API Key，或本地 Ollama
-- Xcode Command Line Tools，用于编译 key scanner
+- Xcode Command Line Tools 仅 macOS 需要，用于编译 key scanner
 - Obsidian 可选；只想生成 Markdown 文件时不需要安装
 
 支持的 AI provider：
@@ -218,7 +220,7 @@ internal continuity docs。
 选择 DeepSeek 且没有显式填写 `ai_model` 时，当前默认使用
 `deepseek-v4-flash`；仍可在配置中指定其他兼容 model。
 
-### 快速开始
+### macOS 快速开始
 
 ```bash
 git clone https://github.com/IndelibleVivi/we-groupchat-obsidian.git
@@ -236,6 +238,46 @@ cd we-groupchat-obsidian
 
 这一步可能会退出微信，并要求输入 Mac 登录密码。输入密码时终端不显示字符是正常的。
 
+### Windows 适配预览
+
+```powershell
+git clone https://github.com/IndelibleVivi/we-groupchat-obsidian.git
+cd we-groupchat-obsidian
+.\启动.cmd
+```
+
+Windows 启动器只使用当前 checkout 的 `.venv`，首次安装或依赖变化时先征求同意；它会
+自动发现 Windows 微信 4.x 的 `db_storage`，再通过 Windows 托盘 adapter 启动同一份
+`app.py`。仓库固定了 `.cmd` 的 CRLF 和 `.ps1` 的 UTF-8 BOM/CRLF，兼容 Windows
+PowerShell 5.1 与含中文的 checkout path。
+
+Windows 微信 4.x 的加密数据库仍需要当前账户的 64 位十六进制 `raw key`。WGO 不会
+下载、捆绑或执行第三方 key extractor；请只使用你独立信任、确认有权使用的方法取得
+raw key，然后在启动器的遮蔽输入框中输入，或运行：
+
+```powershell
+.\启动.cmd --refresh-data-source
+```
+
+raw key 不接受命令行明文参数，也绝不写入 config、log 或计划任务参数。普通刷新只在
+内存中为已有数据库逐个派生页密钥。WGO 继续使用原实现的 page HMAC 验证，只把验证
+成功的逐库密钥 map 写入当前 Windows 用户 ACL 保护的 runtime 目录；错误 raw key 不会
+覆盖已有 map。
+
+`--install-autostart` 是普通刷新“不留存 raw key”规则的显式例外：命令会先遮蔽输入并完整验证 raw key，
+再把它保存到 Windows 凭据管理器，并创建当前用户的计划任务。任务忽略重复实例，进程异常
+退出后按一分钟间隔最多重启三次；启动或发现新增必需数据库时，WGO 可以用这份凭据自动
+重新派生并验证逐库密钥。这里的“自动续期”只指从已记住的 raw key 补齐新数据库分片；WGO 不会
+扫描内存或猜测已轮换的 raw key。如果账户 raw key 确实变了，重新运行 `--install-autostart`
+遮蔽输入并替换凭据。自启不会在后台静默升级已经变化的 Python 环境，拉取到依赖变化后
+应先手动运行一次 `启动.cmd`。`--uninstall-autostart` 会删除计划任务和被记住的 raw key，
+但不删除已经派生的逐库密钥。
+
+Windows 预览当前覆盖：加密 source 读取、托盘总结与搜索、关注推送/Obsidian 输出、
+MCP 读取、Unicode 剪贴板、Windows 凭据管理器与当前用户登录自启。macOS 微信重签名、
+source guard、通知点击跳转、MCP 真实 UI 发送、py2app 打包，以及高级附件/mounted-backup
+链仍是 macOS-only 或只在 macOS 验证；这里不把它们宣称为 Windows 已支持。
+
 ### 文档地图
 
 - `README.md` / `README.zh-CN.md`：当前用户、operator、隐私和项目概览 authority。
@@ -247,6 +289,20 @@ cd we-groupchat-obsidian
   projection、handoff、status 与 failure semantics 的 formal spec。
 
 ## 常用命令
+
+Windows 入口：
+
+| 命令 | 用途 |
+| --- | --- |
+| `.\启动.cmd` | 经同意检查/安装依赖，必要时初始化数据源，再启动托盘 app |
+| `.\启动.cmd --setup-only` | 只检查依赖并输出 privacy-safe 数据源状态 |
+| `.\启动.cmd --health-check` | 执行 Windows 数据源健康检查 |
+| `.\启动.cmd --refresh-data-source` | 遮蔽输入 raw key，重建经验证的逐库密钥 |
+| `.\启动.cmd --install-autostart` | 验证/记住 raw key，再安装当前用户登录自启与有界异常保活 |
+| `.\启动.cmd --uninstall-autostart` | 删除计划任务和记住的 raw key |
+| `.\启动.cmd --autostart-status` | 查看 Windows 计划任务状态 |
+
+macOS 入口：
 
 Canonical Finder helper 统一放在 `launchers/`，都可以双击运行或在 Terminal
 执行。根目录只保留一个极薄的 `启动.command` compatibility entrypoint，供已有
@@ -394,7 +450,7 @@ descendant 已是 symlink 或非目录，会在写 generated file 或 target byt
 
 Mounted target 另有一个真正给人打开的入口：
 `<target>/wgo-resource-backup/00-打开微信资源备份.md`；菜单栏的
-`📂 在 Finder 打开文件备份` 会直接在 Finder 中 reveal 它。入口下的 `文件备份` 页面只列文件，
+`📂 在文件夹中显示文件备份` 会直接在系统文件管理器中 reveal 它。入口下的 `文件备份` 页面只列文件，
 按显式选中的群聊与月份分组，但只收录真正 delivered 的文件；同一 digest 只出现一行，并显示它在
 群聊记录中的 occurrence 次数。独立的 `待补齐附件` family 会按尚未尝试、cache unavailable、retry、
 本地空间、需处理、awaiting handoff 与 unknown 分组，且不生成可点击 target link。Portal 同时报告
@@ -627,7 +683,7 @@ MCP 默认偏只读，但 read tools 会把本地 chat-derived data 暴露给 MC
 ## 项目结构
 
 ```text
-app.py                   # macOS 菜单栏应用入口
+app.py                   # 共享菜单栏 / 托盘应用入口
 mcp_server.py            # FastMCP Server 入口
 setup.py                 # py2app 打包入口
 ai/                      # 可替换 AI provider 适配层
@@ -642,7 +698,7 @@ core/
   wechat_source_guard.py        # 长驻 app 内的 optional source guard
   google_drive_*.py             # 独立 advanced Drive API queue/OAuth/projection
   mcp_send_*.py / sender.py     # 两步确认 policy 与可选 UI send
-ui/                      # 可复用 macOS UI 组件
+ui/                      # 可复用 UI 与 Windows rumps adapter
 scripts/
   configure_monitor.py / health_check.py / refresh_data_source.py
   backfill_history.py / catch_up_monitor.py / organize_obsidian.py
@@ -650,12 +706,13 @@ scripts/
   google_drive_file_sync.py / wechat_source_guard.py
   daily_digest.py / review_queue.py / repair_relations.py
   autostart.py / build_share_package.py
-launchers/               # canonical Finder 双击 .command entrypoints
+launchers/               # canonical macOS .command 与 Windows PowerShell entrypoints
 tests/                   # 可 import 的 unittest package
 c_src/                   # key scanner C 代码
 resources/               # 图标资源
 docs/                    # 用户、运维、架构与 formal contract 文档
 启动.command             # 已有 source install / LaunchAgent 的 root compatibility stub
+启动.cmd                 # Windows 双击 compatibility stub
 ```
 
 Repo root 只保留 `app.py`、`mcp_server.py` 与 `setup.py` 三个明确的应用/打包 entrypoint，
@@ -712,6 +769,14 @@ runtime 都使用绝对 checkout path。只有当这些表面改为 installed ex
 for launcher in 启动.command launchers/*.command; do bash -n "$launcher"; done
 ```
 
+Windows 使用 checkout 内的精确解释器并验证原生入口：
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest tests.test_windows_key_extractor tests.test_windows_rumps tests.test_windows_launcher tests.test_windows_autostart tests.test_windows_runtime tests.test_windows_console
+.\.venv\Scripts\python.exe -m compileall -q app.py mcp_server.py setup.py ai core ui scripts tests
+cmd.exe /d /c "启动.cmd --setup-only --yes --no-pause"
+```
+
 部分测试会 import macOS/AppKit 或加密相关依赖；如果本地环境卡在 import 阶段，先用上面的窄测试确认核心逻辑，再单独排查依赖。
 
 ## 常见问题
@@ -753,11 +818,11 @@ macOS 菜单栏图标太多、刘海区域或菜单栏管理工具都可能把�
 
 ## 公开仓库状态
 
-这个 repo 不应该包含个人聊天数据库、导出 Markdown、API Key、Keychain 内容、日志、`.venv`、`~/.we-groupchat-obsidian/`、legacy `~/.wechat-summary/` 或任何微信账号标识。`.gitignore` 已覆盖常见运行文件，但公开前仍建议手动检查 `git status --short` 和 secret pattern scan。
+这个 repo 不应该包含个人聊天数据库、导出 Markdown、API Key、钥匙串/凭据管理器内容、日志、`.venv`、`~/.we-groupchat-obsidian/`、legacy `~/.wechat-summary/` 或任何微信账号标识。`.gitignore` 已覆盖常见运行文件，但公开前仍建议手动检查 `git status --short` 和 secret pattern scan。
 
 ## 和原仓库相比改了什么
 
-这个 fork 没有改变原项目的核心方向：仍然是在用户自己的 Mac 上读取本地微信数据库，用用户自己配置的 AI provider 做群聊总结。这里的大部分改动来自实际使用反馈：菜单栏图标找不到怎么办，微信更新后 key 失效怎么办，LaunchAgent 显示 loaded 但没真的运行怎么办，关注推送如何避免变成噪音，Obsidian 输出怎样才能长期检索和迁移。
+这个 fork 没有改变原项目的核心方向：仍然是在用户自己的电脑上读取本地微信数据库，用用户自己配置的 AI provider 做群聊总结。这里的大部分改动来自实际使用反馈：菜单栏/托盘图标找不到怎么办，微信更新后 key 失效怎么办，后台启动显示已配置但没真的运行怎么办，关注推送如何避免变成噪音，Obsidian 输出怎样才能长期检索和迁移。
 
 - 更完整的本地运维入口：`setup-only`、健康检查、关注推送配置、刷新数据源、历史回填、整理 Obsidian 输出、安装/卸载自启动，都有 CLI 或 `.command` 入口。
 - 微信更新恢复路径更明确：通过 `./launchers/健康检查.command` 判断 re-sign、missing keys、monitor、Obsidian、LaunchAgent 状态，再用 `./launchers/刷新数据源.command` 修复，不依赖菜单栏图标一定可见。

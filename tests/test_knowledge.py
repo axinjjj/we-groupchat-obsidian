@@ -6,7 +6,8 @@ import sqlite3
 import tempfile
 import threading
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 import core.knowledge as knowledge
@@ -32,6 +33,10 @@ def msg(ts, sender, text):
         "sender": sender,
         "text": text,
     }
+
+
+def obsidian_relpath(*parts):
+    return "/".join(parts)
 
 
 def msg_at(time_str, sender="示例成员甲", text="测试消息"):
@@ -390,7 +395,7 @@ class KnowledgeStoreTests(unittest.TestCase):
             candidate(links=[]), self.messages, self.config, {"relation": "new"}
         )
         expected_id = f"wg_topic_{result['topic_id']}"
-        expected_generated_at = datetime.fromtimestamp(1000).astimezone().isoformat(
+        expected_generated_at = datetime.fromtimestamp(1000, timezone.utc).astimezone().isoformat(
             timespec="seconds"
         )
 
@@ -506,7 +511,7 @@ class KnowledgeStoreTests(unittest.TestCase):
         result = self.store.apply_event(candidate(links=[]), self.messages, config, {"relation": "new"})
 
         self.assertIn(
-            os.path.join("关注推送", "示例稳定群名", "AI模型"),
+            obsidian_relpath("关注推送", "示例稳定群名", "AI模型"),
             result["obsidian_path"],
         )
         self.assertNotIn("示例技术群改名后", result["obsidian_path"])
@@ -892,7 +897,7 @@ class KnowledgeStoreTests(unittest.TestCase):
         self.assertEqual(topics[0]["taxonomy_profile"], HUMAN_AI_INTIMACY_PROFILE)
         self.assertEqual(topics[0]["taxonomy_version"], 2)
         self.assertIn(
-            os.path.join("关注推送", "示例人机互动群", "互动实验与玩法"),
+            obsidian_relpath("关注推送", "示例人机互动群", "互动实验与玩法"),
             result["obsidian_path"],
         )
 
@@ -948,7 +953,7 @@ class KnowledgeStoreTests(unittest.TestCase):
 
         self.assertEqual(topic["category"], "资源线索")
         self.assertIn(
-            os.path.join("关注推送", "示例人机互动群", "资源线索"),
+            obsidian_relpath("关注推送", "示例人机互动群", "资源线索"),
             result["obsidian_path"],
         )
 
@@ -975,7 +980,7 @@ class KnowledgeStoreTests(unittest.TestCase):
         self.assertEqual(after["category"], "互动实验与玩法")
         self.assertEqual(after["obsidian_path"], before["obsidian_path"])
         self.assertIn(
-            os.path.join("关注推送", "示例人机互动群", "互动实验与玩法"),
+            obsidian_relpath("关注推送", "示例人机互动群", "互动实验与玩法"),
             after["obsidian_path"],
         )
 
@@ -997,7 +1002,7 @@ class KnowledgeStoreTests(unittest.TestCase):
         self.assertEqual(topic["category"], "待归类")
         self.assertEqual(topic["taxonomy_profile"], HUMAN_AI_INTIMACY_PROFILE)
         self.assertIn(
-            os.path.join("关注推送", "Example Interaction Lab", "待归类"),
+            obsidian_relpath("关注推送", "Example Interaction Lab", "待归类"),
             result["obsidian_path"],
         )
 
@@ -1019,7 +1024,7 @@ class KnowledgeStoreTests(unittest.TestCase):
         self.assertEqual(topic["category"], "AI伴侣交互")
         self.assertEqual(topic["taxonomy_profile"], "")
         self.assertIn(
-            os.path.join("关注推送", "其他群", "AI伴侣交互"),
+            obsidian_relpath("关注推送", "其他群", "AI伴侣交互"),
             result["obsidian_path"],
         )
 
@@ -1628,8 +1633,8 @@ class KnowledgeStoreTests(unittest.TestCase):
         topics = {t["topic_key"]: t for t in self.store.list_topics()}
         self.assertEqual(topics["example-model-thinking-tips"]["category"], "技术方法")
         self.assertEqual(topics["self-app-feature"]["category"], "自建app")
-        self.assertIn(os.path.join("关注推送", "示例技术群", "技术方法"), topics["example-model-thinking-tips"]["obsidian_path"])
-        self.assertIn(os.path.join("关注推送", "示例技术群", "自建app"), topics["self-app-feature"]["obsidian_path"])
+        self.assertIn(obsidian_relpath("关注推送", "示例技术群", "技术方法"), topics["example-model-thinking-tips"]["obsidian_path"])
+        self.assertIn(obsidian_relpath("关注推送", "示例技术群", "自建app"), topics["self-app-feature"]["obsidian_path"])
         self.assertIn("Example Model 2.0 思考链提取技巧", topics["example-model-thinking-tips"]["obsidian_path"])
         self.assertIn("自建 app 新功能讨论", topics["self-app-feature"]["obsidian_path"])
         self.assertEqual(result["removed_empty_dirs"], 2)
@@ -2112,7 +2117,7 @@ class KnowledgeStoreTests(unittest.TestCase):
         self.assertEqual(event["taxonomy_profile"], HUMAN_AI_INTIMACY_PROFILE)
         self.assertEqual(event["taxonomy_version"], 2)
         self.assertIn(
-            os.path.join("关注推送", "示例人机互动群", "模型与平台"),
+            obsidian_relpath("关注推送", "示例人机互动群", "模型与平台"),
             topic["obsidian_path"],
         )
 
@@ -2195,11 +2200,11 @@ class KnowledgeStoreTests(unittest.TestCase):
         self.assertEqual(len(to_paths), 2)
         self.assertEqual(len(set(to_paths)), 2)
         self.assertIn(
-            os.path.join("关注推送", "示例人机互动群", "模型与平台", "同名主题.md"),
+            obsidian_relpath("关注推送", "示例人机互动群", "模型与平台", "同名主题.md"),
             to_paths,
         )
         self.assertIn(
-            os.path.join("关注推送", "示例人机互动群", "工具与方法", "同名主题.md"),
+            obsidian_relpath("关注推送", "示例人机互动群", "工具与方法", "同名主题.md"),
             to_paths,
         )
 
@@ -2380,7 +2385,7 @@ class KnowledgeStoreTests(unittest.TestCase):
         self.assertIn('  - "file"', md)
         self.assertIn("### 文件", md)
         self.assertIn("test workflow.zip", md)
-        self.assertIn("file://" + file_dir.replace(" ", "%20"), md)
+        self.assertIn(Path(file_dir).resolve().as_uri(), md)
 
     def test_attachment_mention_is_registered_with_event_transaction(self):
         messages = [

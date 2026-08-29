@@ -7,13 +7,41 @@
 
   https://github.com/IndelibleVivi/we-groupchat-obsidian/blob/main/README.zh-CN.md
 
-这个项目是 source-distributed macOS menu-bar app。公开 repo 是正式分发入口；
-目前不提供已签名 installer、.dmg 或 bundled Python runtime。
+这个项目是 source-distributed macOS menu-bar / Windows tray app。公开 repo 是
+正式分发入口；目前不提供已签名 installer、.dmg 或 bundled Python runtime。
 
 
 ============================================
     第一次运行
 ============================================
+
+Windows 微信 4.x：
+
+1. 从公开 repo clone：
+
+     git clone https://github.com/IndelibleVivi/we-groupchat-obsidian.git
+     cd we-groupchat-obsidian
+     .\启动.cmd
+
+2. 启动器会先征求依赖安装同意，自动发现 db_storage。首次没有数据库密钥时，
+   按提示遮蔽输入当前账户 64 位十六进制 raw key。也可以单独运行：
+
+     .\启动.cmd --refresh-data-source
+
+   WGO 不捆绑/下载第三方 key extractor。raw key 不进命令行、config、log 或计划任务
+   参数；普通刷新只在内存中派生逐库密钥，且只保存通过原 page HMAC 验证的结果。
+
+3. Windows 登录自启不会默认安装。需要时显式运行：
+
+     .\启动.cmd --install-autostart
+
+   该命令会重新遮蔽输入并验证 raw key，再把它保存到 Windows 凭据管理器；计划任务
+   负责登录启动、拒绝重复实例和异常退出后一分钟间隔最多三次重启。发现新增必需数据库
+   时会自动重新派生/验证逐库密钥。它不会扫描内存或猜测已轮换的 raw key；如果
+   账户 raw key 变了，重新运行 `--install-autostart` 遮蔽输入一次。卸载自启会同时
+   删除计划任务和记住的 raw key。
+
+macOS：
 
 1. 从公开 repo clone：
 
@@ -33,10 +61,11 @@
 4. 菜单栏出现 💬 图标后，在“设置”里选择 AI provider 并填写 API Key。
 
 支持通义千问（新安装默认）、DeepSeek、Claude、OpenAI、Ollama 和自定义
-OpenAI-compatible endpoint。API Key 存在 macOS Keychain，不写入 repo。
+OpenAI-compatible endpoint。API Key 存在 macOS 钥匙串或 Windows 凭据管理器，
+不写入 repo。
 云端 provider 会收到你要求总结/判断的聊天文本；需要本地 AI 时使用 Ollama。
 
-macOS 可能在菜单 app 启动后询问一次 WeChat App Data 访问。source guard、
+macOS 可能在菜单 app 启动后询问一次 WeChat App Data 访问。macOS source guard、
 monitor 与 mounted-resource timer 都由这只长驻 app 负责，不会靠每几分钟启动
 短命 worker 来反复索取授权。附件 bytes 解析还需要单独开启，授权只在当前
 app process/session 内存里有效，重启后自动关闭。
@@ -57,8 +86,21 @@ app process/session 内存里有效，重启后自动关闭。
 
      ./启动.command
 
-前台启动时关闭该 Terminal 或按 Ctrl+C 会结束这次 app process。需要登录自启时，
-请使用下面的安装入口；不要自己复制或改写 LaunchAgent plist。
+启动 Windows 托盘 app：
+
+     .\启动.cmd
+
+Windows 常用维护入口：
+
+     .\启动.cmd --setup-only
+     .\启动.cmd --health-check
+     .\启动.cmd --refresh-data-source
+     .\启动.cmd --install-autostart
+     .\启动.cmd --uninstall-autostart
+
+前台启动时关闭该 Terminal 或按 Ctrl+C 会结束这次 app process。Windows 请用
+`--install-autostart` 管理计划任务；macOS 请用下面的安装入口，不要自己复制或改写
+LaunchAgent plist。
 
 常用 Finder/Terminal helper：
 
@@ -106,7 +148,7 @@ archive；Obsidian note 可以链接到私有归档 object，但附件 bytes 不
   source guard 和 MCP 真实发送；不要因为看到命令存在就把它们当成已经启用。
 - Mounted target 只证明目标 filesystem bytes/readback，不证明云端 provider 已上传。
 - 每轮 mounted backup 会维护 wgo-resource-backup/00-打开微信资源备份.md；也可从菜单
-  “在 Finder 打开文件备份”直接进入。入口分成“文件备份”“待补齐附件”“资源索引”：
+  “在文件夹中显示文件备份”直接进入。入口分成“文件备份”“待补齐附件”“资源索引”：
   文件备份只列真正已交付的去重文件，并显示群聊出现次数；待补齐页按真实状态分组且没有
   target link。看到“本地缓存暂未找到”时，先在微信里重新打开或下载附件，再点立即更新。
   “已备份”只表示 mounted target 已交付并即时校验，不表示 provider 云端同步已经完成。
@@ -129,6 +171,11 @@ docs/resource-capture-and-mounted-backup-spec.md 为准。
 
      git pull --ff-only
      ./启动.command
+
+Windows 更新后运行：
+
+     git pull --ff-only
+     .\启动.cmd
 
 分享给别人时只发送公开 repo 或中文版 README 链接：
 
