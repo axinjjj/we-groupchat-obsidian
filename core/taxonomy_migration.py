@@ -27,7 +27,6 @@ _SCHEMA_VERSION = 2
 _RENAME_SWAP = 0x00000002
 _RENAME_EXCL = 0x00000004
 _RENAME_NOFOLLOW_ANY = 0x00000010
-_RENAME_RESOLVE_BENEATH = 0x00000020
 
 
 class MigrationError(RuntimeError):
@@ -324,19 +323,23 @@ def _probe_atomic_leaf_capabilities(inputs: dict, operation_namespace: str) -> N
                 os.fsync(fd)
             finally:
                 os.close(fd)
+        # Every operation is a validated single leaf beneath this already-open
+        # directory FD.  RENAME_NOFOLLOW_ANY is available across the supported
+        # macOS range; RENAME_RESOLVE_BENEATH was added only in macOS 26 and is
+        # unnecessary for these slash-free, dir-FD-relative names.
         _renameatx_np(
             probe_fd,
             "a",
             probe_fd,
             "c",
-            _RENAME_EXCL | _RENAME_NOFOLLOW_ANY | _RENAME_RESOLVE_BENEATH,
+            _RENAME_EXCL | _RENAME_NOFOLLOW_ANY,
         )
         _renameatx_np(
             probe_fd,
             "c",
             probe_fd,
             "b",
-            _RENAME_SWAP | _RENAME_NOFOLLOW_ANY | _RENAME_RESOLVE_BENEATH,
+            _RENAME_SWAP | _RENAME_NOFOLLOW_ANY,
         )
         if _read_at(probe_fd, "b", code="atomic_leaf_capability_unsupported")[0] != b"a":
             raise OSError(errno.EINVAL, "swap verification failed")
@@ -521,9 +524,7 @@ def _atomic_replace_generated(
             if before_rename is not None:
                 before_rename()
                 ledgered = True
-            rename_flags = (
-                _RENAME_EXCL | _RENAME_NOFOLLOW_ANY | _RENAME_RESOLVE_BENEATH
-            )
+            rename_flags = _RENAME_EXCL | _RENAME_NOFOLLOW_ANY
             try:
                 _renameatx_np(parent_fd, temp_leaf, parent_fd, leaf, rename_flags)
             except OSError as exc:
@@ -567,9 +568,7 @@ def _atomic_replace_generated(
             if before_rename is not None:
                 before_rename()
                 ledgered = True
-            rename_flags = (
-                _RENAME_SWAP | _RENAME_NOFOLLOW_ANY | _RENAME_RESOLVE_BENEATH
-            )
+            rename_flags = _RENAME_SWAP | _RENAME_NOFOLLOW_ANY
             try:
                 _renameatx_np(parent_fd, temp_leaf, parent_fd, leaf, rename_flags)
             except OSError as exc:
@@ -676,9 +675,7 @@ def _unlink_generated(
                 raise MigrationError(drift_code, "managed file identity changed")
         if before_rename is not None:
             before_rename()
-        rename_flags = (
-            _RENAME_EXCL | _RENAME_NOFOLLOW_ANY | _RENAME_RESOLVE_BENEATH
-        )
+        rename_flags = _RENAME_EXCL | _RENAME_NOFOLLOW_ANY
         try:
             _renameatx_np(
                 parent_fd, leaf, parent_fd, quarantine_leaf, rename_flags

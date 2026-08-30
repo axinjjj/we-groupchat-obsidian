@@ -31,6 +31,25 @@
 - `tests/` is an importable unittest package. New tests belong there and use
   `tests.<module>` for focused invocation.
 
+## Windows port staging
+
+- The full Windows programme contract, `WGO-WIN-SPEC-1`, is owner-authorized
+  external material. For `PR-W0.1`, `docs/WINDOWS-PORT-MAP.md` is the sole
+  in-repository executable authority: portability mapping, platform
+  contracts/factory, dependency markers, Windows import/compile CI and
+  documentation only.
+- `app.py` remains the macOS shell. W0.1 must not add Windows source reads, key
+  acquisition, monitor activation, attachment/backup behavior, tray UI,
+  autostart, packaging or message sending.
+- `core/platform/` owns behavior-free platform contracts and fail-closed
+  provider selection. Concrete lock/path/private-storage adapters begin in
+  W0.2; secrets/open/notification adapters begin in W0.3; source adapters begin
+  in W1.
+- `docs/WINDOWS-PORT-MAP.md` is the W0.1 module inventory. Every root,
+  `ai/`, `core/`, `ui/` and `scripts/` Python module must remain classified,
+  and only modules marked `windows-import-safe` enter the Windows import gate.
+  Import success is not evidence of Windows feature support.
+
 ## Durable and generated boundaries
 
 - SQLite/CAS ledgers are authoritative for durable derived state. Markdown,
@@ -76,6 +95,16 @@ shared code, packaging, public-boundary or runtime changes. Source completion,
 private/public publication, app-bundle rebuild, LaunchAgent reload and live
 acceptance are separate gates. Do not mutate live config/data or reload a live
 agent merely because source tests pass.
+
+For W0.1 on Windows, also run:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest tests.windows tests.test_repository_layout
+.\.venv\Scripts\python.exe -m compileall -q mcp_server.py ai core ui scripts tests
+```
+
+The portability workflow is the macOS regression authority; a Windows host
+cannot waive or simulate that gate.
 
 ## Review ref resolution
 

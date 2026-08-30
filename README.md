@@ -8,6 +8,13 @@ full regression suite; review the data-flow and account-safety notes before
 using it on real chat data. A bundled Python runtime or signed installer is not
 currently distributed.
 
+Windows port status: **W0.1 module inventory and import-boundary stage**. The
+complete W0 portability foundation is not yet finished. The repository now
+tracks an explicit module/import boundary and Windows CI, but W0.1 does not
+support Windows WeChat discovery, keys, database reads, monitoring, tray UI,
+backup, autostart, packaging, or sending. See
+[`docs/WINDOWS-PORT-MAP.md`](docs/WINDOWS-PORT-MAP.md) for the staged contract.
+
 A local-first macOS tool for reading your own WeChat desktop database, summarizing group chats, searching messages, and turning high-value group-chat updates into an Obsidian-friendly Markdown knowledge base.
 
 This is not official WeChat/Tencent software, not a WeChat bot, not employee-monitoring software, and not fully offline when you enable cloud AI, remote link preview, or MCP sending. It does not use a WeChat API, does not run a remote service, and does not send your chat history to this project. The app reads local database files on your Mac and calls the AI provider you configure.
