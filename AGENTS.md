@@ -9,6 +9,13 @@
   send tool names are inert `mcp_send_retired` stubs; legacy send config keys
   remain loadable but inactive. Do not restore sender/policy/confirmation
   modules or a send-side effect path.
+- `core/monitor_state.py::MonitorStateStore` is the sole monitor-checkpoint
+  write authority. Existing state migrates only after a valid parse; corrupt,
+  symlink or non-regular state fails closed. TopicMonitor commits one expected
+  revision after successful work and never advances state after an AI failure.
+  Catch-up apply must stop the managed LaunchAgent, acquire the same
+  `AppInstanceLock` as the menu app, hold it through backup/drain/projection/
+  validation/receipt, release it, and only then restore the LaunchAgent.
 - `setup.py` is the py2app packaging entrypoint. These are the only Python
   files that belong at repository root.
 - `core/` owns domain behavior, durable state, privacy boundaries, recovery,

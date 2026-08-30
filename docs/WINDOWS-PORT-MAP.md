@@ -73,6 +73,7 @@ root, `ai/`, `core/`, `ui/`, and `scripts/` Python module and imports every
 | `core/link_preview.py` | `windows-import-safe` | Platform-neutral URL extraction and preview logic. |
 | `core/mcp_config.py` | `windows-import-safe` | Pure configuration rendering; Windows command emission is activated later. |
 | `core/monitor.py` | `deferred-w0.2` | Transitively imports config/knowledge/review storage; Windows activation is W3. |
+| `core/monitor_state.py` | `deferred-w0.2` | Direct `fcntl` plus durable private-state semantics; the shared lock backend belongs to W0.2. |
 | `core/notification_identity.py` | `macos-only` | Foundation/app-bundle notification identity diagnostics. |
 | `core/notification_target.py` | `macos-only` | Emits the macOS `open` command; target-opening adapter is W0.3. |
 | `core/platform/__init__.py` | `windows-import-safe` | Exposes contracts/factory only; registers no concrete service. |

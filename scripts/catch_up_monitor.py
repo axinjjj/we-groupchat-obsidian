@@ -27,6 +27,7 @@ if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
 from core.config import DATA_DIR, active_monitor_chats, ensure_private_dir, ensure_private_file, load_config
+from core.app_runtime import AppAlreadyRunning, AppInstanceLock
 from core.daily_digest import _timezone, digest_output_path, write_daily_digest
 from core.key_extractor import get_cached_keys
 from core.knowledge import KNOWLEDGE_DB, KnowledgeStore, build_message_hash
@@ -332,7 +333,9 @@ def build_reconciliation_receipt(
         })
 
     validation_ok = bool(validation and validation.get("ok"))
-    launch_ok = not launch_agent.get("was_loaded") or bool(launch_agent.get("restored"))
+    # The receipt is durably written while the maintenance lock is still held;
+    # a previously loaded LaunchAgent is restored only after releasing it.
+    launch_ok = not launch_agent.get("was_loaded") or launch_agent.get("restored") is not False
     complete = bool(
         result
         and not result.get("blocked")
@@ -341,7 +344,10 @@ def build_reconciliation_receipt(
         and launch_ok
     )
     progressed = checkpoint_changed or any(row["pages"] for row in chat_rows)
-    if complete:
+    if outcome_override in {"menu_app_active", "maintenance_lock_busy"}:
+        state = "failed"
+        outcome = outcome_override
+    elif complete:
         state = "complete"
         outcome = outcome_override or "drained"
     elif progressed or projections:
@@ -563,9 +569,12 @@ def apply_catch_up(config: dict, chats: list[dict], db, args) -> int:
     transaction_error = ""
     receipt_error = ""
     receipt_path = None
+    receipt = None
     result = None
     projections = None
     validation = None
+    instance_lock = None
+    outcome_override = ""
     launch_agent = {
         "inspected": False,
         "was_loaded": False,
@@ -580,56 +589,75 @@ def apply_catch_up(config: dict, chats: list[dict], db, args) -> int:
         if original_status.loaded:
             print(f"暂停 LaunchAgent: {record.label}")
             _stop_launch_agent(record)
-        backup_path = backup_runtime_state(config, chats)
-        print(f"局部恢复备份（SQLite + checkpoints）: {backup_path}")
+        try:
+            instance_lock = AppInstanceLock().acquire()
+        except AppAlreadyRunning:
+            transaction_error = "menu_app_active"
+            outcome_override = "menu_app_active"
+        if instance_lock is not None:
+            backup_path = backup_runtime_state(config, chats)
+            print(f"局部恢复备份（SQLite + checkpoints）: {backup_path}")
 
-        monitors = []
-        for chat in chats:
-            chat_config = dict(config)
-            chat_config["monitor_chat_username"] = chat["username"]
-            chat_config["monitor_chat_display_name"] = chat["name"]
-            monitors.append((chat, TopicMonitor(
-                db,
-                chat_config,
-                state_file=state_file_for_chat(chat["username"]),
-            )))
-        result = drain_monitors(
-            monitors,
-            max_pages_per_chat=args.max_pages_per_chat,
-            max_minutes=args.max_minutes,
-        )
-        projections = rebuild_projections(config, result["affected_dates"])
-        validation = validate_knowledge_db(config)
+            monitors = []
+            for chat in chats:
+                chat_config = dict(config)
+                chat_config["monitor_chat_username"] = chat["username"]
+                chat_config["monitor_chat_display_name"] = chat["name"]
+                monitors.append((chat, TopicMonitor(
+                    db,
+                    chat_config,
+                    state_file=state_file_for_chat(chat["username"]),
+                )))
+            result = drain_monitors(
+                monitors,
+                max_pages_per_chat=args.max_pages_per_chat,
+                max_minutes=args.max_minutes,
+            )
+            projections = rebuild_projections(config, result["affected_dates"])
+            validation = validate_knowledge_db(config)
     except Exception as exc:
         transaction_error = f"{type(exc).__name__}: {exc}"
-    finally:
-        if original_status and original_status.loaded:
-            launch_agent["restore_attempted"] = True
-            try:
-                _restore_launch_agent(record)
-                launch_agent["restored"] = True
-            except Exception as exc:
-                restore_error = f"{type(exc).__name__}: {exc}"
-                launch_agent["restored"] = False
-                launch_agent["error"] = restore_error
-
-    receipt = build_reconciliation_receipt(
-        run_id=run_id,
-        started_at=started_at,
-        chats=chats,
-        audit=audit,
-        checkpoints_after={chat["username"]: _checkpoint_for_chat(chat["username"]) for chat in chats},
-        result=result,
-        projections=projections,
-        validation=validation,
-        backup_path=backup_path,
-        launch_agent=launch_agent,
-        transaction_error=transaction_error,
-    )
     try:
-        receipt_path = write_reconciliation_receipt(receipt)
+        receipt = build_reconciliation_receipt(
+            run_id=run_id,
+            started_at=started_at,
+            chats=chats,
+            audit=audit,
+            checkpoints_after={chat["username"]: _checkpoint_for_chat(chat["username"]) for chat in chats},
+            result=result,
+            projections=projections,
+            validation=validation,
+            backup_path=backup_path,
+            launch_agent=launch_agent,
+            transaction_error=transaction_error,
+            outcome_override=outcome_override,
+        )
+        try:
+            receipt_path = write_reconciliation_receipt(receipt)
+        except Exception as exc:
+            receipt_error = f"{type(exc).__name__}: {exc}"
     except Exception as exc:
         receipt_error = f"{type(exc).__name__}: {exc}"
+    finally:
+        try:
+            if instance_lock is not None:
+                instance_lock.release()
+        finally:
+            if original_status and original_status.loaded:
+                launch_agent["restore_attempted"] = True
+                try:
+                    _restore_launch_agent(record)
+                    launch_agent["restored"] = True
+                except Exception as exc:
+                    restore_error = f"{type(exc).__name__}: {exc}"
+                    launch_agent["restored"] = False
+                    launch_agent["error"] = restore_error
+
+    if receipt is None:
+        print("补跑结果不可用：reconciliation_receipt_failed")
+        if restore_error:
+            print(f"LaunchAgent restore error: {_receipt_error_code(restore_error)}")
+        return 1
 
     print("\n补跑结果")
     print(f"  state: {receipt['state']} · outcome: {receipt['outcome']}")
@@ -660,7 +688,7 @@ def apply_catch_up(config: dict, chats: list[dict], db, args) -> int:
     if receipt_error:
         print(f"  reconciliation receipt error: {receipt_error}")
 
-    success = receipt["state"] == "complete" and not receipt_error
+    success = receipt["state"] == "complete" and not receipt_error and not restore_error
     return 0 if success else 1
 
 

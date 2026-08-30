@@ -498,6 +498,24 @@ Review Queue 文件保存在 `~/.we-groupchat-obsidian/review_queue/`；里面�
 
 如果 Mac 睡眠导致普通菜单栏 timer 错过检查，程序会在醒来后做轻量补跑。默认只在命中、写入或报错时通知；如果想确认后台仍然活着，可以在菜单栏里打开“心跳通知”。
 
+如果 WeChat 或 provider 不可用后积累了 checkpointed backlog，用 guarded catch-up，
+不要手改 state：
+
+```bash
+./launchers/补跑遗漏笔记.command          # 只读 audit
+./launchers/补跑遗漏笔记.command --apply  # 显式写入补跑
+```
+
+Monitor state 现在由 locked、revisioned、atomic store 持有。只有 state 文件真的不存在时
+才会初始化到 now；corrupt JSON、symlink 或 non-regular file 一律 fail closed；stale writer
+返回 `monitor_state_conflict`；AI 失败完全不改 canonical state。`--apply` 会先停 managed
+LaunchAgent，再获取 menu app 使用的同一把 singleton lock。若手动启动的 menu app 仍占锁，
+结果是 `failed / menu_app_active`，不会执行 backup、monitor、SQLite 或 projection 写入。
+取得 ownership 后，锁会覆盖 backup、drain、projection rebuild、canonical validation 与
+reconciliation receipt 写入；随后先 release lock，再恢复原本 loaded 的 LaunchAgent。
+恢复失败会让命令以 nonzero 退出。Catch-up backup 仍只是 SQLite + per-chat checkpoint 的
+partial-recovery evidence，不是完整 rollback bundle。
+
 ## Obsidian 输出
 
 默认知识库数据库：
@@ -617,7 +635,7 @@ ai/                      # 可替换 AI provider 适配层
 core/
   config.py / app_runtime.py     # main-config 与 menu-process ownership
   wechat_db.py / source_contract.py # source、snapshot、shard/message identity
-  monitor.py / knowledge.py     # 关注推送 durable ledger 与 Markdown projection
+  monitor.py / monitor_state.py / knowledge.py # 关注推送 CAS state、durable ledger 与 Markdown projection
   attachment_archive.py         # attachment occurrence、resolver 与私有 CAS
   attachment_backup.py          # archive filesystem snapshot / verify / restore plan
   resource_capture.py           # selected-chat exact occurrence capture/backfill
