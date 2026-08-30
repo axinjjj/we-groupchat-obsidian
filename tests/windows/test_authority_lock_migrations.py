@@ -12,6 +12,16 @@ from core.monitor_state import MonitorStateStore
 from core.source_inventory import SourceInventoryStore
 
 
+class _NoopLockHandle:
+    def close(self):
+        return None
+
+
+class _NoopFileLock:
+    def acquire(self, _path, *, mode, blocking):
+        return _NoopLockHandle()
+
+
 class AuthorityLockMigrationTests(unittest.TestCase):
     def test_authority_writes_do_not_require_posix_fchmod(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(
@@ -21,11 +31,18 @@ class AuthorityLockMigrationTests(unittest.TestCase):
             create=True,
         ):
             root = Path(tmp)
-            ConfigStore(root / "config.json").replace({})
-            MonitorStateStore(root / "monitor.json").initialize_if_absent(
+            file_lock = _NoopFileLock()
+            ConfigStore(root / "config.json", file_lock=file_lock).replace({})
+            MonitorStateStore(
+                root / "monitor.json",
+                file_lock=file_lock,
+            ).initialize_if_absent(
                 {"last_checked_ts": 1}
             )
-            SourceInventoryStore(root / "inventory.json").reconcile(
+            SourceInventoryStore(
+                root / "inventory.json",
+                file_lock=file_lock,
+            ).reconcile(
                 "source",
                 [{
                     "relative_path": "message/message_1.db",
