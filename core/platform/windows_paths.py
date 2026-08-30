@@ -16,12 +16,15 @@ from .contracts import PathIdentity, PathIdentityError, ReparsePointConflict
 _FILE_ATTRIBUTE_DIRECTORY = 0x00000010
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
 _FILE_CS_FLAG_CASE_SENSITIVE_DIR = 0x00000001
+_FILE_READ_ATTRIBUTES = 0x00000080
 _FILE_SHARE_READ = 0x00000001
 _FILE_SHARE_WRITE = 0x00000002
 _FILE_SHARE_DELETE = 0x00000004
 _OPEN_EXISTING = 3
+_FILE_OPEN = 1
 _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_FILE_OPEN_REPARSE_POINT = 0x00200000
 _FILE_NAME_NORMALIZED = 0x0
 _VOLUME_NAME_DOS = 0x0
 _FILE_ATTRIBUTE_TAG_INFO_CLASS = 9
@@ -33,6 +36,7 @@ _ERROR_PATH_NOT_FOUND = 3
 _ERROR_INVALID_NAME = 123
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 _MAX_WIN32_PATH_CHARS = 32768
+_OBJ_CASE_INSENSITIVE = 0x00000040
 
 _DRIVE_ABSOLUTE_RE = re.compile(r"^[A-Za-z]:\\")
 _DRIVE_RELATIVE_RE = re.compile(r"^[A-Za-z]:(?!\\)")
@@ -74,6 +78,40 @@ class _FILE_ATTRIBUTE_TAG_INFO(ctypes.Structure):
 
 class _FILE_CASE_SENSITIVE_INFO(ctypes.Structure):
     _fields_ = [("Flags", wintypes.DWORD)]
+
+
+class _UNICODE_STRING(ctypes.Structure):
+    _fields_ = [
+        ("Length", wintypes.USHORT),
+        ("MaximumLength", wintypes.USHORT),
+        ("Buffer", wintypes.LPWSTR),
+    ]
+
+
+class _OBJECT_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [
+        ("Length", wintypes.ULONG),
+        ("RootDirectory", wintypes.HANDLE),
+        ("ObjectName", ctypes.POINTER(_UNICODE_STRING)),
+        ("Attributes", wintypes.ULONG),
+        ("SecurityDescriptor", wintypes.LPVOID),
+        ("SecurityQualityOfService", wintypes.LPVOID),
+    ]
+
+
+class _IO_STATUS_VALUE(ctypes.Union):
+    _fields_ = [
+        ("Status", wintypes.LONG),
+        ("Pointer", wintypes.LPVOID),
+    ]
+
+
+class _IO_STATUS_BLOCK(ctypes.Structure):
+    _anonymous_ = ("value",)
+    _fields_ = [
+        ("value", _IO_STATUS_VALUE),
+        ("Information", ctypes.c_size_t),
+    ]
 
 
 @dataclass(frozen=True)
@@ -154,6 +192,13 @@ def _strip_extended_prefix(path: str) -> str:
     return path
 
 
+def _trim_nonroot_trailing_separators(path: str) -> str:
+    drive, tail = ntpath.splitdrive(path)
+    if tail == "\\":
+        return drive + "\\"
+    return path.rstrip("\\")
+
+
 def _to_extended_path(display_path: str) -> str:
     if display_path.startswith("\\\\"):
         return "\\\\?\\UNC\\" + display_path[2:]
@@ -190,7 +235,9 @@ def _normalize_windows_syntax(
             "absolute_path_failed",
             native_error=exc.native_error,
         ) from None
-    absolute = _strip_extended_prefix(absolute)
+    absolute = _trim_nonroot_trailing_separators(
+        _strip_extended_prefix(absolute)
+    )
     _validate_components(absolute)
     is_unc = absolute.startswith("\\\\")
     if not is_unc and not _DRIVE_ABSOLUTE_RE.match(absolute):
@@ -249,6 +296,7 @@ class _WindowsNativePaths:
         if os.name != "nt" or not hasattr(ctypes, "WinDLL"):
             raise OSError("Windows path APIs are unavailable")
         self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.ntdll = ctypes.WinDLL("ntdll")
         self._bind()
 
     def _bind(self) -> None:
@@ -308,6 +356,22 @@ class _WindowsNativePaths:
             wintypes.LPARAM,
         ]
         self.kernel32.LCMapStringEx.restype = ctypes.c_int
+        self.ntdll.NtCreateFile.argtypes = [
+            ctypes.POINTER(wintypes.HANDLE),
+            wintypes.DWORD,
+            ctypes.POINTER(_OBJECT_ATTRIBUTES),
+            ctypes.POINTER(_IO_STATUS_BLOCK),
+            wintypes.LPVOID,
+            wintypes.ULONG,
+            wintypes.ULONG,
+            wintypes.ULONG,
+            wintypes.ULONG,
+            wintypes.LPVOID,
+            wintypes.ULONG,
+        ]
+        self.ntdll.NtCreateFile.restype = wintypes.LONG
+        self.ntdll.RtlNtStatusToDosError.argtypes = [wintypes.LONG]
+        self.ntdll.RtlNtStatusToDosError.restype = wintypes.ULONG
 
     @staticmethod
     def _last_error() -> int:
@@ -325,7 +389,10 @@ class _WindowsNativePaths:
             raise _NativePathError(self._last_error())
         return buffer.value
 
-    def describe_existing(self, operational_path: str) -> _ExistingWindowsPath:
+    def open_existing(
+        self,
+        operational_path: str,
+    ) -> tuple[_ExistingWindowsPath, wintypes.HANDLE]:
         handle = self.kernel32.CreateFileW(
             operational_path,
             0,
@@ -338,37 +405,99 @@ class _WindowsNativePaths:
         if handle == _INVALID_HANDLE_VALUE:
             raise _NativePathError(self._last_error())
         try:
-            tag_info = self._query(
-                handle,
-                _FILE_ATTRIBUTE_TAG_INFO_CLASS,
-                _FILE_ATTRIBUTE_TAG_INFO,
-            )
-            file_id_info = self._query(
-                handle,
-                _FILE_ID_INFO_CLASS,
-                _FILE_ID_INFO,
-            )
-            case_sensitive = False
-            if tag_info.FileAttributes & _FILE_ATTRIBUTE_DIRECTORY:
-                case_info = self._query(
-                    handle,
-                    _FILE_CASE_SENSITIVE_INFO_CLASS,
-                    _FILE_CASE_SENSITIVE_INFO,
-                )
-                case_sensitive = bool(
-                    case_info.Flags & _FILE_CS_FLAG_CASE_SENSITIVE_DIR
-                )
-            return _ExistingWindowsPath(
-                operational_path=self._final_path(handle),
-                volume_serial=int(file_id_info.VolumeSerialNumber),
-                file_id=bytes(file_id_info.FileId.Identifier),
-                attributes=int(tag_info.FileAttributes),
-                reparse_tag=int(tag_info.ReparseTag),
-                filesystem_name=self._filesystem_name(handle),
-                case_sensitive=case_sensitive,
-            )
-        finally:
+            return self._describe_handle(handle), handle
+        except BaseException:
             self.kernel32.CloseHandle(handle)
+            raise
+
+    def open_relative(
+        self,
+        parent_handle: wintypes.HANDLE,
+        component: str,
+    ) -> tuple[_ExistingWindowsPath, wintypes.HANDLE]:
+        buffer = ctypes.create_unicode_buffer(component)
+        character_size = ctypes.sizeof(ctypes.c_wchar)
+        name = _UNICODE_STRING(
+            Length=(len(buffer) - 1) * character_size,
+            MaximumLength=len(buffer) * character_size,
+            Buffer=ctypes.cast(buffer, wintypes.LPWSTR),
+        )
+        attributes = _OBJECT_ATTRIBUTES(
+            Length=ctypes.sizeof(_OBJECT_ATTRIBUTES),
+            RootDirectory=parent_handle,
+            ObjectName=ctypes.pointer(name),
+            Attributes=_OBJ_CASE_INSENSITIVE,
+            SecurityDescriptor=None,
+            SecurityQualityOfService=None,
+        )
+        io_status = _IO_STATUS_BLOCK()
+        handle = wintypes.HANDLE()
+        status = self.ntdll.NtCreateFile(
+            ctypes.byref(handle),
+            _FILE_READ_ATTRIBUTES,
+            ctypes.byref(attributes),
+            ctypes.byref(io_status),
+            None,
+            0,
+            _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+            _FILE_OPEN,
+            _FILE_OPEN_REPARSE_POINT,
+            None,
+            0,
+        )
+        if status < 0:
+            native_error = int(
+                self.ntdll.RtlNtStatusToDosError(status)
+            )
+            raise _NativePathError(native_error)
+        try:
+            return self._describe_handle(handle), handle
+        except BaseException:
+            self.kernel32.CloseHandle(handle)
+            raise
+
+    def close_existing(self, handle: wintypes.HANDLE) -> None:
+        self.kernel32.CloseHandle(handle)
+
+    def refresh_existing(
+        self,
+        handle: wintypes.HANDLE,
+    ) -> _ExistingWindowsPath:
+        return self._describe_handle(handle)
+
+    def _describe_handle(
+        self,
+        handle: wintypes.HANDLE,
+    ) -> _ExistingWindowsPath:
+        tag_info = self._query(
+            handle,
+            _FILE_ATTRIBUTE_TAG_INFO_CLASS,
+            _FILE_ATTRIBUTE_TAG_INFO,
+        )
+        file_id_info = self._query(
+            handle,
+            _FILE_ID_INFO_CLASS,
+            _FILE_ID_INFO,
+        )
+        case_sensitive = False
+        if tag_info.FileAttributes & _FILE_ATTRIBUTE_DIRECTORY:
+            case_info = self._query(
+                handle,
+                _FILE_CASE_SENSITIVE_INFO_CLASS,
+                _FILE_CASE_SENSITIVE_INFO,
+            )
+            case_sensitive = bool(
+                case_info.Flags & _FILE_CS_FLAG_CASE_SENSITIVE_DIR
+            )
+        return _ExistingWindowsPath(
+            operational_path=self._final_path(handle),
+            volume_serial=int(file_id_info.VolumeSerialNumber),
+            file_id=bytes(file_id_info.FileId.Identifier),
+            attributes=int(tag_info.FileAttributes),
+            reparse_tag=int(tag_info.ReparseTag),
+            filesystem_name=self._filesystem_name(handle),
+            case_sensitive=case_sensitive,
+        )
 
     def fold_file_name(self, value: str) -> str:
         required = self.kernel32.LCMapStringEx(
@@ -505,36 +634,53 @@ class WindowsPathService:
         chain = _local_path_chain(display_path)
         last_index = len(chain) - 1
         parent: _ExistingWindowsPath | None = None
-        for index, lexical_path in enumerate(chain):
-            operational_path = _to_extended_path(lexical_path)
-            try:
-                current = self._native.describe_existing(operational_path)
-            except _NativePathError as exc:
-                if (
-                    index == last_index
-                    and parent is not None
-                    and exc.native_error
-                    in {_ERROR_FILE_NOT_FOUND, _ERROR_PATH_NOT_FOUND}
+        held_handles: list[wintypes.HANDLE] = []
+        try:
+            for index, lexical_path in enumerate(chain):
+                try:
+                    if not held_handles:
+                        current, handle = self._native.open_existing(
+                            _to_extended_path(lexical_path)
+                        )
+                    else:
+                        current, handle = self._native.open_relative(
+                            held_handles[-1],
+                            ntpath.basename(lexical_path),
+                        )
+                except _NativePathError as exc:
+                    if (
+                        index == last_index
+                        and parent is not None
+                        and exc.native_error
+                        in {_ERROR_FILE_NOT_FOUND, _ERROR_PATH_NOT_FOUND}
+                    ):
+                        parent = self._native.refresh_existing(
+                            held_handles[-1]
+                        )
+                        self._validate_existing(parent)
+                        return parent, False
+                    reason = (
+                        "invalid_name"
+                        if exc.native_error == _ERROR_INVALID_NAME
+                        else "path_unavailable"
+                    )
+                    raise PathIdentityError(
+                        reason,
+                        native_error=exc.native_error,
+                    ) from None
+                held_handles.append(handle)
+                self._validate_existing(current)
+                if index < last_index and not (
+                    current.attributes & _FILE_ATTRIBUTE_DIRECTORY
                 ):
-                    return parent, False
-                reason = (
-                    "invalid_name"
-                    if exc.native_error == _ERROR_INVALID_NAME
-                    else "path_unavailable"
-                )
-                raise PathIdentityError(
-                    reason,
-                    native_error=exc.native_error,
-                ) from None
-            self._validate_existing(current)
-            if index < last_index and not (
-                current.attributes & _FILE_ATTRIBUTE_DIRECTORY
-            ):
-                raise PathIdentityError("ancestor_not_directory")
-            parent = current
-        if parent is None:
-            raise PathIdentityError("path_unavailable")
-        return parent, True
+                    raise PathIdentityError("ancestor_not_directory")
+                parent = current
+            if parent is None:
+                raise PathIdentityError("path_unavailable")
+            return parent, True
+        finally:
+            for handle in reversed(held_handles):
+                self._native.close_existing(handle)
 
     @staticmethod
     def _validate_existing(value: _ExistingWindowsPath) -> None:

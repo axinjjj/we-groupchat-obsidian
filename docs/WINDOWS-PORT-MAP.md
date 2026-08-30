@@ -17,7 +17,7 @@ w0_1_implementation_sha: 27c46226d21e540518a868c0ff55498b9f55bb3e
 last_reconciled_main_sha: 7a318c0f2a85c587f05f5013dfd301d67efb4702
 w0_2a_squash_merge_sha: 7a318c0f2a85c587f05f5013dfd301d67efb4702
 classification_scope: living module/import status
-applies_to: feat/windows-port-w0-2b1-path-identity
+applies_to: feat/windows-port-w0-2b1-path-identity-main
 release_tier_affected: W0 only
 ```
 
@@ -96,9 +96,9 @@ root, `ai/`, `core/`, `ui/`, and `scripts/` Python module and imports every
 | `core/platform/contracts.py` | `windows-import-safe` | Shared lock/path/storage/secret/process/notification/open/autostart protocols; W0.2B.1 defines stable `path_identity_unknown` and `reparse_point_conflict` failures. |
 | `core/platform/factory.py` | `windows-import-safe` | Fail-closed service registry with lazy macOS and Windows lock/path providers; all later capabilities remain absent. |
 | `core/platform/macos_locks.py` | `macos-only` | Native `fcntl.flock` shared/exclusive backend retained for current macOS behavior. |
-| `core/platform/macos_paths.py` | `macos-only` | Concrete inode/parent identity provider preserving current macOS path semantics. |
+| `core/platform/macos_paths.py` | `macos-only` | Concrete inode identity; valid-UTF-8 missing-child identity is limited to APFS and uses volume-reported case semantics. HFS+ and unknown normalization rules fail closed. |
 | `core/platform/windows_locks.py` | `windows-import-safe` | Native `LockFileEx` shared/exclusive backend with retained handles and stable `worker_busy` conflicts. |
-| `core/platform/windows_paths.py` | `windows-import-safe` | Local-NTFS identity via Win32 handles, volume/file IDs, extended operational paths, and fail-closed reparse/case-sensitive/unsupported-filesystem checks. |
+| `core/platform/windows_paths.py` | `windows-import-safe` | Local-NTFS identity via handle-relative NT traversal, retained ancestry handles, volume/file IDs, extended operational paths, and fail-closed reparse/case-sensitive/unsupported-filesystem checks. |
 | `core/project_identity.py` | `windows-import-safe` | Shared public project identifiers. |
 | `core/relation_audit.py` | `windows-import-safe` | Imports without platform services; filesystem behavior remains unclaimed. |
 | `core/relation_markdown_cleanup.py` | `deferred-w0.2` | Transitively imports knowledge/config storage. |
@@ -143,7 +143,7 @@ root, `ai/`, `core/`, `ui/`, and `scripts/` Python module and imports every
    activation.
 2. **W0.2B.1:** provide concrete macOS/Windows path identities and prove path
    alias, Unicode, long-path, missing-final, UNC-syntax, reserved-name, and
-   reparse boundaries without migrating existing callers.
+   reparse and held-ancestor boundaries without migrating existing callers.
 3. **W0.2B.2:** add private-storage enforcement and atomic publication, then
    migrate only the explicitly authorized storage owners.
 4. **W0.3:** adapt secrets behind the contract. Notifications, target opening,
