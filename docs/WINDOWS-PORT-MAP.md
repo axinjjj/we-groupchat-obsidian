@@ -18,6 +18,8 @@ release_tier_affected: W0 only
 W0.1 does not enable Windows source discovery, key acquisition, database
 reads, monitor writes, attachments, backup, tray UI, autostart, packaging, or
 message sending. Existing macOS entrypoints and behavior remain authoritative.
+MCP message sending is now retired across platforms; `mcp_server.py` remains
+only as an optional legacy read-only compatibility surface.
 
 ## Classification
 
@@ -41,7 +43,7 @@ root, `ai/`, `core/`, `ui/`, and `scripts/` Python module and imports every
 | Path | Classification | Current boundary and next owner |
 |---|---|---|
 | `app.py` | `macos-only` | rumps/AppKit/objc menu shell; reusable controllers are extracted in later staged PRs. |
-| `mcp_server.py` | `deferred-w0.2` | Imports `core.config`; Windows source factory activation belongs to W1.1/W2. |
+| `mcp_server.py` | `deferred-w0.2` | Optional legacy read-only compatibility surface; imports `core.config`, and Windows source factory activation belongs to W1.1/W2. |
 | `setup.py` | `macos-only` | py2app packaging entrypoint; Windows packaging is W6. |
 | `ai/__init__.py` | `windows-import-safe` | Empty shared provider package boundary. |
 | `ai/base.py` | `windows-import-safe` | Platform-neutral provider interface. |
@@ -70,8 +72,6 @@ root, `ai/`, `core/`, `ui/`, and `scripts/` Python module and imports every
 | `core/launch_agent.py` | `macos-only` | macOS LaunchAgent adapter; Windows autostart is W6. |
 | `core/link_preview.py` | `windows-import-safe` | Platform-neutral URL extraction and preview logic. |
 | `core/mcp_config.py` | `windows-import-safe` | Pure configuration rendering; Windows command emission is activated later. |
-| `core/mcp_send_confirmation.py` | `windows-import-safe` | Shared confirmation state; Windows send remains forbidden through W6. |
-| `core/mcp_send_policy.py` | `windows-import-safe` | Shared send policy; no Windows sender is registered. |
 | `core/monitor.py` | `deferred-w0.2` | Transitively imports config/knowledge/review storage; Windows activation is W3. |
 | `core/notification_identity.py` | `macos-only` | Foundation/app-bundle notification identity diagnostics. |
 | `core/notification_target.py` | `macos-only` | Emits the macOS `open` command; target-opening adapter is W0.3. |
@@ -85,7 +85,6 @@ root, `ai/`, `core/`, `ui/`, and `scripts/` Python module and imports every
 | `core/resource_backup.py` | `deferred-w0.2` | Direct `fcntl`, path identity, target lock, and atomic semantics; Windows is W5. |
 | `core/resource_capture.py` | `deferred-w0.2` | Direct `fcntl` and source/config dependencies; Windows is W4. |
 | `core/review_queue.py` | `deferred-w0.2` | Transitively imports ConfigStore/private storage; Windows activation is W3. |
-| `core/sender.py` | `macos-only` | Quartz and AppleScript UI sender; Windows send is separately authorized after W6. |
 | `core/source_contract.py` | `windows-import-safe` | Existing shared source-metadata helpers; canonical WeChatSource extraction is W1.1. |
 | `core/source_metadata_plan.py` | `deferred-w0.2` | Transitively imports digest/knowledge/config storage. |
 | `core/taxonomy_assignment.py` | `windows-import-safe` | Platform-neutral taxonomy resolution. |

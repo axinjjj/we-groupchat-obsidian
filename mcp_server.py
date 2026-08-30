@@ -18,6 +18,7 @@ Claude Desktop config (~/Library/Application Support/Claude/claude_desktop_confi
     }
   }
 """
+import json
 import os
 import sys
 import time
@@ -34,18 +35,15 @@ from core.image_decoder import (
     detect_mime,
     is_v2_image_data,
 )
-from core.mcp_send_confirmation import SendConfirmationStore
-from core.mcp_send_policy import check_send_policy
 from core.project_identity import MCP_SERVER_ID
 
 mcp = FastMCP(
     MCP_SERVER_ID,
     instructions=(
-        "微信群聊查询、AI 总结和可选消息发送工具。"
-        "可以读取群聊/私聊消息、搜索关键词、用 AI 总结内容、管理分组、"
-        "以及在用户显式设置 mcp_send_mode 并完成 prepare/confirm 后通过微信桌面端发送消息。"
+        "可选的 legacy read-only 微信群聊查询与 AI 总结兼容 surface。"
+        "可以读取群聊/私聊消息、搜索关键词、用 AI 总结内容和查看已有分组，"
+        "但不会修改本地 metadata，也不会通过微信桌面端发送消息。"
         "首次使用请先调用 get_status 确认连接状态。"
-        "发送消息必须先调用 prepare_send_message，再让用户确认 nonce、内容和非空目标。"
     ),
 )
 
@@ -53,7 +51,24 @@ mcp = FastMCP(
 
 _db = None
 _keys_mtime = 0  # keys file mtime, used to detect key updates
-_send_confirmations = SendConfirmationStore()
+_MCP_SEND_RETIRED_RESPONSE = json.dumps(
+    {
+        "code": "mcp_send_retired",
+        "message": "MCP message sending is no longer supported",
+    },
+    ensure_ascii=False,
+    sort_keys=True,
+    separators=(",", ":"),
+)
+_MCP_MUTATION_RETIRED_RESPONSE = json.dumps(
+    {
+        "code": "mcp_mutation_retired",
+        "message": "MCP is read-only; manage groups in the menu-bar app",
+    },
+    ensure_ascii=False,
+    sort_keys=True,
+    separators=(",", ":"),
+)
 
 
 def _get_db():
@@ -577,7 +592,7 @@ def summarize_chat(
         chat_name: 群聊名称，支持模糊匹配
         hours: 总结最近 N 小时的消息（0 表示从上次书签位置开始）
         limit: 最大消息数，默认 500
-        update_bookmark: 总结后是否更新书签位置，默认 True
+        update_bookmark: legacy compatibility parameter; ignored because MCP is read-only
     """
     try:
         username, display = _resolve(chat_name)
@@ -609,10 +624,6 @@ def summarize_chat(
         )
         summary = ai.summarize(prompt)
 
-        if update_bookmark and messages:
-            from core.bookmark import set_bookmark
-            set_bookmark(username, messages[-1]["timestamp"])
-
         header = (
             f"📋 {display} 总结\n"
             f"时间范围: {start_time} ~ {end_time}  |  消息数: {msg_count}\n"
@@ -635,7 +646,7 @@ def summarize_group_batch(group_name: str, hours: int = 0) -> str:
         hours: 总结最近 N 小时的消息（0 表示从上次书签位置开始）
     """
     try:
-        from core.bookmark import get_bookmark, set_bookmark
+        from core.bookmark import get_bookmark
         from core.chat_groups import get_group_chats
 
         chat_usernames = get_group_chats(group_name)
@@ -664,8 +675,6 @@ def summarize_group_batch(group_name: str, hours: int = 0) -> str:
                     messages, show_group_nickname=_cfg.get("show_group_nickname", True))
                 start_time = messages[0]["time_str"]
                 end_time = messages[-1]["time_str"]
-                # Update bookmark
-                set_bookmark(username, messages[-1]["timestamp"])
             else:
                 messages_text = ""
                 start_time = ""
@@ -809,73 +818,35 @@ def manage_chat_groups(
     group_name: str = "",
     chat_name: str = "",
 ) -> str:
-    """管理群聊分组。分组可用于批量总结。
+    """只读查看群聊分组。旧 mutation actions 保留为 inert compatibility calls。
 
     Args:
         action: 操作类型，可选值:
             - "list": 列出所有分组及其包含的群聊
-            - "create": 创建新分组（需要 group_name）
-            - "delete": 删除分组（需要 group_name）
-            - "add": 将群聊加入分组（需要 group_name 和 chat_name）
-            - "remove": 将群聊从分组移除（需要 group_name 和 chat_name）
+            - "create" / "delete" / "add" / "remove": 已退休，返回稳定 read-only 结果
         group_name: 分组名称
         chat_name: 群聊名称（用于 add/remove 操作）
     """
+    if action != "list":
+        return _MCP_MUTATION_RETIRED_RESPONSE
     try:
-        from core.chat_groups import (
-            add_chat_to_group,
-            create_group,
-            delete_group,
-            load_groups,
-            remove_chat_from_group,
-        )
+        from core.chat_groups import load_groups
 
-        if action == "list":
-            groups = load_groups()
-            if not groups:
-                return "还没有创建任何分组。"
-            db = _get_db()
-            db._load_contacts()
-            lines = [f"共 {len(groups)} 个分组：\n"]
-            for g in groups:
-                chat_displays = [
-                    db._contacts.get(c, c) for c in g["chats"]
-                ]
-                chats_str = "、".join(chat_displays) if chat_displays else "（空）"
-                lines.append(f"📁 {g['name']}: {chats_str}")
-            return "\n".join(lines)
-
-        elif action == "create":
-            if not group_name:
-                return "请提供分组名称（group_name 参数）"
-            ok = create_group(group_name)
-            return f"✅ 分组「{group_name}」创建成功" if ok else f"❌ 分组「{group_name}」已存在"
-
-        elif action == "delete":
-            if not group_name:
-                return "请提供分组名称（group_name 参数）"
-            delete_group(group_name)
-            return f"✅ 分组「{group_name}」已删除"
-
-        elif action == "add":
-            if not group_name or not chat_name:
-                return "请提供分组名称（group_name）和群聊名称（chat_name）"
-            username, display = _resolve(chat_name)
-            ok = add_chat_to_group(group_name, username)
-            return f"✅ 已将「{display}」加入分组「{group_name}」" if ok else f"❌ 分组「{group_name}」不存在"
-
-        elif action == "remove":
-            if not group_name or not chat_name:
-                return "请提供分组名称（group_name）和群聊名称（chat_name）"
-            username, display = _resolve(chat_name)
-            ok = remove_chat_from_group(group_name, username)
-            return f"✅ 已将「{display}」从分组「{group_name}」移除" if ok else f"❌ 分组「{group_name}」不存在"
-
-        else:
-            return f"未知操作: {action}。支持: list, create, delete, add, remove"
-
+        groups = load_groups()
+        if not groups:
+            return "还没有创建任何分组。"
+        db = _get_db()
+        db._load_contacts()
+        lines = [f"共 {len(groups)} 个分组：\n"]
+        for group in groups:
+            chat_displays = [
+                db._contacts.get(chat, chat) for chat in group["chats"]
+            ]
+            chats_str = "、".join(chat_displays) if chat_displays else "（空）"
+            lines.append(f"📁 {group['name']}: {chats_str}")
+        return "\n".join(lines)
     except Exception as e:
-        return f"分组操作失败: {e}"
+        return f"读取分组失败: {e}"
 
 
 @mcp.tool()
@@ -912,139 +883,25 @@ def get_ai_config() -> str:
         return f"获取配置失败: {e}"
 
 
-# ── E. Message Sending ────────────────────────────────────
-
-
-def _format_send_policy_decision(decision: dict) -> str:
-    if decision["action"] == "blocked":
-        return (
-            f"❌ MCP 发送被策略阻止：{decision['reason']}。"
-            "请在 ~/.we-groupchat-obsidian/config.json 设置 "
-            "\"mcp_send_mode\": \"dry_run|allowlist|enabled\"，"
-            "并确认目标非空和辅助功能权限。"
-        )
-    if decision["action"] == "dry_run":
-        return (
-            "🧪 MCP dry run：不会发送到微信。\n"
-            f"目标：{decision['target']}\n"
-            f"内容：{str(decision.get('text_preview') or '').strip()}"
-        )
-    if decision["action"] == "confirm_required":
-        return (
-            "⚠️ MCP real send requires confirmation before touching WeChat.\n"
-            f"Nonce: {decision['nonce']}\n"
-            f"Target: {decision['target']}\n"
-            f"Text: {decision['text_preview']}\n"
-            f"Expires at: {decision['expires_at']}\n"
-            "Call confirm_send_message with the same nonce, target, and text after the user confirms."
-        )
-    return f"❌ MCP 发送状态未知：{decision}"
+# ── E. Retired Message-Sending Compatibility ──────────────
 
 
 @mcp.tool()
 def prepare_send_message(text: str, chat_name: str = "") -> str:
-    """准备一次真实微信发送，返回短期 nonce；不会触碰微信 UI。
-
-    真实发送前必须让用户确认目标、内容和 nonce，然后调用 confirm_send_message。
-    dry_run 模式仍只返回预览，不需要 confirm。
-    """
-    try:
-        cfg = load_config()
-        decision = _send_confirmations.prepare(
-            cfg,
-            text=text,
-            chat_name=chat_name,
-            resolve_username=_resolve_send_username,
-        )
-        if decision["action"] == "dry_run":
-            decision["text_preview"] = str(text or "").strip()
-        return _format_send_policy_decision(decision)
-    except Exception as e:
-        return f"❌ 准备发送失败: {e}"
+    """Retired compatibility tool. Never reads config or touches WeChat UI."""
+    return _MCP_SEND_RETIRED_RESPONSE
 
 
 @mcp.tool()
 def confirm_send_message(nonce: str, text: str, chat_name: str = "") -> str:
-    """确认并执行一次已 prepare 的微信发送。nonce、目标和内容必须完全匹配。"""
-    try:
-        cfg = load_config()
-        from core.sender import send_message as _send
-
-        result = _send_confirmations.confirm(
-            nonce,
-            text=text,
-            chat_name=chat_name,
-            config=cfg,
-            send_func=_send,
-            resolve_username=_resolve_send_username,
-        )
-        if result["action"] == "blocked":
-            return f"❌ MCP 发送被策略阻止：{result['reason']}。"
-        if result["action"] == "failed":
-            return f"❌ {result['message']}"
-
-        target = result["target"]
-        verified = _verify_sent(text, target)
-        if verified is True:
-            return f"✅ 已发送到「{target}」（已验证）"
-        if verified is False:
-            return f"⚠️ 操作完成但未在数据库中确认到消息「{target}」，请检查微信窗口"
-        return f"✅ 已发送到「{target}」"
-    except ImportError:
-        return "❌ 发送模块未找到，请确认 core/sender.py 存在"
-    except Exception as e:
-        return f"❌ 发送失败: {e}"
+    """Retired compatibility tool. Never reads config or touches WeChat UI."""
+    return _MCP_SEND_RETIRED_RESPONSE
 
 
 @mcp.tool()
 def send_message(text: str, chat_name: str = "") -> str:
-    """兼容旧 MCP 调用：真实发送模式下只 prepare，不会直接发送。
-
-    使用 prepare_send_message + confirm_send_message 完成真实发送。目标不能为空。
-    """
-    return prepare_send_message(text=text, chat_name=chat_name)
-
-
-def _resolve_send_username(target: str) -> str | None:
-    try:
-        return _resolve(target)[0]
-    except Exception:
-        target = str(target or "").strip()
-        if target.endswith("@chatroom") or target.startswith("wxid_"):
-            return target
-        return None
-
-
-def _verify_sent(text: str, chat_name: str) -> bool | None:
-    """Check if a just-sent message appeared in the WeChat database.
-
-    Returns True (confirmed), False (not found), or None (verification unavailable).
-    """
-    try:
-        db = _get_db()
-        username = db.resolve_username(chat_name)
-        if not username:
-            return None
-
-        # Wait for WeChat to flush the message to its database
-        time.sleep(2)
-
-        # Refresh in-memory metadata so the next read incorporates the latest WAL
-        # without deleting decrypted cache files that other readers may be using.
-        db.refresh_cache_view()
-
-        # Read last 5 messages
-        since_ts = time.time() - 30  # only look at messages from last 30 seconds
-        messages = db.get_messages(username, since_ts=since_ts, limit=5)
-
-        sent_text = text.strip()
-        for msg in messages:
-            if msg.get("type", 0) == 1 and msg.get("text", "").strip() == sent_text:
-                return True
-
-        return False
-    except Exception:
-        return None
+    """Retired compatibility tool. Never reads config or touches WeChat UI."""
+    return _MCP_SEND_RETIRED_RESPONSE
 
 
 # ── Entry point ───────────────────────────────────────────
