@@ -3,7 +3,7 @@ import plistlib
 import sqlite3
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -48,7 +48,7 @@ class HealthCheckTests(unittest.TestCase):
             },
         )()
 
-        with (
+        patchers = (
             patch("scripts.health_check.load_config", return_value=config),
             patch("scripts.health_check.get_cached_keys", return_value={}),
             patch("scripts.health_check.load_key", return_value=""),
@@ -59,10 +59,16 @@ class HealthCheckTests(unittest.TestCase):
             patch("scripts.health_check.launch_agent_status", return_value=status),
             patch("scripts.health_check.autostart_log_status", return_value=("", "", False)),
             patch("scripts.health_check.latest_notification_backend_status", return_value=("", False)),
-            patch("scripts.health_check.notification_identity_status_for_launch_agent", return_value={"ok": True}),
+            patch(
+                "scripts.health_check.notification_identity_status_for_launch_agent",
+                return_value={"ok": True},
+            ),
             patch("scripts.health_check.count_markdown", return_value=(0, "")),
             patch("scripts.health_check.recent_topics", return_value=(0, [])),
-            patch("scripts.health_check.relation_integrity_status", return_value=("unavailable", False)),
+            patch(
+                "scripts.health_check.relation_integrity_status",
+                return_value=("unavailable", False),
+            ),
             patch("scripts.health_check.review_queue_pending_count", return_value=0),
             patch("scripts.health_check._sensitive_log_status", return_value=("absent", False)),
             patch(
@@ -106,7 +112,10 @@ class HealthCheckTests(unittest.TestCase):
                     "last_error_code": "",
                 },
             ),
-        ):
+        )
+        with ExitStack() as stack:
+            for patcher in patchers:
+                stack.enter_context(patcher)
             output = StringIO()
             with redirect_stdout(output):
                 health_check.main([])
