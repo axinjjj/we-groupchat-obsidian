@@ -90,6 +90,13 @@ class FileLockContractTests(unittest.TestCase):
         )
         self.assertEqual(outcome, ("busy", "worker_busy"))
 
+    def test_exclusive_owner_blocks_shared_owner(self):
+        outcome = self._run_nonblocking_child(
+            LockMode.EXCLUSIVE,
+            LockMode.SHARED,
+        )
+        self.assertEqual(outcome, ("busy", "worker_busy"))
+
     def test_blocking_owner_waits_until_release(self):
         parent = self.service.acquire(
             self.path,
