@@ -64,7 +64,14 @@ class TopicMonitorResilienceTests(unittest.TestCase):
 
     def test_retryable_ai_failure_is_retried_once_before_advancing_checkpoint(self):
         self.config["monitor_ai_retry_attempts"] = 1
-        save_state({"last_checked_ts": 10}, self.state_file)
+        save_state({
+            "last_checked_ts": 10,
+            "ai_failure_count": 2,
+            "ai_last_error": "legacy raw error",
+            "ai_last_error_code": "ai_connection_error",
+            "ai_last_error_ts": 900,
+            "ai_next_retry_after": 999,
+        }, self.state_file)
         calls = []
 
         def flaky_evaluation(*_):
@@ -79,12 +86,18 @@ class TopicMonitorResilienceTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         state = load_state(self.state_file)
         self.assertEqual(state["last_checked_ts"], 11)
-        self.assertNotIn("ai_next_retry_after", state)
+        for key in (
+            "ai_failure_count",
+            "ai_last_error",
+            "ai_last_error_code",
+            "ai_last_error_ts",
+            "ai_next_retry_after",
+        ):
+            self.assertNotIn(key, state)
 
-    def test_retryable_ai_failure_leaves_state_unchanged(self):
+    def test_retryable_ai_failure_commits_backoff_without_advancing_checkpoint(self):
         self.config["monitor_ai_retry_attempts"] = 0
-        save_state({"last_checked_ts": 10}, self.state_file)
-        original = Path(self.state_file).read_bytes()
+        save_state({"last_checked_ts": 10, "last_topic_key": "keep-me"}, self.state_file)
         calls = []
 
         def fail_evaluation(*_):
@@ -96,13 +109,42 @@ class TopicMonitorResilienceTests(unittest.TestCase):
 
         state = load_state(self.state_file)
         self.assertEqual(state["last_checked_ts"], 10)
+        self.assertEqual(state["last_topic_key"], "keep-me")
+        self.assertEqual(state["ai_failure_count"], 1)
+        self.assertEqual(state["ai_last_error_code"], "ai_connection_error")
+        self.assertEqual(state["ai_last_error_ts"], 1000)
+        self.assertEqual(state["ai_next_retry_after"], 1600)
+        self.assertNotIn("ai_last_error", state)
         self.assertEqual(len(calls), 1)
-        self.assertEqual(Path(self.state_file).read_bytes(), original)
 
-    def test_empty_ai_response_leaves_state_unchanged(self):
+    def test_ai_backoff_skips_provider_call_until_retry_deadline(self):
         self.config["monitor_ai_retry_attempts"] = 0
         save_state({"last_checked_ts": 10}, self.state_file)
-        original = Path(self.state_file).read_bytes()
+        calls = []
+
+        def fail_evaluation(*_):
+            calls.append(True)
+            raise RuntimeError("provider timeout")
+
+        with self.assertRaisesRegex(RuntimeError, "provider timeout"):
+            self.monitor(
+                FakeDB([msg(11, "普通闲聊")]), fail_evaluation, now=1000
+            ).check_once()
+
+        result = self.monitor(
+            FakeDB([msg(11, "普通闲聊")]),
+            lambda *_: calls.append(True),
+            now=1001,
+        ).check_once()
+
+        self.assertEqual(result["status"], "ai_backoff")
+        self.assertEqual(result["retry_after_ts"], 1600)
+        self.assertEqual(result["last_error_code"], "ai_timeout")
+        self.assertEqual(len(calls), 1)
+
+    def test_empty_ai_response_enters_backoff_without_advancing_checkpoint(self):
+        self.config["monitor_ai_retry_attempts"] = 0
+        save_state({"last_checked_ts": 10}, self.state_file)
 
         def empty_response(*_):
             raise RuntimeError("deepseek API 返回空响应，请稍后重试")
@@ -112,7 +154,39 @@ class TopicMonitorResilienceTests(unittest.TestCase):
 
         state = load_state(self.state_file)
         self.assertEqual(state["last_checked_ts"], 10)
-        self.assertEqual(Path(self.state_file).read_bytes(), original)
+        self.assertEqual(state["ai_last_error_code"], "ai_empty_response")
+        self.assertEqual(state["ai_next_retry_after"], 1600)
+
+    def test_retryable_ai_failure_conflict_does_not_overwrite_newer_state(self):
+        self.config["monitor_ai_retry_attempts"] = 0
+        save_state({"last_checked_ts": 10}, self.state_file)
+        store = MonitorStateStore(self.state_file)
+
+        def concurrent_failure(*_):
+            store.update(lambda state: state.update({
+                "last_checked_ts": 77,
+                "source_cursors": {
+                    "logical-new": {
+                        "generation_id": "generation-new",
+                        "cursor_token": "[77,9]",
+                    },
+                },
+            }))
+            raise RuntimeError("provider timeout")
+
+        result = self.monitor(
+            FakeDB([msg(11, "普通闲聊")]), concurrent_failure, now=1000
+        ).check_once()
+
+        self.assertEqual(result["status"], "monitor_state_conflict")
+        state = load_state(self.state_file)
+        self.assertEqual(state["last_checked_ts"], 77)
+        self.assertEqual(
+            state["source_cursors"]["logical-new"]["cursor_token"],
+            "[77,9]",
+        )
+        self.assertNotIn("ai_failure_count", state)
+        self.assertNotIn("ai_next_retry_after", state)
 
     def test_corrupt_state_fails_closed_without_calling_ai_or_initializing(self):
         original = b'{"last_checked_ts":'

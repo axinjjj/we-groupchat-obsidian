@@ -151,8 +151,8 @@ class TopicMonitor:
                     initial_state.update(
                         initialize_monitor_source_state(self.db, checkpoint)
                     )
-                except MonitorSourceError as exc:
-                    return self._source_error_result(exc)
+                except MonitorSourceError as source_exc:
+                    return self._source_error_result(source_exc)
             try:
                 initialized = self.state_store.initialize_if_absent(initial_state)
             except MonitorStateError as exc:
@@ -288,7 +288,7 @@ class TopicMonitor:
             )
         except MonitorConfigError:
             raise
-        except Exception:
+        except Exception as exc:
             if source_batch is not None:
                 try:
                     verify_monitor_source_inventory(
@@ -296,8 +296,12 @@ class TopicMonitor:
                         source_batch.inventory_digest,
                         source_batch.inventory_revision,
                     )
-                except MonitorSourceError as exc:
-                    return self._source_error_result(exc)
+                except MonitorSourceError as source_exc:
+                    return self._source_error_result(source_exc)
+            if not dry_run and is_retryable_ai_error(exc):
+                state_error = self._commit_retryable_ai_failure(snapshot, exc)
+                if state_error:
+                    return state_error
             raise
         normalized = self._normalize_decision(decision, messages)
         if not dry_run:
@@ -506,8 +510,59 @@ class TopicMonitor:
             "status": "ai_backoff",
             "message": f"AI API 暂时不可用，约 {remaining} 分钟后重试",
             "retry_after_ts": retry_after,
-            "last_error": state.get("ai_last_error", ""),
+            "last_error_code": (
+                state.get("ai_last_error_code") or "ai_retryable_error"
+            ),
         }
+
+    def _ai_failure_backoff_minutes(self):
+        try:
+            minutes = int(
+                self.config.get("monitor_ai_failure_backoff_minutes", 10)
+            )
+        except (TypeError, ValueError):
+            minutes = 10
+        return max(1, min(1440, minutes))
+
+    @staticmethod
+    def _ai_failure_code(error):
+        text = str(error or "").casefold()
+        if "empty response" in text or "空响应" in text:
+            return "ai_empty_response"
+        if "timeout" in text or "timed out" in text or "请求超时" in text:
+            return "ai_timeout"
+        if (
+            "connect" in text
+            or "connection" in text
+            or "无法连接" in text
+        ):
+            return "ai_connection_error"
+        if "network" in text or "网络连接" in text:
+            return "ai_network_error"
+        return "ai_service_unavailable"
+
+    def _commit_retryable_ai_failure(self, snapshot, error):
+        """Persist only backoff metadata against the observed state revision."""
+        failure_state = dict(snapshot.data)
+        try:
+            failure_count = int(failure_state.get("ai_failure_count") or 0)
+        except (TypeError, ValueError):
+            failure_count = 0
+        now = float(self.now_func())
+        failure_state.update({
+            "ai_failure_count": failure_count + 1,
+            "ai_last_error_code": self._ai_failure_code(error),
+            "ai_last_error_ts": now,
+            "ai_next_retry_after": (
+                now + self._ai_failure_backoff_minutes() * 60
+            ),
+        })
+        failure_state.pop("ai_last_error", None)
+        try:
+            self.state_store.commit(snapshot.revision, failure_state)
+        except MonitorStateError as exc:
+            return self._state_error_result(exc)
+        return None
 
     def _ai_retry_attempts(self):
         try:
@@ -528,6 +583,7 @@ class TopicMonitor:
         for key in (
             "ai_failure_count",
             "ai_last_error",
+            "ai_last_error_code",
             "ai_last_error_ts",
             "ai_next_retry_after",
         ):

@@ -141,9 +141,36 @@ reserved for verified raw EOF on every shard under the same complete inventory.
 Visible rows may use separately queried, read-only overlap context. Context never
 changes tentative cursor positions. AI/provider failure commits no cursor, and a
 generation change is rechecked after AI/Knowledge work and before the monitor
-state CAS. Knowledge writes use a source-ID-derived `source_batch_id`; if the
-event commits but the state revision loses its CAS, the retry adopts that exact
-event instead of inserting another canonical event.
+state CAS. A retryable provider failure may CAS-write only content-free failure
+count/code/timestamps and a bounded backoff deadline against the observed state
+revision. It preserves source cursors, inventory bindings and checkpoints
+exactly; a run before the deadline returns `ai_backoff` without calling the
+provider. A successful retry clears both current and legacy failure metadata.
+
+Knowledge writes use a source-ID-derived `source_batch_id`; if the event commits
+but the state revision loses its CAS, the retry adopts that exact event instead
+of inserting another canonical event. Reuse normally performs no projection
+write. If the managed topic Markdown is absent, however, reuse reconstructs that
+note and the date indexes from canonical SQLite without changing the event or
+topic identity; an I/O failure remains an explicit `projection_warnings` result.
+
+### Catch-up receipt finalization
+
+Write-mode catch-up stops the managed LaunchAgent, acquires the menu app's
+singleton lock, and holds it through backup, bounded drain, projection rebuild,
+canonical validation, one capture of the post-drain checkpoints, and a durable
+provisional receipt. Receipt publication fsyncs the file and parent directory
+around atomic replacement. Catch-up then releases the lock and attempts to
+restore a LaunchAgent that was previously loaded. It atomically overwrites the
+same `run_id` receipt with the observed restore result; no second checkpoint
+sample is taken after the app can resume.
+
+The provisional state is `partial / drain_complete_restore_pending`, never
+success. The finalized receipt is `complete / drained` only when canonical work
+passed and restoration succeeded or was unnecessary. A failed restoration is
+durably `partial / launch_agent_restore_failed`, disables `resume_supported`,
+and returns nonzero. Receipts keep content-free error codes rather than provider
+or chat content.
 
 Encrypted WAL reconstruction validates the SQLite WAL header and cumulative
 frame checksums, applies frames only through the last valid commit marker,

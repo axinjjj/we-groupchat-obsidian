@@ -376,20 +376,29 @@ def build_reconciliation_receipt(
         })
 
     validation_ok = bool(validation and validation.get("ok"))
-    # The receipt is durably written while the maintenance lock is still held;
-    # a previously loaded LaunchAgent is restored only after releasing it.
-    launch_ok = not launch_agent.get("was_loaded") or launch_agent.get("restored") is not False
-    complete = bool(
+    was_loaded = bool(launch_agent.get("was_loaded"))
+    restore_attempted = bool(launch_agent.get("restore_attempted"))
+    restored = launch_agent.get("restored")
+    restore_pending = was_loaded and not restore_attempted
+    restore_failed = was_loaded and restore_attempted and restored is not True
+    launch_ok = not was_loaded or (restore_attempted and restored is True)
+    canonical_complete = bool(
         result
         and not result.get("blocked")
         and validation_ok
         and not transaction_error
-        and launch_ok
     )
+    complete = canonical_complete and launch_ok
     progressed = checkpoint_changed or any(row["pages"] for row in chat_rows)
     if outcome_override in {"menu_app_active", "maintenance_lock_busy"}:
         state = "failed"
         outcome = outcome_override
+    elif restore_pending and canonical_complete:
+        state = "partial"
+        outcome = "drain_complete_restore_pending"
+    elif restore_failed:
+        state = "partial" if canonical_complete or progressed or projections else "failed"
+        outcome = "launch_agent_restore_failed"
     elif complete:
         state = "complete"
         outcome = outcome_override or "drained"
@@ -421,7 +430,19 @@ def build_reconciliation_receipt(
         "commit_policy": "page_level_partial",
         "state": state,
         "outcome": outcome,
-        "resume_supported": state == "partial" and validation_ok and launch_ok,
+        "finalization": (
+            "restore_pending"
+            if restore_pending
+            else "restore_failed"
+            if restore_failed
+            else "finalized"
+        ),
+        "resume_supported": (
+            state == "partial"
+            and outcome == "resume_required"
+            and validation_ok
+            and launch_ok
+        ),
         "started_at": started_at,
         "finished_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "backup": {
@@ -452,13 +473,40 @@ def write_reconciliation_receipt(
     root = Path(receipts_dir)
     ensure_private_dir(root)
     path = root / f"{receipt['run_id']}.json"
-    tmp_path = root / f".{receipt['run_id']}.tmp"
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(receipt, handle, ensure_ascii=False, indent=2, sort_keys=True)
-        handle.write("\n")
-    ensure_private_file(tmp_path)
-    os.replace(tmp_path, path)
-    ensure_private_file(path)
+    temp_fd = -1
+    temp_path = ""
+    try:
+        temp_fd, temp_path = tempfile.mkstemp(
+            prefix=f".{receipt['run_id']}.",
+            suffix=".tmp",
+            dir=root,
+        )
+        try:
+            os.fchmod(temp_fd, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(temp_fd, "w", encoding="utf-8") as handle:
+            temp_fd = -1
+            json.dump(receipt, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        temp_path = ""
+        ensure_private_file(path)
+        directory_fd = os.open(root, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temp_fd >= 0:
+            os.close(temp_fd)
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
     return path
 
 
@@ -613,9 +661,11 @@ def apply_catch_up(config: dict, chats: list[dict], db, args) -> int:
     receipt_error = ""
     receipt_path = None
     receipt = None
+    provisional_receipt = None
     result = None
     projections = None
     validation = None
+    checkpoints_after = {}
     instance_lock = None
     outcome_override = ""
     launch_agent = {
@@ -625,6 +675,23 @@ def apply_catch_up(config: dict, chats: list[dict], db, args) -> int:
         "restored": None,
         "error": "",
     }
+
+    def current_receipt():
+        return build_reconciliation_receipt(
+            run_id=run_id,
+            started_at=started_at,
+            chats=chats,
+            audit=audit,
+            checkpoints_after=checkpoints_after,
+            result=result,
+            projections=projections,
+            validation=validation,
+            backup_path=backup_path,
+            launch_agent=launch_agent,
+            transaction_error=transaction_error,
+            outcome_override=outcome_override,
+        )
+
     try:
         record, original_status = launch_agent_report(PROJECT_DIR)
         launch_agent["inspected"] = True
@@ -661,22 +728,14 @@ def apply_catch_up(config: dict, chats: list[dict], db, args) -> int:
     except Exception as exc:
         transaction_error = f"{type(exc).__name__}: {exc}"
     try:
-        receipt = build_reconciliation_receipt(
-            run_id=run_id,
-            started_at=started_at,
-            chats=chats,
-            audit=audit,
-            checkpoints_after={chat["username"]: _checkpoint_for_chat(chat["username"]) for chat in chats},
-            result=result,
-            projections=projections,
-            validation=validation,
-            backup_path=backup_path,
-            launch_agent=launch_agent,
-            transaction_error=transaction_error,
-            outcome_override=outcome_override,
-        )
+        checkpoints_after = {
+            chat["username"]: _checkpoint_for_chat(chat["username"])
+            for chat in chats
+        }
+        provisional_receipt = current_receipt()
+        receipt = provisional_receipt
         try:
-            receipt_path = write_reconciliation_receipt(receipt)
+            receipt_path = write_reconciliation_receipt(provisional_receipt)
         except Exception as exc:
             receipt_error = f"{type(exc).__name__}: {exc}"
     except Exception as exc:
@@ -695,6 +754,17 @@ def apply_catch_up(config: dict, chats: list[dict], db, args) -> int:
                     restore_error = f"{type(exc).__name__}: {exc}"
                     launch_agent["restored"] = False
                     launch_agent["error"] = restore_error
+
+    if original_status and original_status.loaded:
+        try:
+            final_receipt = current_receipt()
+            final_path = write_reconciliation_receipt(final_receipt)
+        except Exception as exc:
+            receipt_error = f"{type(exc).__name__}: {exc}"
+        else:
+            receipt = final_receipt
+            receipt_path = final_path
+            receipt_error = ""
 
     if receipt is None:
         print("补跑结果不可用：reconciliation_receipt_failed")

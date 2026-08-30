@@ -535,13 +535,19 @@ progress 是 per-chat × logical-shard generation 的 `source_cursors`，持有 
 下有界读取所有 shard，按 `create_time`、`source_message_id` 合并，只推进真正消费的 raw row。
 filtered/system row 会推进 cursor 但不进入 AI prompt，因此 `source_advanced_no_visible` 是有效进度，
 只有 unchanged complete inventory 下的 raw EOF 才能返回 `no_messages`。AI 失败、generation 变化或
-stale writer 返回 `monitor_state_conflict` 时都不提交 cursor；若 Knowledge event 已写而 state CAS
-冲突，retry 会复用 source-batch identity，不再插入第二条 canonical event。`--apply` 会先停 managed
+stale writer 返回 `monitor_state_conflict` 时都不提交 cursor。Retryable provider failure 只会针对
+刚读取的 revision CAS 写入 content-free failure count/code/timestamp 与有上限的 backoff deadline；
+`source_cursors`、inventory binding 和 checkpoint 保持不变，backoff 尚未到期的 interval 不会调用
+provider。若 Knowledge event 已写而 state CAS 冲突，retry 会复用 source-batch identity，不再插入
+第二条 canonical event；如果该 event 的 managed topic Markdown 缺失，同一次 reuse 会补写 projection
+和 date indexes，但不会改变 event identity。`--apply` 会先停 managed
 LaunchAgent，再获取 menu app 使用的同一把 singleton lock。若手动启动的 menu app 仍占锁，
 结果是 `failed / menu_app_active`，不会执行 backup、monitor、SQLite 或 projection 写入。
 取得 ownership 后，锁会覆盖 backup、drain、projection rebuild、canonical validation 与
-reconciliation receipt 写入；随后先 release lock，再恢复原本 loaded 的 LaunchAgent。
-恢复失败会让命令以 nonzero 退出。Catch-up backup 仍只是 SQLite + per-chat checkpoint 的
+durable provisional reconciliation receipt 写入；随后先 release lock，再恢复原本 loaded 的
+LaunchAgent，并以同一个 `run_id` atomic finalize receipt。只有恢复成功（或原本未 loaded）才可写成
+`complete / drained`；中断留下 `partial / drain_complete_restore_pending`，恢复失败则写成
+`partial / launch_agent_restore_failed` 并让命令以 nonzero 退出。Catch-up backup 仍只是 SQLite + per-chat checkpoint 的
 partial-recovery evidence，不是完整 rollback bundle。
 
 ## Obsidian 输出
