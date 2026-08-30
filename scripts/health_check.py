@@ -19,6 +19,7 @@ from core.attachment_backup import AttachmentBackup
 from core.google_drive_auth import GoogleDriveOAuth
 from core.google_drive_file_sync import GoogleDriveFileSync
 from core.knowledge import TAXONOMY_PROFILES
+from core.link_preview import LINK_PREVIEW_STATE
 from core.key_extractor import (
     EXTRACT_LOG,
     check_new_databases,
@@ -38,11 +39,38 @@ from core.launch_agent import (
 )
 from core.notification_identity import notification_identity_status_for_launch_agent
 from core.project_identity import SOURCE_GUARD_LAUNCH_AGENT_LABEL
+from core.monitor import STATE_DIR as MONITOR_STATE_DIR, state_file_for_chat
+from core.monitor_state import MonitorStateError, MonitorStateStore
+from core.resource_backup import inspect_mounted_resource_backup
+from core.source_inventory import (
+    SOURCE_STATES,
+    SourceInventoryError,
+    SourceInventoryStore,
+    source_namespaces_for_root,
+)
 from core.taxonomy_assignment import taxonomy_assignment_summary
 from core.wechat_source_guard import source_guard_status
 
 AUTOSTART_ERR_LOG = Path(DATA_DIR) / "logs" / "autostart.err.log"
 AUTOSTART_OUT_LOG = Path(DATA_DIR) / "logs" / "autostart.out.log"
+
+_MONITOR_RUNTIME_STATES = frozenset({
+    "ai_backoff",
+    "cooldown",
+    "duplicate",
+    "initialized",
+    "missing_topic",
+    "monitor_source_cursors_corrupt",
+    "monitor_state_conflict",
+    "monitor_state_corrupt",
+    "monitor_state_missing_checkpoint",
+    "no_match",
+    "no_messages",
+    "notified",
+    "source_advanced_no_visible",
+    "source_generation_changed",
+    "source_inventory_incomplete",
+})
 
 
 def ok(value: bool) -> str:
@@ -190,6 +218,161 @@ def _sensitive_log_status(delete: bool = False) -> tuple[str, bool]:
     return "present", True
 
 
+def latest_monitor_runtime_result(
+    path: str | os.PathLike[str] = AUTOSTART_OUT_LOG,
+) -> str:
+    """Return the last content-free monitor result code from the app log."""
+    try:
+        lines = Path(path).read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+    except OSError:
+        return "unknown"
+    for line in reversed(lines):
+        text = line.strip()
+        if text.startswith("[monitor] 命中["):
+            return "notified"
+        match = re.match(r"^\[monitor\]\s+([a-z][a-z0-9_]*)(?::|$)", text)
+        if match and match.group(1) in _MONITOR_RUNTIME_STATES:
+            return match.group(1)
+    return "unknown"
+
+
+def _monitor_cursor_progress(data) -> tuple[dict, bool]:
+    cursors = (data or {}).get("source_cursors")
+    progress = {
+        "shard_cursors": 0,
+        "generation_bound": 0,
+        "inventory_bound": bool((data or {}).get("source_inventory_digest")),
+        "legacy_checkpoint_only": False,
+    }
+    if cursors is None:
+        progress["legacy_checkpoint_only"] = bool(
+            (data or {}).get("last_checked_ts")
+        )
+        return progress, True
+    if not isinstance(cursors, dict):
+        return progress, False
+    progress["shard_cursors"] = len(cursors)
+    for shard_id, item in cursors.items():
+        if (
+            not isinstance(shard_id, str)
+            or not isinstance(item, dict)
+            or not isinstance(item.get("generation_id"), str)
+            or not item.get("generation_id")
+            or not isinstance(item.get("cursor_token"), str)
+        ):
+            return progress, False
+        progress["generation_bound"] += 1
+    return progress, True
+
+
+def monitor_state_health(
+    config,
+    *,
+    state_dir: str | os.PathLike[str] = MONITOR_STATE_DIR,
+    runtime_log: str | os.PathLike[str] = AUTOSTART_OUT_LOG,
+) -> dict:
+    """Inspect per-chat monitor state without printing chat identity or paths."""
+    chats = active_monitor_chats(config or {})
+    counts = {"healthy": 0, "missing": 0, "corrupt": 0}
+    cursor_chats = 0
+    shard_cursors = 0
+    generation_bound = 0
+    inventory_bound = 0
+    legacy_states = 0
+    for chat in chats:
+        path = state_file_for_chat(chat.get("username", ""), state_dir=state_dir)
+        try:
+            snapshot = MonitorStateStore(path).inspect()
+        except MonitorStateError:
+            counts["corrupt"] += 1
+            continue
+        if not snapshot.existed:
+            counts["missing"] += 1
+            continue
+        progress, valid = _monitor_cursor_progress(snapshot.data)
+        if not valid:
+            counts["corrupt"] += 1
+            continue
+        if not snapshot.data.get("last_checked_ts") and not progress["shard_cursors"]:
+            counts["missing"] += 1
+            continue
+        counts["healthy"] += 1
+        if snapshot.revision == 0:
+            legacy_states += 1
+        if progress["shard_cursors"]:
+            cursor_chats += 1
+        shard_cursors += int(progress["shard_cursors"])
+        generation_bound += int(progress["generation_bound"])
+        inventory_bound += int(progress["inventory_bound"])
+
+    runtime_result = latest_monitor_runtime_result(runtime_log)
+    if runtime_result == "monitor_state_conflict":
+        state = "conflict"
+    elif counts["corrupt"]:
+        state = "corrupt"
+    elif counts["missing"] or not chats:
+        state = "missing"
+    else:
+        state = "healthy"
+    return {
+        "state": state,
+        "chat_count": len(chats),
+        "counts": counts,
+        "runtime_result": runtime_result,
+        "cursor_chats": cursor_chats,
+        "shard_cursors": shard_cursors,
+        "generation_bound": generation_bound,
+        "inventory_bound_chats": inventory_bound,
+        "legacy_states": legacy_states,
+    }
+
+
+def source_inventory_health(
+    config,
+    *,
+    store=None,
+    sensitive: bool = False,
+) -> dict:
+    """Inspect the configured source inventory without scanning or mutation."""
+    db_dir = str((config or {}).get("db_dir") or "").strip()
+    empty_counts = {state: 0 for state in sorted(SOURCE_STATES)}
+    if not db_dir:
+        return {
+            "state": "unconfigured",
+            "complete": False,
+            "counts": empty_counts,
+            "error_codes": ["source_not_configured"],
+            "shards": [],
+        }
+    _cache_namespace, source_namespace = source_namespaces_for_root(db_dir)
+    try:
+        snapshot = (store or SourceInventoryStore()).inspect(source_namespace)
+    except SourceInventoryError as exc:
+        return {
+            "state": "degraded",
+            "complete": False,
+            "counts": empty_counts,
+            "error_codes": [exc.code],
+            "shards": [],
+        }
+    if "source_inventory_uninitialized" in snapshot.error_codes:
+        state = "uninitialized"
+    else:
+        state = "complete" if snapshot.complete else "degraded"
+    return {
+        "state": state,
+        "complete": bool(snapshot.complete),
+        "counts": dict(snapshot.counts),
+        "error_codes": list(snapshot.error_codes),
+        "shards": (
+            snapshot.as_dict(sensitive=True).get("shards", [])
+            if sensitive else []
+        ),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Print local we-groupchat-obsidian health status.")
     parser.add_argument(
@@ -240,6 +423,12 @@ def main(argv: list[str] | None = None) -> int:
         config,
         oauth=GoogleDriveOAuth(),
     )
+    monitor_state = monitor_state_health(config)
+    source_inventory = source_inventory_health(
+        config,
+        sensitive=args.sensitive,
+    )
+    mounted_backup = inspect_mounted_resource_backup(config)
 
     print("微信总结 health check")
     print("")
@@ -281,6 +470,71 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     print(f"[{ok(bool(config.get('monitor_topic')))}] Monitor topic: {'已设置' if config.get('monitor_topic') else '未设置'}")
+    monitor_counts = monitor_state["counts"]
+    monitor_enabled = bool(config.get("monitor_enabled", False))
+    monitor_ok = monitor_state["state"] == "healthy" or (
+        not monitor_enabled and monitor_state["state"] == "missing"
+    )
+    print(
+        f"[{ok(monitor_ok)}] Monitor state: {monitor_state['state']}; "
+        f"healthy={monitor_counts['healthy']}; missing={monitor_counts['missing']}; "
+        f"corrupt={monitor_counts['corrupt']}; "
+        f"last_runtime={monitor_state['runtime_result']}; "
+        f"legacy={monitor_state['legacy_states']}"
+    )
+    print(
+        f"[{ok(monitor_ok)}] Monitor raw cursor progress: "
+        f"checkpointed_chats={monitor_counts['healthy']}/{monitor_state['chat_count']}; "
+        f"cursor_chats={monitor_state['cursor_chats']}; "
+        f"shard_cursors={monitor_state['shard_cursors']}; "
+        f"generation_bound={monitor_state['generation_bound']}; "
+        f"inventory_bound_chats={monitor_state['inventory_bound_chats']}"
+    )
+    inventory_counts = source_inventory["counts"]
+    inventory_ok = source_inventory["state"] == "complete" or (
+        not monitor_enabled and source_inventory["state"] == "unconfigured"
+    )
+    print(
+        f"[{ok(inventory_ok)}] Source inventory: {source_inventory['state']}; "
+        f"present={inventory_counts.get('present', 0)}; "
+        f"generation_changed={inventory_counts.get('generation_changed', 0)}; "
+        f"missing={inventory_counts.get('missing_file', 0)}; "
+        f"cache_only={inventory_counts.get('cache_only', 0)}; "
+        f"key_missing={inventory_counts.get('key_missing', 0)}; "
+        f"unreadable={inventory_counts.get('unreadable', 0)}; "
+        f"errors={len(source_inventory['error_codes'])}"
+    )
+    if args.sensitive:
+        for shard in source_inventory.get("shards") or []:
+            print(
+                "  - Source shard: "
+                f"{shard.get('relative_path', '-')}; "
+                f"logical={shard.get('logical_shard_id', '-')}; "
+                f"generation={shard.get('generation_id', '-')}; "
+                f"state={shard.get('state', 'unknown')}"
+            )
+    mounted_state = mounted_backup.get("state") or "unknown"
+    mounted_ok = (
+        not mounted_backup.get("enabled")
+        or mounted_state == "ready"
+    )
+    delivery_counts = mounted_backup.get("delivery_counts") or {}
+    print(
+        f"[{ok(mounted_ok)}] Mounted resource handoff: "
+        f"runtime={mounted_state}; "
+        f"handoff={mounted_backup.get('handoff_semantics') or 'unknown'}; "
+        f"target={'configured' if mounted_backup.get('target_configured') else 'not_configured'}; "
+        f"delegated_objects={int(delivery_counts.get('sync_delegated') or 0)}; "
+        "provider_side_sync=unknown; remote_verified=False"
+    )
+    print(
+        f"[OK] Link preview: state={LINK_PREVIEW_STATE}; network_requests=0"
+    )
+    print("[OK] MCP compatibility: legacy_read_only; send=mcp_send_retired")
+    print(
+        "[OK] Windows: W0.1 import/dependency boundary only; "
+        "product_support=not_claimed"
+    )
     print("")
     obsidian_label = obsidian_root if args.sensitive else _path_status(obsidian_root)
     print(f"[{ok(os.path.isdir(obsidian_root))}] Obsidian output: {obsidian_label}")
@@ -381,6 +635,19 @@ def main(argv: list[str] | None = None) -> int:
         f"root={drive_root}; objects={int(drive_sync.get('uploaded_unique_objects') or 0)}; "
         f"shortcuts={int(drive_sync.get('shortcut_placements') or 0)}; "
         f"last_error={drive_sync.get('last_error_code') or '-'}"
+    )
+    verified_objects = int(drive_sync.get("uploaded_unique_objects") or 0)
+    if drive_sync.get("last_error_code") == "local_ledger_unreadable":
+        drive_remote_state = "unknown"
+    elif verified_objects:
+        drive_remote_state = "verified_ledger_objects"
+    else:
+        drive_remote_state = "not_yet_verified"
+    print(
+        f"[{ok(drive_remote_state != 'unknown')}] Google Drive API remote verification: "
+        f"{drive_remote_state}; verified_objects={verified_objects}; "
+        f"last_verified={float(drive_sync.get('last_verified_upload_at') or 0):.0f}; "
+        "separate_from_source_inventory=True"
     )
     print("")
     plist_label = agent_record.plist_path if args.sensitive else ("present" if agent_record.plist_path.exists() else "missing")

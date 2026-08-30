@@ -331,6 +331,22 @@ Equivalent CLI flags:
 ./启动.command --uninstall-autostart
 ```
 
+The default health output is content-free and path-free. It now separates the
+operational facts that were previously easy to collapse:
+
+| Health line | What it proves |
+| --- | --- |
+| `Monitor state` | Per-chat state files are valid, missing, corrupt, or the last runtime result observed a revision conflict. Corrupt state blocks progress; it is never reset to now. |
+| `Monitor raw cursor progress` | Counts of checkpointed chats and generation-bound shard cursors; no chat or cursor value is printed. |
+| `Source inventory` | Complete versus degraded/uninitialized inventory plus present, missing, cache-only, key-missing, and unreadable counts. “Complete” requires a complete expected-shard inventory, stable current generations, and successful reads. |
+| `Mounted resource handoff` | Existing destination binding and latest snapshot handoff evidence. `provider_side_sync=unknown` and `remote_verified=False` remain explicit even after `sync_delegated`. |
+| `Google Drive API remote verification` | Count of objects verified through the optional Direct Drive API ledger. It is separate from source completeness and mounted-folder delivery. |
+| `Link preview` / `MCP compatibility` / `Windows` | Preview is disabled with zero requests; MCP is legacy read-only and send-retired; W0.1 is only an import/dependency boundary, not Windows product support. |
+
+`--sensitive` may show local paths, chat names, topic titles, source-relative
+paths, and opaque shard IDs for deliberate on-device debugging. Default output
+never prints those values, message text, API endpoints, or token material.
+
 Monitor maintenance helpers:
 
 ```bash
@@ -587,7 +603,7 @@ If WeChat or the provider was unavailable and the monitor has a checkpointed bac
 ./launchers/补跑遗漏笔记.command --apply  # pause, back up, drain, rebuild, validate, restore
 ```
 
-Write mode requires the explicit `--apply` flag. It refuses chats without recoverable state and uses the normal paginated `TopicMonitor` path. Monitor state is a locked, revisioned atomic file: only a truly absent file initializes to now; corrupt JSON, symlinks, and non-regular files fail closed. Canonical progress is `source_cursors` per chat and logical-shard generation, using opaque raw-row tokens; `last_checked_ts` remains only a derived compatibility/diagnostic value. Each bounded batch reads every shard under one complete inventory, merges raw envelopes by `create_time` then `source_message_id`, and advances only rows actually consumed. Filtered/system rows advance the source cursor but never enter the AI prompt; `source_advanced_no_visible` is therefore progress, while `no_messages` means verified raw EOF. AI failure, source-generation change, or stale state revision commits no cursor. If a Knowledge event commits before a state CAS conflict, the retry reuses its source-batch identity instead of inserting a duplicate canonical event. Catch-up stops the managed LaunchAgent, then must acquire the same menu-app singleton lock before any backup, state, database, or projection write. `menu_app_active` means a manually started app still owns that lock, so catch-up writes no canonical data. With ownership established, it stores a private partial-recovery backup under `~/.we-groupchat-obsidian/backups/monitor-catch-up/`, drains to verified raw EOF under an unchanged complete inventory, rebuilds affected source-date indexes and historical Daily Digests, validates SQLite/FTS/hash parity, writes the reconciliation receipt while still holding the lock, releases ownership, and only then restores a previously loaded LaunchAgent.
+Write mode requires the explicit `--apply` flag. It refuses chats without recoverable state and uses the normal paginated `TopicMonitor` path. Monitor state is a locked, revisioned atomic file: only a truly absent file initializes to now; corrupt JSON, symlinks, and non-regular files fail closed. Canonical progress is `source_cursors` per chat and logical-shard generation, using opaque raw-row tokens; `last_checked_ts` remains only a derived compatibility/diagnostic value. Each bounded batch reads every shard under one complete inventory, merges raw envelopes by `create_time` then `source_message_id`, and advances only rows actually consumed. Here “complete source” means the expected logical-shard inventory is complete, every generation remains the one bound to the batch, and all required reads succeed. Filtered/system rows advance the source cursor but never enter the AI prompt; `source_advanced_no_visible` is therefore progress, while `no_messages` means verified raw EOF. AI failure, source-generation change, or stale state revision commits no cursor. If a Knowledge event commits before a state CAS conflict, the retry reuses its source-batch identity instead of inserting a duplicate canonical event. Catch-up stops the managed LaunchAgent, then must acquire the same menu-app singleton lock before any backup, state, database, or projection write. `menu_app_active` means a manually started app still owns that lock, so catch-up writes no canonical data. With ownership established, it stores a private partial-recovery backup under `~/.we-groupchat-obsidian/backups/monitor-catch-up/`, drains to verified raw EOF under an unchanged complete inventory, rebuilds affected source-date indexes and historical Daily Digests, validates SQLite/FTS/hash parity, writes the reconciliation receipt while still holding the lock, releases ownership, and only then restores a previously loaded LaunchAgent.
 
 The catch-up backup currently contains only canonical SQLite plus per-chat checkpoints. It is useful for recovery evidence, but it is not a complete rollback bundle: Review Queue JSONL and Obsidian Markdown/index/Digest projections are not copied. A failed run may therefore retain successfully committed pages before the LaunchAgent resumes. Do not describe this backup as full rollback until a separate recovery policy covers every managed surface.
 

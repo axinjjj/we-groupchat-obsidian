@@ -88,6 +88,37 @@ def logical_shard_id(source_namespace: str, relative_path: str) -> str:
     ).hexdigest()[:32]
 
 
+def source_namespaces_for_root(path: str | os.PathLike[str]) -> tuple[str, str]:
+    """Return the cache and durable source namespaces for one configured root.
+
+    This is intentionally observation-only.  It does not create a cache,
+    inventory ledger, lock file, or source directory.
+    """
+    source_root = os.path.realpath(os.path.expanduser(os.fspath(path or "")))
+    try:
+        source_stat = os.stat(source_root)
+        cache_identity = (
+            f"{source_root}\0{source_stat.st_dev}\0{source_stat.st_ino}"
+        )
+        namespace_identity = (
+            f"{source_root}\0{source_stat.st_dev}:{source_stat.st_ino}"
+        )
+    except OSError:
+        cache_identity = f"{source_root}\0missing"
+        cache_namespace = hashlib.sha256(
+            cache_identity.encode("utf-8")
+        ).hexdigest()
+        namespace_identity = cache_namespace
+    else:
+        cache_namespace = hashlib.sha256(
+            cache_identity.encode("utf-8")
+        ).hexdigest()
+    source_namespace = hashlib.sha256(
+        f"wechat-source-namespace-v1\0{namespace_identity}".encode("utf-8")
+    ).hexdigest()[:32]
+    return cache_namespace, source_namespace
+
+
 @dataclass(frozen=True)
 class SourceInventorySnapshot:
     source_namespace: str

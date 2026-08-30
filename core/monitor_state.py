@@ -216,6 +216,16 @@ class MonitorStateStore:
         finally:
             self._unlock(fd)
 
+    def inspect(self) -> MonitorStateSnapshot:
+        """Read atomic state without creating a directory or lock file.
+
+        State publication uses ``os.replace``, so an observation sees either
+        the complete old file or the complete new file.  Writers still use the
+        locked ``read``/``commit`` surfaces; this method exists for health and
+        other strictly read-only diagnostics.
+        """
+        return self._read_locked()
+
     def initialize_if_absent(self, initial_state: dict) -> MonitorStateSnapshot:
         fd = self._lock(exclusive=True)
         try:

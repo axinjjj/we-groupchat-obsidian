@@ -61,6 +61,11 @@ def _capture_db_path(config):
     return os.path.abspath(os.path.expanduser(value))
 
 
+def resource_capture_db_path(config):
+    """Return the canonical capture-ledger path without opening it."""
+    return _capture_db_path(config)
+
+
 @contextmanager
 def resource_capture_operation_lock(config):
     """Serialize capture operations and selected-chat config mutations.

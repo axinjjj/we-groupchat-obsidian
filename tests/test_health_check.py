@@ -1,5 +1,6 @@
 import os
 import plistlib
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -11,14 +12,166 @@ from unittest.mock import patch
 import scripts.health_check as health_check
 from scripts.health_check import (
     launch_agent_report,
+    latest_monitor_runtime_result,
     latest_notification_backend_status,
+    monitor_state_health,
     parse_launch_agent_status,
     review_queue_pending_count,
+    source_inventory_health,
 )
+from core.monitor import state_file_for_chat
+from core.monitor_state import MonitorStateStore
 from core.review_queue import ReviewQueue
+from core.source_inventory import SourceInventoryStore, source_namespaces_for_root
 
 
 class HealthCheckTests(unittest.TestCase):
+    def test_monitor_state_inspect_does_not_create_parent_or_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "absent" / "monitor-state.json"
+
+            snapshot = MonitorStateStore(state_path).inspect()
+
+            self.assertFalse(snapshot.existed)
+            self.assertFalse(state_path.exists())
+            self.assertFalse(state_path.parent.exists())
+            self.assertFalse(Path(str(state_path) + ".lock").exists())
+
+    def test_monitor_state_health_distinguishes_all_operator_states(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "states"
+            runtime_log = root / "autostart.out.log"
+            config = {
+                "monitor_chats": [
+                    {"username": "one@chatroom", "name": "Private One"},
+                ]
+            }
+            state_path = state_file_for_chat(
+                "one@chatroom", state_dir=str(state_dir)
+            )
+            MonitorStateStore(state_path).initialize_if_absent({
+                "last_checked_ts": 100,
+                "source_inventory_digest": "opaque-digest",
+                "source_cursors": {
+                    "opaque-shard": {
+                        "generation_id": "opaque-generation",
+                        "cursor_token": "100:9",
+                    }
+                },
+            })
+            runtime_log.write_text(
+                "[monitor] no_messages: no_messages\n", encoding="utf-8"
+            )
+
+            report = monitor_state_health(
+                config,
+                state_dir=str(state_dir),
+                runtime_log=runtime_log,
+            )
+            self.assertEqual(report["state"], "healthy")
+            self.assertEqual(report["counts"], {
+                "healthy": 1, "missing": 0, "corrupt": 0,
+            })
+            self.assertEqual(report["shard_cursors"], 1)
+            self.assertEqual(report["generation_bound"], 1)
+            self.assertEqual(report["inventory_bound_chats"], 1)
+            self.assertNotIn("one@chatroom", str(report))
+            self.assertNotIn(str(state_dir), str(report))
+
+            runtime_log.write_text(
+                "[monitor] monitor_state_conflict: monitor_state_conflict\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                monitor_state_health(
+                    config,
+                    state_dir=str(state_dir),
+                    runtime_log=runtime_log,
+                )["state"],
+                "conflict",
+            )
+
+            missing = monitor_state_health(
+                {"monitor_chats": [{"username": "missing@chatroom"}]},
+                state_dir=str(state_dir),
+                runtime_log=root / "missing.log",
+            )
+            self.assertEqual(missing["state"], "missing")
+
+            corrupt_path = state_file_for_chat(
+                "corrupt@chatroom", state_dir=str(state_dir)
+            )
+            Path(corrupt_path).write_text("{broken", encoding="utf-8")
+            corrupt = monitor_state_health(
+                {"monitor_chats": [{"username": "corrupt@chatroom"}]},
+                state_dir=str(state_dir),
+                runtime_log=root / "missing.log",
+            )
+            self.assertEqual(corrupt["state"], "corrupt")
+
+    def test_latest_monitor_runtime_result_resets_old_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "out.log"
+            log.write_text(
+                "[monitor] monitor_state_conflict: monitor_state_conflict\n"
+                "[monitor] 命中[notification-muted]: redacted\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(latest_monitor_runtime_result(log), "notified")
+
+    def test_source_inventory_health_is_read_only_and_counts_degradation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_root = root / "db_storage"
+            source_root.mkdir()
+            config = {"db_dir": str(source_root)}
+            inventory_path = root / "source_inventory.json"
+            store = SourceInventoryStore(path=inventory_path)
+            _cache_namespace, namespace = source_namespaces_for_root(source_root)
+            store.reconcile(namespace, [
+                {
+                    "relative_path": "message/message_0.db",
+                    "generation_id": "generation-0",
+                    "state": "present",
+                },
+                {
+                    "relative_path": "message/message_1.db",
+                    "generation_id": "generation-1",
+                    "state": "present",
+                },
+            ])
+            store.reconcile(namespace, [
+                {
+                    "relative_path": "message/message_0.db",
+                    "generation_id": "generation-0",
+                    "state": "present",
+                },
+                {
+                    "relative_path": "message/message_2.db",
+                    "generation_id": "generation-2",
+                    "state": "cache_only",
+                },
+            ])
+
+            report = source_inventory_health(config, store=store)
+            self.assertEqual(report["state"], "degraded")
+            self.assertEqual(report["counts"]["present"], 1)
+            self.assertEqual(report["counts"]["missing_file"], 1)
+            self.assertEqual(report["counts"]["cache_only"], 1)
+            self.assertEqual(report["shards"], [])
+            self.assertNotIn(str(source_root), str(report))
+            self.assertNotIn("message/message_0.db", str(report))
+
+            absent_path = root / "absent-inventory.json"
+            absent = source_inventory_health(
+                config,
+                store=SourceInventoryStore(path=absent_path),
+            )
+            self.assertEqual(absent["state"], "uninitialized")
+            self.assertFalse(absent_path.exists())
+            self.assertFalse(Path(str(absent_path) + ".lock").exists())
+
     def test_health_check_reports_v1_singleton_as_one_active_chat(self):
         config = {
             "monitor_chat_username": "room@chatroom",
@@ -350,6 +503,7 @@ gui/501/com.example.wechat-summary = {
                 "db_dir": str(db_dir),
                 "ai_provider": "qwen",
                 "ai_model": "model-private",
+                "ai_base_url": "https://api.private.invalid/v1?token=TOPSECRET",
                 "monitor_enabled": True,
                 "monitor_interval_minutes": 3,
                 "monitor_chats": [
@@ -410,6 +564,71 @@ gui/501/com.example.wechat-summary = {
                      },
                      create=True,
                  ), \
+                 patch(
+                     "scripts.health_check.monitor_state_health",
+                     return_value={
+                         "state": "conflict",
+                         "chat_count": 2,
+                         "counts": {"healthy": 2, "missing": 0, "corrupt": 0},
+                         "runtime_result": "monitor_state_conflict",
+                         "cursor_chats": 2,
+                         "shard_cursors": 6,
+                         "generation_bound": 6,
+                         "inventory_bound_chats": 2,
+                         "legacy_states": 0,
+                     },
+                 ), \
+                 patch(
+                     "scripts.health_check.source_inventory_health",
+                     return_value={
+                         "state": "degraded",
+                         "complete": False,
+                         "counts": {
+                             "present": 2,
+                             "generation_changed": 0,
+                             "missing_file": 1,
+                             "cache_only": 1,
+                             "key_missing": 0,
+                             "unreadable": 0,
+                         },
+                         "error_codes": ["source_missing_file", "source_cache_only"],
+                         "shards": [{
+                             "relative_path": "private/account/message_0.db",
+                             "logical_shard_id": "opaque",
+                             "generation_id": "opaque-generation",
+                             "state": "present",
+                         }],
+                     },
+                 ), \
+                 patch(
+                     "scripts.health_check.inspect_mounted_resource_backup",
+                     return_value={
+                         "state": "ready",
+                         "enabled": True,
+                         "target_configured": True,
+                         "handoff_semantics": "sync_delegated",
+                         "delivery_counts": {"sync_delegated": 7},
+                         "provider_side_sync": "unknown",
+                         "remote_verified": False,
+                     },
+                 ), \
+                 patch(
+                     "scripts.health_check.GoogleDriveFileSync.inspect_status",
+                     return_value={
+                         "state": "enabled",
+                         "auth": "connected",
+                         "selected_chat_count": 2,
+                         "queue_counts": {},
+                         "last_scan_at": 10,
+                         "last_verified_upload_at": 9,
+                         "next_retry_at": 0,
+                         "root_state": "ready",
+                         "root_web_view_link": "https://drive.invalid/?token=TOPSECRET",
+                         "uploaded_unique_objects": 3,
+                         "shortcut_placements": 4,
+                         "last_error_code": "",
+                     },
+                 ), \
                  patch("scripts.health_check.check_new_databases", return_value=[]), \
                  patch("scripts.health_check.EXTRACT_LOG", str(key_log)):
                 output = StringIO()
@@ -428,6 +647,36 @@ gui/501/com.example.wechat-summary = {
             self.assertIn("expected io.github.indeliblevivi.we-groupchat-obsidian", text)
             self.assertNotIn("/private/runtime/Python.app", text)
             self.assertIn("Sensitive key extraction log: present", text)
+            self.assertIn("Monitor state: conflict", text)
+            self.assertIn(
+                "Source inventory: degraded; present=2; generation_changed=0; "
+                "missing=1; cache_only=1",
+                text,
+            )
+            self.assertIn(
+                "Mounted resource handoff: runtime=ready; "
+                "handoff=sync_delegated; target=configured; delegated_objects=7; "
+                "provider_side_sync=unknown; remote_verified=False",
+                text,
+            )
+            self.assertIn(
+                "Link preview: state=link_preview_disabled; network_requests=0",
+                text,
+            )
+            self.assertIn(
+                "MCP compatibility: legacy_read_only; send=mcp_send_retired",
+                text,
+            )
+            self.assertIn(
+                "Windows: W0.1 import/dependency boundary only; "
+                "product_support=not_claimed",
+                text,
+            )
+            self.assertIn(
+                "Google Drive API remote verification: "
+                "verified_ledger_objects; verified_objects=3",
+                text,
+            )
             self.assertNotIn(str(db_dir), text)
             self.assertNotIn(str(obsidian_root), text)
             self.assertNotIn("secret-one@chatroom", text)
@@ -438,6 +687,10 @@ gui/501/com.example.wechat-summary = {
             self.assertNotIn("secret-title.md", text)
             self.assertNotIn("/private/raw stderr", text)
             self.assertNotIn("com.private.label", text)
+            self.assertNotIn("private/account/message_0.db", text)
+            self.assertNotIn("api.private.invalid", text)
+            self.assertNotIn("drive.invalid", text)
+            self.assertNotIn("TOPSECRET", text)
 
     def test_health_check_sensitive_mode_reveals_paths_chats_topics_and_logs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -503,6 +756,47 @@ gui/501/com.example.wechat-summary = {
                      },
                      create=True,
                  ), \
+                 patch(
+                     "scripts.health_check.monitor_state_health",
+                     return_value={
+                         "state": "healthy",
+                         "chat_count": 1,
+                         "counts": {"healthy": 1, "missing": 0, "corrupt": 0},
+                         "runtime_result": "no_messages",
+                         "cursor_chats": 1,
+                         "shard_cursors": 1,
+                         "generation_bound": 1,
+                         "inventory_bound_chats": 1,
+                         "legacy_states": 0,
+                     },
+                 ), \
+                 patch(
+                     "scripts.health_check.source_inventory_health",
+                     return_value={
+                         "state": "complete",
+                         "complete": True,
+                         "counts": {"present": 1},
+                         "error_codes": [],
+                         "shards": [{
+                             "relative_path": "message/message_0.db",
+                             "logical_shard_id": "opaque-shard",
+                             "generation_id": "opaque-generation",
+                             "state": "present",
+                         }],
+                     },
+                 ), \
+                 patch(
+                     "scripts.health_check.inspect_mounted_resource_backup",
+                     return_value={
+                         "state": "disabled",
+                         "enabled": False,
+                         "target_configured": False,
+                         "handoff_semantics": "target_not_configured",
+                         "delivery_counts": {},
+                         "provider_side_sync": "unknown",
+                         "remote_verified": False,
+                     },
+                 ), \
                  patch("scripts.health_check.EXTRACT_LOG", str(key_log)):
                 output = StringIO()
                 with redirect_stdout(output):
@@ -517,6 +811,7 @@ gui/501/com.example.wechat-summary = {
             self.assertIn("/private/raw stderr", text)
             self.assertIn("/Applications/WeGroupchatObsidian.app", text)
             self.assertIn("com.private.label", text)
+            self.assertIn("message/message_0.db", text)
 
     def test_delete_sensitive_key_log_requires_explicit_flag(self):
         with tempfile.TemporaryDirectory() as tmp:

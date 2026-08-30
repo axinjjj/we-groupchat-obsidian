@@ -27,7 +27,11 @@ from urllib.parse import quote
 
 from .attachment_archive import ArchiveError
 from .config import DATA_DIR
-from .resource_capture import ResourceCaptureError, SelectedResourceCapture
+from .resource_capture import (
+    ResourceCaptureError,
+    SelectedResourceCapture,
+    resource_capture_db_path,
+)
 from .url_safety import redact_url_for_display, redact_urls_in_text
 
 
@@ -2792,28 +2796,7 @@ class MountedResourceBackup:
         directory = self._snapshot_dir(snapshot_id)
         if not directory:
             return None
-        try:
-            with open(os.path.join(directory, "COMPLETE"), "rb") as handle:
-                complete_bytes = handle.read()
-            with open(os.path.join(directory, "manifest.json"), "rb") as handle:
-                manifest_bytes = handle.read()
-            with open(os.path.join(directory, "resources.jsonl"), "rb") as handle:
-                resources_bytes = handle.read()
-            complete = json.loads(complete_bytes.decode("utf-8"))
-            manifest = json.loads(manifest_bytes.decode("utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            return None
-        if (
-            complete.get("schema") != BACKUP_SCHEMA
-            or complete.get("state") != "complete"
-            or manifest.get("schema") != BACKUP_SCHEMA
-            or complete.get("snapshot_id") != manifest.get("snapshot_id")
-            or complete.get("manifest_sha256") != hashlib.sha256(manifest_bytes).hexdigest()
-            or complete.get("resources_sha256") != hashlib.sha256(resources_bytes).hexdigest()
-            or manifest.get("resources_sha256") != hashlib.sha256(resources_bytes).hexdigest()
-        ):
-            return None
-        return {"directory": directory, "manifest": manifest}
+        return _read_complete_snapshot_directory(directory)
 
     def verify(self, snapshot_id=""):
         try:
@@ -2912,3 +2895,240 @@ class MountedResourceBackup:
             "remote_verified": False,
             "link_export_mode": self.link_export_mode,
         }
+
+
+def _read_complete_snapshot_directory(directory):
+    """Read and hash-bind one existing mounted snapshot without mutation."""
+    try:
+        complete_bytes = MountedResourceBackup._read_regular_bytes(
+            os.path.join(directory, "COMPLETE"),
+            error_code="snapshot_unavailable",
+        )
+        manifest_bytes = MountedResourceBackup._read_regular_bytes(
+            os.path.join(directory, "manifest.json"),
+            error_code="snapshot_unavailable",
+        )
+        resources_bytes = MountedResourceBackup._read_regular_bytes(
+            os.path.join(directory, "resources.jsonl"),
+            error_code="snapshot_unavailable",
+        )
+        complete = json.loads(complete_bytes.decode("utf-8"))
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (
+        ResourceBackupError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        OSError,
+    ):
+        return None
+    if (
+        complete.get("schema") != BACKUP_SCHEMA
+        or complete.get("state") != "complete"
+        or manifest.get("schema") != BACKUP_SCHEMA
+        or complete.get("snapshot_id") != manifest.get("snapshot_id")
+        or complete.get("manifest_sha256")
+        != hashlib.sha256(manifest_bytes).hexdigest()
+        or complete.get("resources_sha256")
+        != hashlib.sha256(resources_bytes).hexdigest()
+        or manifest.get("resources_sha256")
+        != hashlib.sha256(resources_bytes).hexdigest()
+    ):
+        return None
+    return {"directory": directory, "manifest": manifest}
+
+
+def _read_snapshot_metadata_directory(directory):
+    """Validate snapshot control files without opening the resource catalog."""
+    try:
+        complete_bytes = MountedResourceBackup._read_regular_bytes(
+            os.path.join(directory, "COMPLETE"),
+            error_code="snapshot_unavailable",
+        )
+        manifest_bytes = MountedResourceBackup._read_regular_bytes(
+            os.path.join(directory, "manifest.json"),
+            error_code="snapshot_unavailable",
+        )
+        complete = json.loads(complete_bytes.decode("utf-8"))
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (
+        ResourceBackupError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        OSError,
+    ):
+        return None
+    if (
+        complete.get("schema") != BACKUP_SCHEMA
+        or complete.get("state") != "complete"
+        or manifest.get("schema") != BACKUP_SCHEMA
+        or complete.get("snapshot_id") != manifest.get("snapshot_id")
+        or complete.get("manifest_sha256")
+        != hashlib.sha256(manifest_bytes).hexdigest()
+        or complete.get("resources_sha256") != manifest.get("resources_sha256")
+    ):
+        return None
+    return {"directory": directory, "manifest": manifest}
+
+
+def inspect_mounted_resource_backup(config, *, settings_path=SETTINGS_FILE):
+    """Inspect mounted handoff evidence without creating or migrating state.
+
+    The result is path-free and provider-neutral.  It validates the existing
+    destination binding and latest hash-bound snapshot, but never claims that
+    a desktop sync provider uploaded those bytes to its remote service.
+    """
+    config = dict(config or {})
+    settings = _read_resource_backup_settings_unlocked(settings_path)
+    configured_target = str(
+        config.get("resource_backup_target") or settings.get("target") or ""
+    ).strip()
+    target = (
+        os.path.abspath(os.path.expanduser(configured_target))
+        if configured_target else ""
+    )
+    enabled = bool(config.get("resource_backup_enabled", False))
+    result = {
+        "state": "disabled" if not enabled else "target_not_configured",
+        "enabled": enabled,
+        "target_configured": bool(target),
+        "handoff_semantics": "target_not_configured",
+        "provider_side_sync": "unknown",
+        "remote_verified": False,
+        "latest_snapshot": False,
+        "source_complete": False,
+        "delivery_counts": {},
+        "link_export_mode": _normalized_link_export_mode(
+            settings.get("link_export_mode")
+        ),
+        "last_error_code": "",
+    }
+    if not target:
+        return result
+    if not os.path.isdir(target):
+        result.update({
+            "state": "destination_unavailable",
+            "handoff_semantics": "destination_unavailable",
+            "last_error_code": "destination_unavailable",
+        })
+        return result
+
+    marker_path = os.path.join(
+        target,
+        "wgo-resource-backup",
+        DESTINATION_MARKER_NAME,
+    )
+    try:
+        marker = json.loads(MountedResourceBackup._read_regular_bytes(
+            marker_path,
+            error_code="destination_identity_missing",
+        ).decode("utf-8"))
+        destination_id = str(uuid.UUID(str(marker.get("destination_uuid") or "")))
+        if marker.get("schema") != DESTINATION_MARKER_SCHEMA:
+            raise ValueError("destination identity schema")
+    except (
+        ResourceBackupError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        ValueError,
+    ):
+        result.update({
+            "state": "destination_identity_missing",
+            "handoff_semantics": "destination_identity_missing",
+            "last_error_code": "destination_identity_missing",
+        })
+        return result
+
+    db_path = resource_capture_db_path(config)
+    if not os.path.isfile(db_path):
+        result.update({
+            "state": "ledger_missing",
+            "handoff_semantics": "pending",
+            "last_error_code": "resource_ledger_missing",
+        })
+        return result
+
+    conn = None
+    try:
+        uri = "file:" + quote(db_path, safe="/") + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        archive_row = conn.execute(
+            "SELECT value FROM resource_meta WHERE key = 'archive_id'"
+        ).fetchone()
+        archive_id = str(archive_row["value"] or "") if archive_row else ""
+        if not archive_id or str(marker.get("archive_id") or "") != archive_id:
+            result.update({
+                "state": "destination_archive_mismatch",
+                "handoff_semantics": "destination_archive_mismatch",
+                "last_error_code": "destination_archive_mismatch",
+            })
+            return result
+        state_row = conn.execute(
+            "SELECT snapshot_id FROM resource_backup_state WHERE destination_id = ?",
+            (destination_id,),
+        ).fetchone()
+        result["delivery_counts"] = {
+            str(row["status"]): int(row["count"])
+            for row in conn.execute(
+                "SELECT status, COUNT(*) AS count FROM resource_deliveries "
+                "WHERE destination_id = ? GROUP BY status",
+                (destination_id,),
+            )
+        }
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        result.update({
+            "state": "ledger_unreadable",
+            "handoff_semantics": "unknown",
+            "last_error_code": "resource_ledger_unreadable",
+        })
+        return result
+    finally:
+        if conn is not None:
+            conn.close()
+
+    if not state_row or not str(state_row["snapshot_id"] or ""):
+        result.update({
+            "state": "disabled" if not enabled else "ready",
+            "handoff_semantics": "pending",
+        })
+        return result
+    snapshot_id = str(state_row["snapshot_id"])
+    if os.path.basename(snapshot_id) != snapshot_id:
+        snapshot = None
+    else:
+        snapshot = _read_snapshot_metadata_directory(os.path.join(
+            target,
+            "wgo-resource-backup",
+            "v3",
+            "snapshots",
+            snapshot_id,
+        ))
+    if snapshot is None:
+        result.update({
+            "state": "snapshot_unavailable",
+            "handoff_semantics": "pending",
+            "last_error_code": "snapshot_unavailable",
+        })
+        return result
+    manifest = snapshot["manifest"]
+    if (
+        str(manifest.get("archive_id") or "") != archive_id
+        or str(manifest.get("snapshot_id") or "") != snapshot_id
+    ):
+        result.update({
+            "state": "snapshot_unavailable",
+            "handoff_semantics": "pending",
+            "last_error_code": "snapshot_unavailable",
+        })
+        return result
+    result.update({
+        "state": "disabled" if not enabled else "ready",
+        "handoff_semantics": str(
+            manifest.get("handoff_semantics") or "unknown"
+        ),
+        "latest_snapshot": True,
+        "source_complete": bool(
+            (manifest.get("source_observation") or {}).get("complete")
+        ),
+    })
+    return result

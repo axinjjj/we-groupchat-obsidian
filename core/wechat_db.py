@@ -18,7 +18,12 @@ from urllib.parse import quote
 import zstandard as zstd
 
 from .decryptor import WALSnapshotError, decrypt_database, decrypt_wal
-from .source_inventory import COMPLETE_STATES, SourceInventoryError, SourceInventoryStore
+from .source_inventory import (
+    COMPLETE_STATES,
+    SourceInventoryError,
+    SourceInventoryStore,
+    source_namespaces_for_root,
+)
 
 _zstd_dctx = zstd.ZstdDecompressor()
 
@@ -337,27 +342,9 @@ class WeChatDB:
             else SourceInventoryStore(path=None)
         )
         self._inventory_specs_by_generation = {}
-        source_root = os.path.realpath(self.db_dir)
-        source_stat = None
-        try:
-            source_stat = os.stat(source_root)
-            source_identity = (
-                f"{source_root}\0{source_stat.st_dev}\0{source_stat.st_ino}"
-            )
-        except OSError:
-            source_identity = f"{source_root}\0missing"
-        self.cache_namespace = hashlib.sha256(
-            source_identity.encode("utf-8")
-        ).hexdigest()
-        if source_stat is not None:
-            namespace_identity = (
-                f"{source_root}\0{source_stat.st_dev}:{source_stat.st_ino}"
-            )
-        else:
-            namespace_identity = self.cache_namespace
-        self.source_namespace = hashlib.sha256(
-            f"wechat-source-namespace-v1\0{namespace_identity}".encode("utf-8")
-        ).hexdigest()[:32]
+        self.cache_namespace, self.source_namespace = source_namespaces_for_root(
+            self.db_dir
+        )
         self.cache_dir = os.path.join(self.CACHE_DIR, self.cache_namespace)
         os.makedirs(self.cache_dir, exist_ok=True)
         try:

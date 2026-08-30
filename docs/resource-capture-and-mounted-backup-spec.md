@@ -456,6 +456,13 @@ the backup root and passes metadata-only `lstat`: regular, non-symlink, matching
 size. Ordinary classification, rendering, `plan`, and `status` do not hash target
 bytes or open the source CAS. Explicit `verify` retains full target hashing.
 
+The general redacted health check uses a stricter read-only inspection path: it
+does not create/migrate the capture ledger, does not open CAS payload objects,
+and reports only destination/snapshot control evidence plus delivery counts.
+Its mounted line always says `provider_side_sync=unknown` and
+`remote_verified=False`. Direct Drive API verification is a separate health
+line and never upgrades mounted handoff evidence.
+
 App/CLI reporting keeps the existing strict `completed` and CLI exit contract for
 compatibility, and adds `operational_success`, `coverage_complete`, and `coverage`.
 `operational_success` accepts a healthy capture/scan/resolution/projection cycle
