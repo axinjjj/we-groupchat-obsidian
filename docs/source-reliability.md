@@ -752,15 +752,50 @@ tranche deliberately provides no automatic restore or deletion.
 
 ## 7. Health and safe rollout
 
-The redacted health check reports source-guard effective state, last result,
-remaining restart budget, source freshness, attachment catalog counts/object
-count, optional attachment snapshots, and privacy-safe optional direct-Drive
-state. Mounted resource backup currently has its own explicit status surface:
+The redacted health check now gives one privacy-safe reliability matrix. It
+distinguishes monitor state `healthy|missing|corrupt|conflict`, counts
+generation-bound raw cursors, reads the configured source inventory without
+scanning or creating it, and reports complete/degraded plus present, missing,
+cache-only, key-missing, and unreadable counts. Source completeness means the
+expected logical-shard inventory is complete, the current generation set stays
+stable, and the required reads succeeded; it does not mean merely that one
+enumeration returned rows.
+
+The same health surface reports the existing mounted destination/snapshot
+handoff without opening CAS payload objects. Mounted `sync_delegated` remains
+`provider_side_sync=unknown` and `remote_verified=False`. A separate Direct
+Drive line reports the number of ledger objects that passed Drive API
+verification; that remote evidence is independent from source completeness.
+It also states the fixed product boundaries: remote link preview is
+`link_preview_disabled` with zero requests, MCP is legacy read-only with send
+retired, and Windows W0.1 is an import/dependency boundary only.
 
 ```bash
 .venv/bin/python scripts/health_check.py
 .venv/bin/python scripts/resource_backup.py status
 ```
+
+Default output contains no absolute paths, chat names/usernames, message text,
+source-relative paths, API endpoints, or token material. `--sensitive` is an
+explicit local-debug disclosure gate for paths, titles, and source-shard
+details.
+
+### Upgrade and migration behavior
+
+- A valid unversioned monitor state remains readable and is upgraded only by a
+  later successful locked write. Corrupt/non-regular state never migrates or
+  resets to now.
+- A legacy timestamp checkpoint seeds missing per-generation raw cursors only
+  under one complete inventory. Generation changes never inherit an old token.
+- Source-inventory health inspection never creates or migrates the ledger;
+  initialization happens only during an actual source scan.
+- Legacy `monitor_fetch_links=true` loads as disabled, and legacy mounted
+  `link_export_mode=full` loads as `redacted`. Neither value restores the
+  retired network/export behavior.
+- Legacy MCP send keys remain parseable but inert; every old send tool returns
+  `mcp_send_retired`.
+- Windows W0.1 adds no source, monitor, backup, tray, autostart, packaging, or
+  sending activation. Later Windows phases remain separate migrations.
 
 A safe first mounted-backup rollout is:
 

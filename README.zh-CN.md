@@ -287,6 +287,20 @@ source install 与 LaunchAgent 继续使用。
 ./启动.command --uninstall-autostart
 ```
 
+默认 health output 保持 content-free、path-free，并把过去容易混成一团的状态拆开：
+
+| Health line | 它能证明什么 |
+| --- | --- |
+| `Monitor state` | 每个 selected chat 的 state 是 healthy、missing、corrupt，或最近 runtime 观察到 revision conflict。Corrupt state 会阻断推进，绝不会自动 reset to now。 |
+| `Monitor raw cursor progress` | 只输出 checkpointed chat 数和 generation-bound shard cursor 数，不输出 chat/cursor value。 |
+| `Source inventory` | 区分 complete、degraded 与 uninitialized，并分别统计 present、missing、cache-only、key-missing、unreadable。只有 expected inventory 完整、current generations 稳定且 required reads 全部成功，才能叫 source complete。 |
+| `Mounted resource handoff` | 只读检查现有 destination binding 与 latest snapshot handoff；即使是 `sync_delegated`，也明确保留 `provider_side_sync=unknown`、`remote_verified=False`。 |
+| `Google Drive API remote verification` | 可选 Direct Drive API ledger 中经过 remote verification 的 object 数；它与 source completeness、mounted delivery 都是不同事实。 |
+| `Link preview` / `MCP compatibility` / `Windows` | Preview 停用且零请求；MCP 为 legacy read-only、send retired；W0.1 只是 import/dependency boundary，不是 Windows 产品支持。 |
+
+只有显式 `--sensitive` 才可能显示本机 paths、chat names、topic titles、source-relative
+paths 与 opaque shard IDs。默认输出不打印这些值，也不打印 message text、API endpoint 或 token material。
+
 面向 monitor 的维护脚本：
 
 ```bash

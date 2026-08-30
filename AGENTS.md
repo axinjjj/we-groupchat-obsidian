@@ -32,6 +32,16 @@
   Monitor/catch-up may read only a complete inventory. Resource and Direct
   Drive scanners may consume present generations while reporting
   `source_degraded`; they must never relabel that partial observation complete.
+- `scripts/health_check.py` is the canonical operator health matrix. Its
+  default output is path-free and content-free: no chat identity/body,
+  source-relative path, local absolute path, API endpoint, or token. It must
+  distinguish monitor healthy/missing/corrupt/conflict, source inventory
+  completeness/counts, raw cursor progress, mounted handoff with provider sync
+  unknown, separate Direct Drive verification, disabled link preview, legacy
+  read-only/send-retired MCP, and the Windows W0.1 import-only boundary.
+  Health inspection must not scan source, initialize/migrate the source
+  inventory, open CAS payload objects, or promote mounted evidence to remote
+  verification. Local details require explicit `--sensitive`.
 - `setup.py` is the py2app packaging entrypoint. These are the only Python
   files that belong at repository root.
 - `core/` owns domain behavior, durable state, privacy boundaries, recovery,

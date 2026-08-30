@@ -10,6 +10,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+import uuid
 from contextlib import redirect_stdout
 from pathlib import Path
 from urllib.parse import unquote
@@ -17,6 +18,9 @@ from unittest.mock import Mock, patch
 
 import scripts.resource_backup as resource_backup_cli
 from core.resource_backup import (
+    BACKUP_SCHEMA,
+    DESTINATION_MARKER_NAME,
+    DESTINATION_MARKER_SCHEMA,
     FILE_SURFACE_STATES,
     LOCAL_INDEX_MANIFEST_SCHEMA,
     MountedResourceBackup,
@@ -26,6 +30,7 @@ from core.resource_backup import (
     _safe_month,
     classify_file_occurrence,
     evaluate_resource_backup_outcome,
+    inspect_mounted_resource_backup,
     load_resource_backup_settings,
     save_resource_backup_settings,
     summarize_file_coverage,
@@ -251,6 +256,119 @@ class ResourceBackupTests(unittest.TestCase):
     @staticmethod
     def _digest(data):
         return hashlib.sha256(data).hexdigest()
+
+    def test_read_only_mounted_health_inspector_reports_verified_handoff(self):
+        archive_id = "archive-health-fixture"
+        destination_id = str(uuid.uuid4())
+        snapshot_id = "20260830T120000Z-health"
+        marker_dir = Path(self.target) / "wgo-resource-backup"
+        marker_dir.mkdir(parents=True, exist_ok=True)
+        (marker_dir / DESTINATION_MARKER_NAME).write_text(json.dumps({
+            "schema": DESTINATION_MARKER_SCHEMA,
+            "archive_id": archive_id,
+            "destination_uuid": destination_id,
+        }), encoding="utf-8")
+
+        conn = sqlite3.connect(self.capture_db)
+        conn.executescript(
+            """
+            CREATE TABLE resource_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE resource_deliveries (
+                destination_id TEXT NOT NULL,
+                object_sha256 TEXT NOT NULL,
+                object_size INTEGER NOT NULL,
+                target_relpath TEXT NOT NULL,
+                status TEXT NOT NULL,
+                last_error_code TEXT NOT NULL DEFAULT '',
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(destination_id, object_sha256)
+            );
+            CREATE TABLE resource_backup_state (
+                destination_id TEXT PRIMARY KEY,
+                catalog_sha256 TEXT NOT NULL DEFAULT '',
+                snapshot_id TEXT NOT NULL DEFAULT '',
+                updated_at REAL NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO resource_meta(key, value) VALUES ('archive_id', ?)",
+            (archive_id,),
+        )
+        conn.execute(
+            "INSERT INTO resource_deliveries VALUES (?, ?, ?, ?, ?, '', ?)",
+            (destination_id, "a" * 64, 3, "objects/sha256/aa/object", "sync_delegated", 1),
+        )
+        conn.execute(
+            "INSERT INTO resource_backup_state VALUES (?, ?, ?, ?)",
+            (destination_id, "catalog", snapshot_id, 1),
+        )
+        conn.commit()
+        conn.close()
+
+        snapshot_dir = (
+            marker_dir / "v3" / "snapshots" / snapshot_id
+        )
+        snapshot_dir.mkdir(parents=True)
+        resources_bytes = b""
+        resources_sha256 = hashlib.sha256(resources_bytes).hexdigest()
+        manifest = {
+            "schema": BACKUP_SCHEMA,
+            "archive_id": archive_id,
+            "snapshot_id": snapshot_id,
+            "handoff_semantics": "sync_delegated",
+            "source_observation": {"complete": True},
+            "resources_sha256": resources_sha256,
+        }
+        manifest_bytes = (
+            json.dumps(
+                manifest,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ) + "\n"
+        ).encode("utf-8")
+        complete = {
+            "schema": BACKUP_SCHEMA,
+            "snapshot_id": snapshot_id,
+            "state": "complete",
+            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "resources_sha256": resources_sha256,
+        }
+        (snapshot_dir / "manifest.json").write_bytes(manifest_bytes)
+        (snapshot_dir / "COMPLETE").write_text(
+            json.dumps(complete), encoding="utf-8"
+        )
+
+        report = inspect_mounted_resource_backup({
+            **self.config,
+            "resource_backup_enabled": True,
+        }, settings_path=os.path.join(self.root, "missing-settings.json"))
+
+        self.assertEqual(report["state"], "ready")
+        self.assertEqual(report["handoff_semantics"], "sync_delegated")
+        self.assertEqual(report["delivery_counts"], {"sync_delegated": 1})
+        self.assertTrue(report["latest_snapshot"])
+        self.assertTrue(report["source_complete"])
+        self.assertEqual(report["provider_side_sync"], "unknown")
+        self.assertFalse(report["remote_verified"])
+        self.assertNotIn(self.target, str(report))
+        self.assertNotIn(destination_id, str(report))
+        self.assertFalse((snapshot_dir / "resources.jsonl").exists())
+
+    def test_read_only_mounted_health_inspector_does_not_create_settings(self):
+        settings_path = os.path.join(self.root, "absent", "settings.json")
+        report = inspect_mounted_resource_backup(
+            {"resource_backup_enabled": False},
+            settings_path=settings_path,
+        )
+
+        self.assertEqual(report["state"], "disabled")
+        self.assertEqual(report["handoff_semantics"], "target_not_configured")
+        self.assertEqual(report["provider_side_sync"], "unknown")
+        self.assertFalse(report["remote_verified"])
+        self.assertFalse(os.path.exists(settings_path))
+        self.assertFalse(os.path.exists(settings_path + ".lock"))
 
     def _write_candidate_files(self):
         first = b"first file bytes"

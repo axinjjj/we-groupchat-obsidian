@@ -610,13 +610,39 @@ DB/catalog 缺失时仍能工作。这一 tranche 故意没有 automatic restore
 
 ## 7. Health 与安全 rollout
 
-Redacted health check 会报告 source guard、source freshness、attachment catalog、optional attachment
-snapshot 与 privacy-safe optional direct-Drive state。Mounted resource backup 当前有独立 status surface：
+Redacted health check 现在提供一份 privacy-safe reliability matrix：明确区分 monitor state
+`healthy|missing|corrupt|conflict`，统计 generation-bound raw cursors；对 configured source inventory
+只读 inspect，不做 source scan、也不创建 ledger，并分别报告 complete/degraded、present、missing、
+cache-only、key-missing 与 unreadable。只有 expected logical-shard inventory 完整、current generation set
+保持稳定且 required reads 全部成功，才能叫 source complete；一次 enumeration 有 rows 不够。
+
+同一个 health surface 会只读报告现有 mounted destination/snapshot handoff，且不打开 CAS payload
+objects。Mounted `sync_delegated` 始终保留 `provider_side_sync=unknown` 与
+`remote_verified=False`。独立 Direct Drive 行只统计通过 Drive API verification 的 ledger objects；
+这份 remote evidence 与 source completeness 互不替代。Health 还直接写明三个固定产品边界：remote
+link preview 是 `link_preview_disabled` 且零请求；MCP 是 legacy read-only、send retired；Windows
+W0.1 只是一条 import/dependency boundary。
 
 ```bash
 .venv/bin/python scripts/health_check.py
 .venv/bin/python scripts/resource_backup.py status
 ```
+
+默认输出不含 absolute path、chat name/username、message text、source-relative path、API endpoint
+或 token material。只有显式 `--sensitive` 才会为本机 debug 披露 path、title 与 source-shard details。
+
+### Upgrade 与 migration 行为
+
+- 合法的 unversioned monitor state 仍可读取，只在之后一次成功的 locked write 中升级；corrupt 或
+  non-regular state 绝不 migrate，也绝不 reset to now。
+- Legacy timestamp checkpoint 只有在 complete inventory 下才用于 seed 缺失的 per-generation raw
+  cursors；generation change 绝不继承旧 token。
+- Source-inventory health inspection 不创建、不迁移 ledger；只有 actual source scan 才初始化。
+- 旧 `monitor_fetch_links=true` 加载后仍为 disabled；旧 mounted `link_export_mode=full` 加载为
+  `redacted`，两者都不能恢复已经退休的 network/export 行为。
+- Legacy MCP send keys 仍可解析但完全 inert；所有旧 send tool 固定返回 `mcp_send_retired`。
+- Windows W0.1 不激活 source、monitor、backup、tray、autostart、packaging 或 sending；后续 Windows
+  phase 是独立 migration。
 
 第一次安全启用 mounted backup 建议按下面顺序：
 

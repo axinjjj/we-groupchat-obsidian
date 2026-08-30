@@ -106,7 +106,7 @@ root, `ai/`, `core/`, `ui/`, and `scripts/` Python module and imports every
 | `scripts/configure_monitor.py` | `operator-deferred` | Depends on config, source, keychain, and knowledge activation. |
 | `scripts/daily_digest.py` | `operator-deferred` | Depends on W0.2 storage and W3 activation. |
 | `scripts/google_drive_file_sync.py` | `operator-deferred` | Depends on current auth/config/source adapters. |
-| `scripts/health_check.py` | `macos-only` | Reports LaunchAgent, notification identity, and macOS source state. |
+| `scripts/health_check.py` | `macos-only` | Privacy-safe reliability matrix plus LaunchAgent/notification/macOS source diagnostics; its Windows line reports the W0.1 import boundary only. |
 | `scripts/migrate_taxonomy.py` | `operator-deferred` | Depends on W0.2 config/knowledge storage. |
 | `scripts/organize_obsidian.py` | `operator-deferred` | Depends on W0.2 path/storage and W3 projection activation. |
 | `scripts/refresh_data_source.py` | `macos-only` | Invokes the current macOS key/process adapter. |
