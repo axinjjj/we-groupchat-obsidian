@@ -338,10 +338,12 @@ class SourceInventoryStore:
             temp_fd, temp_path = tempfile.mkstemp(
                 prefix=".source-inventory.", suffix=".json", dir=directory
             )
-            try:
-                os.fchmod(temp_fd, 0o600)
-            except OSError:
-                pass
+            fchmod = getattr(os, "fchmod", None)
+            if callable(fchmod):
+                try:
+                    fchmod(temp_fd, 0o600)
+                except OSError:
+                    pass
             with os.fdopen(temp_fd, "w", encoding="utf-8") as handle:
                 temp_fd = -1
                 json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)

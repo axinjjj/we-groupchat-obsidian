@@ -533,10 +533,12 @@ class ConfigStore:
             prefix=".config-", suffix=".json", dir=directory
         )
         try:
-            try:
-                os.fchmod(temp_fd, 0o600)
-            except OSError:
-                pass
+            fchmod = getattr(os, "fchmod", None)
+            if callable(fchmod):
+                try:
+                    fchmod(temp_fd, 0o600)
+                except OSError:
+                    pass
             with os.fdopen(temp_fd, "w", encoding="utf-8") as handle:
                 temp_fd = -1
                 json.dump(value, handle, indent=4, ensure_ascii=False)

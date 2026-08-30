@@ -145,10 +145,12 @@ class MonitorStateStore:
             dir=directory,
         )
         try:
-            try:
-                os.fchmod(temp_fd, 0o600)
-            except OSError:
-                pass
+            fchmod = getattr(os, "fchmod", None)
+            if callable(fchmod):
+                try:
+                    fchmod(temp_fd, 0o600)
+                except OSError:
+                    pass
             payload = {
                 "schema": MONITOR_STATE_SCHEMA,
                 "revision": int(revision),
