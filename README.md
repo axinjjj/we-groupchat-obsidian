@@ -8,11 +8,12 @@ local state, recovery/backup workers and a full regression suite; review the dat
 using it on real chat data. A bundled Python runtime or signed installer is not
 currently distributed.
 
-Windows port status: **W0.1 module inventory and import-boundary stage**. The
-complete W0 portability foundation is not yet finished. The repository now
-tracks an explicit module/import boundary and Windows CI, but W0.1 does not
-support Windows WeChat discovery, keys, database reads, monitoring, tray UI,
-backup, autostart, packaging, or sending. See
+Windows port status: **W0.2A portable file-lock stage**. The repository now has
+native macOS/Windows shared and exclusive lock backends for config, the menu-app
+singleton, monitor state, and source inventory, with real multiprocessing
+coverage. This is source portability only: it does not support Windows WeChat
+discovery, keys, database reads, monitoring, tray UI, backup, autostart,
+packaging, or sending. See
 [`docs/WINDOWS-PORT-MAP.md`](docs/WINDOWS-PORT-MAP.md) for the staged contract.
 
 A local-first macOS tool for reading your own WeChat desktop database, summarizing group chats, searching messages, and turning high-value group-chat updates into an Obsidian-friendly Markdown knowledge base.
@@ -341,7 +342,7 @@ operational facts that were previously easy to collapse:
 | `Source inventory` | Complete versus degraded/uninitialized inventory plus present, missing, cache-only, key-missing, and unreadable counts. “Complete” requires a complete expected-shard inventory, stable current generations, and successful reads. |
 | `Mounted resource handoff` | Existing destination binding and latest snapshot handoff evidence. `provider_side_sync=unknown` and `remote_verified=False` remain explicit even after `sync_delegated`. |
 | `Google Drive API remote verification` | Count of objects verified through the optional Direct Drive API ledger. It is separate from source completeness and mounted-folder delivery. |
-| `Link preview` / `MCP compatibility` / `Windows` | Preview is disabled with zero requests; MCP is legacy read-only and send-retired; W0.1 is only an import/dependency boundary, not Windows product support. |
+| `Link preview` / `MCP compatibility` / `Windows` | Preview is disabled with zero requests; MCP is legacy read-only and send-retired; W0.2A provides portable lock source only, not Windows product support. |
 
 `--sensitive` may show local paths, chat names, topic titles, source-relative
 paths, and opaque shard IDs for deliberate on-device debugging. Default output

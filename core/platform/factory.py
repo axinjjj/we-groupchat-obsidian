@@ -4,10 +4,27 @@ from __future__ import annotations
 import platform as runtime_platform
 from collections.abc import Callable
 
-from .contracts import PlatformName, PlatformServices
+from .contracts import FileLock, PlatformName, PlatformServices
 
 PlatformServicesProvider = Callable[[], PlatformServices]
-_PLATFORM_FACTORIES: dict[PlatformName, PlatformServicesProvider] = {}
+
+
+def _macos_services() -> PlatformServices:
+    from .macos_locks import MacOSFileLock
+
+    return PlatformServices(platform=PlatformName.MACOS, locks=MacOSFileLock())
+
+
+def _windows_services() -> PlatformServices:
+    from .windows_locks import WindowsFileLock
+
+    return PlatformServices(platform=PlatformName.WINDOWS, locks=WindowsFileLock())
+
+
+_PLATFORM_FACTORIES: dict[PlatformName, PlatformServicesProvider] = {
+    PlatformName.MACOS: _macos_services,
+    PlatformName.WINDOWS: _windows_services,
+}
 
 
 class PlatformServicesUnavailable(RuntimeError):
@@ -74,3 +91,7 @@ def create_platform_services(
     if services.platform is not selected:
         raise PlatformFactoryMismatch(selected, services.platform)
     return services
+
+
+def create_file_lock(platform_name: PlatformName | None = None) -> FileLock:
+    return create_platform_services(platform_name).require("locks")

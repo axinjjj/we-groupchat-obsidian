@@ -1,4 +1,5 @@
 import json
+import multiprocessing
 import os
 import sqlite3
 import subprocess
@@ -20,7 +21,56 @@ def _sqlite_file(path, table="messages"):
         conn.close()
 
 
+def _inventory_reconcile_worker(path, namespace, relative_path, start, result):
+    start.wait(10)
+    try:
+        snapshot = SourceInventoryStore(path).reconcile(
+            namespace,
+            [{
+                "relative_path": relative_path,
+                "generation_id": relative_path,
+                "state": "present",
+            }],
+        )
+        result.put(("ok", snapshot.inventory_revision))
+    except Exception as exc:
+        result.put((type(exc).__name__, str(exc)))
+
+
 class SourceInventoryStoreTests(unittest.TestCase):
+    def test_concurrent_reconcile_preserves_inventory_union_and_revisions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "source_inventory.json")
+            namespace = "concurrent-source"
+            context = multiprocessing.get_context("spawn")
+            start = context.Event()
+            result = context.Queue()
+            processes = [
+                context.Process(
+                    target=_inventory_reconcile_worker,
+                    args=(path, namespace, relative_path, start, result),
+                )
+                for relative_path in (
+                    "message/message_1.db",
+                    "message/message_2.db",
+                )
+            ]
+            for process in processes:
+                process.start()
+            start.set()
+            outcomes = [result.get(timeout=10) for _ in processes]
+            for process in processes:
+                process.join(10)
+                self.assertEqual(process.exitcode, 0)
+
+            self.assertEqual([outcome[0] for outcome in outcomes], ["ok", "ok"])
+            snapshot = SourceInventoryStore(path).inspect(namespace)
+            self.assertEqual(snapshot.inventory_revision, 2)
+            self.assertEqual(
+                {shard["relative_path"] for shard in snapshot.shards},
+                {"message/message_1.db", "message/message_2.db"},
+            )
+
     def test_wechat_db_import_does_not_require_posix_lock_module(self):
         script = """
 import builtins

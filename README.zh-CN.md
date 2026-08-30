@@ -7,9 +7,10 @@ operator CLI、持久化本地状态、recovery/backup workers 和完整 regress
 数据流和账号安全边界，再在真实聊天数据上使用。当前不分发 bundled Python runtime
 或已签名 installer。
 
-Windows 迁移当前处于 **W0.1 模块清单与 import 边界阶段**；完整的 W0 可移植性基础
-尚未完成。仓库建立了明确的模块/import 边界和 Windows CI，但 W0.1 不支持 Windows
-微信发现、密钥、数据库读取、monitor、托盘、backup、自启、打包或发送。分阶段契约见
+Windows 迁移当前处于 **W0.2A 可移植文件锁阶段**。仓库已经为 config、菜单 app
+单例、monitor state 和 source inventory 接入原生 macOS/Windows 共享锁与独占锁，
+并由真实多进程测试覆盖。这仍然只是源码可移植性：不支持 Windows 微信发现、密钥、
+数据库读取、monitor、托盘、backup、自启、打包或发送。分阶段契约见
 [`docs/WINDOWS-PORT-MAP.md`](docs/WINDOWS-PORT-MAP.md)。
 
 一个本地优先的 macOS 微信群聊总结工具。它读取你电脑上的微信本地数据库，生成群聊摘要、关键词搜索结果，并把值得关注的新消息整理成 Obsidian-friendly Markdown 笔记。
@@ -296,7 +297,7 @@ source install 与 LaunchAgent 继续使用。
 | `Source inventory` | 区分 complete、degraded 与 uninitialized，并分别统计 present、missing、cache-only、key-missing、unreadable。只有 expected inventory 完整、current generations 稳定且 required reads 全部成功，才能叫 source complete。 |
 | `Mounted resource handoff` | 只读检查现有 destination binding 与 latest snapshot handoff；即使是 `sync_delegated`，也明确保留 `provider_side_sync=unknown`、`remote_verified=False`。 |
 | `Google Drive API remote verification` | 可选 Direct Drive API ledger 中经过 remote verification 的 object 数；它与 source completeness、mounted delivery 都是不同事实。 |
-| `Link preview` / `MCP compatibility` / `Windows` | Preview 停用且零请求；MCP 为 legacy read-only、send retired；W0.1 只是 import/dependency boundary，不是 Windows 产品支持。 |
+| `Link preview` / `MCP compatibility` / `Windows` | Preview 停用且零请求；MCP 为 legacy read-only、send retired；W0.2A 只提供可移植锁源码，不是 Windows 产品支持。 |
 
 只有显式 `--sensitive` 才可能显示本机 paths、chat names、topic titles、source-relative
 paths 与 opaque shard IDs。默认输出不打印这些值，也不打印 message text、API endpoint 或 token material。

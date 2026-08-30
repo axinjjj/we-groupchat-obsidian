@@ -10,6 +10,7 @@ import stat
 import tempfile
 import threading
 
+from .platform import LockMode, create_file_lock
 from .project_identity import DATA_DIR_NAME
 
 
@@ -44,15 +45,6 @@ class SourceInventoryError(RuntimeError):
     def __init__(self, code: str):
         self.code = str(code)
         super().__init__(self.code)
-
-
-def _fcntl_module():
-    """Load the POSIX lock primitive only when durable storage is used."""
-    try:
-        import fcntl
-    except ModuleNotFoundError as exc:
-        raise SourceInventoryError("source_inventory_lock_unavailable") from exc
-    return fcntl
 
 
 def _ensure_private_dir(path: str) -> None:
@@ -228,7 +220,7 @@ class SourceInventoryStore:
 
     _DEFAULT = object()
 
-    def __init__(self, path=_DEFAULT):
+    def __init__(self, path=_DEFAULT, *, file_lock=None):
         if path is self._DEFAULT:
             path = SOURCE_INVENTORY_FILE
         self.path = (
@@ -237,6 +229,7 @@ class SourceInventoryStore:
             else ""
         )
         self.lock_path = self.path + ".lock" if self.path else ""
+        self._file_lock = file_lock
         self._memory_lock = threading.RLock()
         self._memory_payload = self._empty_payload()
 
@@ -317,31 +310,25 @@ class SourceInventoryStore:
             if fd >= 0:
                 os.close(fd)
 
-    def _lock(self) -> int:
-        fcntl = _fcntl_module()
+    def _lock_service(self):
+        if self._file_lock is None:
+            self._file_lock = create_file_lock()
+        return self._file_lock
+
+    def _lock(self):
         try:
             _ensure_private_dir(os.path.dirname(self.path))
-            fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            return self._lock_service().acquire(
+                self.lock_path,
+                mode=LockMode.EXCLUSIVE,
+                blocking=True,
+            )
         except OSError as exc:
             raise SourceInventoryError("source_inventory_lock_unavailable") from exc
-        try:
-            try:
-                os.fchmod(fd, 0o600)
-            except OSError:
-                pass
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            return fd
-        except Exception:
-            os.close(fd)
-            raise
 
     @staticmethod
-    def _unlock(fd: int) -> None:
-        fcntl = _fcntl_module()
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+    def _unlock(lock_handle) -> None:
+        lock_handle.close()
 
     def _write_file(self, payload: dict) -> None:
         directory = os.path.dirname(self.path)
@@ -351,10 +338,12 @@ class SourceInventoryStore:
             temp_fd, temp_path = tempfile.mkstemp(
                 prefix=".source-inventory.", suffix=".json", dir=directory
             )
-            try:
-                os.fchmod(temp_fd, 0o600)
-            except OSError:
-                pass
+            fchmod = getattr(os, "fchmod", None)
+            if callable(fchmod):
+                try:
+                    fchmod(temp_fd, 0o600)
+                except OSError:
+                    pass
             with os.fdopen(temp_fd, "w", encoding="utf-8") as handle:
                 temp_fd = -1
                 json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
