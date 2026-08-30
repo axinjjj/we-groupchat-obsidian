@@ -101,6 +101,25 @@ namespace 加 normalized relative path 构成；文件替换或 key rotation 只
 与 Direct Drive scanner 可以继续消费明确列出的 present generation，但整轮仍报告
 `source_degraded`。缺失 shard 回来后从自己的 cursor 继续，occurrence dedup 会阻止重复写入。
 
+### Monitor raw-row cursor authority
+
+`core/monitor_source.py` 把 complete inventory 变成一批 bounded monitor work。Durable
+`source_cursors` 以 logical shard 为 key，绑定当前 generation ID 与 opaque
+`(create_time, rowid)` token。Legacy timestamp checkpoint 只在某 generation 没有 cursor 时用于
+一次 seed；replacement generation 绝不会继承旧 generation 的 token。
+
+Reader 为每个 present shard 保留 bounded page，再按 `create_time` 与稳定 `source_message_id`
+做 k-way merge，并在 configured raw-row budget 停止。可提交 token 只从最后一条真正消费的 row
+派生，不能拿 fetched page end 冒充。被 presentation cleaning 过滤的 row 同样消耗 budget、推进
+自己的 shard cursor，但绝不进入 AI prompt。只有 filtered row 的批次返回
+`source_advanced_no_visible`；只有同一份 complete inventory 下所有 shard 的 verified raw EOF
+才能返回 `no_messages`。
+
+Visible row 可以搭配另行读取的 read-only overlap context；context 永远不改变 tentative cursor。
+AI/provider 失败不提交 cursor；AI/Knowledge 工作结束后、state CAS 之前还会复核 generation。
+Knowledge write 使用由 source IDs 派生的 `source_batch_id`：若 event 已 commit、state revision CAS
+却失败，retry 会 adopt 同一条 event，不再插入第二条 canonical event。
+
 Encrypted WAL reconstruction 会验证 SQLite WAL header 与 cumulative frame checksum，只回放到最后一个
 valid commit marker，按 committed database-page count 截断，并丢弃 uncommitted tail。发布 decrypted
 cache 前还会重新核对 main/WAL identity；并发 checkpoint、reset 或 replacement 只做一次 bounded retry，

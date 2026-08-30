@@ -33,6 +33,11 @@ from core.key_extractor import get_cached_keys
 from core.knowledge import KNOWLEDGE_DB, KnowledgeStore, build_message_hash
 from core.launch_agent import launch_agent_report
 from core.monitor import TopicMonitor, load_state, state_file_for_chat
+from core.monitor_source import (
+    MonitorSourceError,
+    read_monitor_source_batch,
+    supports_monitor_source_cursors,
+)
 from core.wechat_db import WeChatDB
 
 RECEIPTS_DIR = Path(DATA_DIR) / "catch_up_receipts"
@@ -44,6 +49,30 @@ def _pending_messages(db, username: str, state_path: str, limit: int) -> dict:
         checkpoint = float(state.get("last_checked_ts") or 0)
     except (TypeError, ValueError):
         checkpoint = 0
+    if supports_monitor_source_cursors(db):
+        try:
+            batch = read_monitor_source_batch(
+                db,
+                username,
+                state,
+                raw_limit=max(1, int(limit)) + 1,
+            )
+        except MonitorSourceError as exc:
+            return {
+                "checkpoint": checkpoint,
+                "count": None,
+                "capped": False,
+                "reason": exc.code,
+                "source_eof": False,
+            }
+        return {
+            "checkpoint": checkpoint,
+            "count": min(batch.raw_count, limit),
+            "capped": batch.raw_count > limit or not batch.source_eof,
+            "reason": "",
+            "source_eof": batch.source_eof,
+            "source_inventory_digest": batch.inventory_digest,
+        }
     if checkpoint <= 0:
         return {"checkpoint": 0, "count": None, "capped": False, "reason": "missing_checkpoint"}
 
@@ -218,10 +247,24 @@ def drain_monitors(
             chat_statuses[status] += 1
             per_chat[username]["statuses"] = dict(chat_statuses)
             if status == "no_messages":
-                complete.add(username)
-                per_chat[username]["outcome"] = "complete"
+                if result.get("source_eof") is True:
+                    complete.add(username)
+                    per_chat[username]["outcome"] = "complete"
+                else:
+                    block(username, "source_eof_unverified")
                 continue
-            if status in {"ai_backoff", "initialized", "missing_topic"}:
+            if status in {
+                "ai_backoff",
+                "initialized",
+                "missing_topic",
+                "monitor_state_conflict",
+                "monitor_source_cursors_corrupt",
+                "source_generation_changed",
+                "source_inventory_incomplete",
+                "source_inventory_invalid",
+                "source_inventory_unavailable",
+                "source_shard_unavailable",
+            }:
                 block(username, status)
                 continue
 

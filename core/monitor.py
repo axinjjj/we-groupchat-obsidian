@@ -35,6 +35,13 @@ from .api_errors import is_retryable_ai_error, normalize_ai_error
 from .review_queue import ReviewQueue
 from .daily_digest import source_window_dates
 from .monitor_state import MonitorStateError, MonitorStateStore
+from .monitor_source import (
+    MonitorSourceError,
+    initialize_monitor_source_state,
+    read_monitor_source_batch,
+    supports_monitor_source_cursors,
+    verify_monitor_source_inventory,
+)
 
 STATE_FILE = os.path.join(DATA_DIR, "monitor_state.json")
 STATE_DIR = os.path.join(DATA_DIR, "monitor_state")
@@ -68,6 +75,14 @@ def reset_state_to_now(path=STATE_FILE, now_func=time.time):
     """Reset the monitor checkpoint after changing target or interest text."""
     def mutate(state):
         state["last_checked_ts"] = now_func()
+        for key in (
+            "source_cursors",
+            "source_inventory_digest",
+            "source_inventory_revision",
+            "last_checked_message_hash_ts",
+            "last_checked_message_hashes",
+        ):
+            state.pop(key, None)
         state.pop("last_topic_key", None)
         state.pop("last_notified_ts", None)
 
@@ -128,18 +143,32 @@ class TopicMonitor:
         except MonitorStateError as exc:
             return self._state_error_result(exc)
         state = dict(snapshot.data)
+        source_cursor_mode = (
+            not dry_run and supports_monitor_source_cursors(self.db)
+        )
         if not dry_run and not snapshot.existed:
+            checkpoint = self.now_func()
+            initial_state = {"last_checked_ts": checkpoint}
+            if source_cursor_mode:
+                try:
+                    initial_state.update(
+                        initialize_monitor_source_state(self.db, checkpoint)
+                    )
+                except MonitorSourceError as exc:
+                    return self._source_error_result(exc)
             try:
-                initialized = self.state_store.initialize_if_absent({
-                    "last_checked_ts": self.now_func(),
-                })
+                initialized = self.state_store.initialize_if_absent(initial_state)
             except MonitorStateError as exc:
                 return self._state_error_result(exc)
             if not initialized.existed:
                 return {"status": "initialized", "message": "已从当前时间开始监控"}
             snapshot = initialized
             state = dict(snapshot.data)
-        if not dry_run and not state.get("last_checked_ts"):
+        if (
+            not dry_run
+            and not state.get("last_checked_ts")
+            and not state.get("source_cursors")
+        ):
             return {
                 "status": "monitor_state_missing_checkpoint",
                 "message": "monitor_state_missing_checkpoint",
@@ -151,41 +180,67 @@ class TopicMonitor:
                 return backoff_result
 
         since_ts = self._get_since_ts(state, dry_run)
-        max_messages = self.config.get("monitor_max_messages_per_run", 200)
-
-        query_since_ts = self._get_query_since_ts(since_ts)
-        page_forward = not dry_run and since_ts > 0
-        processed_hashes = (
-            self._processed_hashes_for_timestamp(state, since_ts)
-            if page_forward else set()
-        )
-        if page_forward and processed_hashes:
-            query_since_ts = min(query_since_ts, max(0, since_ts - 0.001))
-        query_limit = max_messages + self._context_max_messages()
-        if page_forward:
-            query_limit += len(processed_hashes)
-        scanned_messages = self.db.get_messages(
-            username,
-            since_ts=query_since_ts,
-            limit=query_limit,
-            page_forward=page_forward,
-        )
-        context_messages, messages = self._split_context_messages(
-            scanned_messages,
-            since_ts,
-            max_messages,
-            page_forward=page_forward,
-            processed_message_hashes=processed_hashes,
-        )
-        if page_forward and not messages and query_since_ts < since_ts:
-            # In very busy chats, the overlap window can contain more rows than
-            # the query limit. Re-query just before the checkpoint so old
-            # states without per-message hashes do not drop same-second rows.
-            retry_since_ts = max(0, since_ts - 0.001)
+        max_messages = max(1, int(
+            self.config.get("monitor_max_messages_per_run", 200)
+        ))
+        source_batch = None
+        if source_cursor_mode:
+            try:
+                source_batch = read_monitor_source_batch(
+                    self.db,
+                    username,
+                    state,
+                    raw_limit=max_messages,
+                )
+            except MonitorSourceError as exc:
+                return self._source_error_result(exc)
+            messages = list(source_batch.visible_messages)
+            if source_batch.raw_count == 0:
+                return self._commit_monitor_result(
+                    snapshot,
+                    state,
+                    {
+                        "status": "no_messages",
+                        "message": "没有新消息",
+                        "raw_message_count": 0,
+                        "source_eof": source_batch.source_eof,
+                    },
+                    source_batch,
+                )
+            if not messages:
+                return self._commit_monitor_result(
+                    snapshot,
+                    state,
+                    {
+                        "status": "source_advanced_no_visible",
+                        "message": "已推进源消息游标；本批没有可展示消息",
+                        "message_count": 0,
+                        "raw_message_count": source_batch.raw_count,
+                        "source_eof": source_batch.source_eof,
+                    },
+                    source_batch,
+                )
+            context_messages = self._source_cursor_context_messages(
+                state,
+                messages,
+                max_messages,
+            )
+        else:
+            query_since_ts = self._get_query_since_ts(since_ts)
+            page_forward = not dry_run and since_ts > 0
+            processed_hashes = (
+                self._processed_hashes_for_timestamp(state, since_ts)
+                if page_forward else set()
+            )
+            if page_forward and processed_hashes:
+                query_since_ts = min(query_since_ts, max(0, since_ts - 0.001))
+            query_limit = max_messages + self._context_max_messages()
+            if page_forward:
+                query_limit += len(processed_hashes)
             scanned_messages = self.db.get_messages(
                 username,
-                since_ts=retry_since_ts,
-                limit=max_messages + len(processed_hashes),
+                since_ts=query_since_ts,
+                limit=query_limit,
                 page_forward=page_forward,
             )
             context_messages, messages = self._split_context_messages(
@@ -195,8 +250,24 @@ class TopicMonitor:
                 page_forward=page_forward,
                 processed_message_hashes=processed_hashes,
             )
-        if not messages:
-            return {"status": "no_messages", "message": "没有新消息"}
+            if page_forward and not messages and query_since_ts < since_ts:
+                # Compatibility for pre-cursor adapters and dry-run reads only.
+                retry_since_ts = max(0, since_ts - 0.001)
+                scanned_messages = self.db.get_messages(
+                    username,
+                    since_ts=retry_since_ts,
+                    limit=max_messages + len(processed_hashes),
+                    page_forward=page_forward,
+                )
+                context_messages, messages = self._split_context_messages(
+                    scanned_messages,
+                    since_ts,
+                    max_messages,
+                    page_forward=page_forward,
+                    processed_message_hashes=processed_hashes,
+                )
+            if not messages:
+                return {"status": "no_messages", "message": "没有新消息"}
 
         messages_text = self.db.format_messages_for_ai(
             messages,
@@ -217,6 +288,15 @@ class TopicMonitor:
         except MonitorConfigError:
             raise
         except Exception:
+            if source_batch is not None:
+                try:
+                    verify_monitor_source_inventory(
+                        self.db,
+                        source_batch.inventory_digest,
+                        source_batch.inventory_revision,
+                    )
+                except MonitorSourceError as exc:
+                    return self._source_error_result(exc)
             raise
         normalized = self._normalize_decision(decision, messages)
         if not dry_run:
@@ -229,13 +309,20 @@ class TopicMonitor:
             "last_msg_ts": last_msg_ts,
             "decision": normalized,
         }
+        if source_batch is not None:
+            result.update({
+                "raw_message_count": source_batch.raw_count,
+                "source_eof": source_batch.source_eof,
+            })
 
-        if not dry_run:
+        if not dry_run and source_batch is None:
             self._advance_checkpoint_state(state, messages, last_msg_ts)
 
         if not normalized["match"] or normalized["score"] < 70:
             if not dry_run:
-                return self._commit_state_result(snapshot, state, result)
+                return self._commit_monitor_result(
+                    snapshot, state, result, source_batch
+                )
             return result
 
         if self._knowledge_enabled():
@@ -244,6 +331,9 @@ class TopicMonitor:
                 messages,
                 source_messages_text,
                 dry_run=dry_run,
+                source_batch_id=(
+                    source_batch.source_batch_id if source_batch is not None else ""
+                ),
             )
             result.update(knowledge_result)
             if dry_run:
@@ -252,18 +342,32 @@ class TopicMonitor:
 
             state["last_topic_key"] = normalized["topic_key"]
             if result.get("status") == "duplicate":
-                return self._commit_state_result(snapshot, state, result)
+                return self._commit_monitor_result(
+                    snapshot, state, result, source_batch
+                )
 
             if result.get("relation") in RELATION_NOTIFY:
                 state["last_notified_ts"] = self.now_func()
-                hit_path = self._save_hit(source_messages, normalized)
+                hit_path = self._save_hit(
+                    source_messages,
+                    normalized,
+                    source_batch_id=(
+                        source_batch.source_batch_id
+                        if source_batch is not None
+                        else ""
+                    ),
+                )
                 result["hit_path"] = hit_path
-            return self._commit_state_result(snapshot, state, result)
+            return self._commit_monitor_result(
+                snapshot, state, result, source_batch
+            )
 
         if self._is_in_cooldown(state, normalized):
             result["status"] = "cooldown"
             if not dry_run:
-                return self._commit_state_result(snapshot, state, result)
+                return self._commit_monitor_result(
+                    snapshot, state, result, source_batch
+                )
             return result
 
         result.update({
@@ -274,11 +378,19 @@ class TopicMonitor:
         })
 
         if not dry_run:
-            hit_path = self._save_hit(source_messages, normalized)
+            hit_path = self._save_hit(
+                source_messages,
+                normalized,
+                source_batch_id=(
+                    source_batch.source_batch_id if source_batch is not None else ""
+                ),
+            )
             state["last_topic_key"] = normalized["topic_key"]
             state["last_notified_ts"] = self.now_func()
             result["hit_path"] = hit_path
-            return self._commit_state_result(snapshot, state, result)
+            return self._commit_monitor_result(
+                snapshot, state, result, source_batch
+            )
 
         return result
 
@@ -286,6 +398,56 @@ class TopicMonitor:
     def _state_error_result(error):
         code = error.code if isinstance(error, MonitorStateError) else "monitor_state_error"
         return {"status": code, "message": code}
+
+    @staticmethod
+    def _source_error_result(error):
+        code = (
+            error.code
+            if isinstance(error, MonitorSourceError)
+            else "monitor_source_error"
+        )
+        return {"status": code, "message": code}
+
+    def _commit_monitor_result(self, snapshot, state, result, source_batch=None):
+        if source_batch is not None:
+            try:
+                verify_monitor_source_inventory(
+                    self.db,
+                    source_batch.inventory_digest,
+                    source_batch.inventory_revision,
+                )
+            except MonitorSourceError as exc:
+                return self._source_error_result(exc)
+            state_cursors = state.get("source_cursors")
+            already_current = (
+                source_batch.raw_count == 0
+                and isinstance(state_cursors, dict)
+                and state_cursors == source_batch.source_cursors
+                and str(state.get("source_inventory_digest") or "")
+                == source_batch.inventory_digest
+                and "last_checked_message_hash_ts" not in state
+                and "last_checked_message_hashes" not in state
+            )
+            if already_current:
+                result.setdefault(
+                    "source_inventory_digest", source_batch.inventory_digest
+                )
+                result.setdefault("source_eof", source_batch.source_eof)
+                result.setdefault("raw_message_count", source_batch.raw_count)
+                return result
+            state["source_cursors"] = {
+                key: dict(value)
+                for key, value in source_batch.source_cursors.items()
+            }
+            state["source_inventory_digest"] = source_batch.inventory_digest
+            state["source_inventory_revision"] = source_batch.inventory_revision
+            state["last_checked_ts"] = source_batch.last_checked_ts
+            state.pop("last_checked_message_hash_ts", None)
+            state.pop("last_checked_message_hashes", None)
+            result.setdefault("source_inventory_digest", source_batch.inventory_digest)
+            result.setdefault("source_eof", source_batch.source_eof)
+            result.setdefault("raw_message_count", source_batch.raw_count)
+        return self._commit_state_result(snapshot, state, result)
 
     def _commit_state_result(self, snapshot, state, result):
         try:
@@ -301,6 +463,34 @@ class TopicMonitor:
         if state.get("last_checked_ts"):
             return float(state["last_checked_ts"])
         return 0
+
+    def _source_cursor_context_messages(self, state, messages, raw_limit):
+        checkpoint = self._get_since_ts(state, False)
+        overlap_seconds = self._context_overlap_seconds()
+        context_limit = self._context_max_messages()
+        if checkpoint <= 0 or overlap_seconds <= 0 or context_limit <= 0:
+            return []
+        scanned = self.db.get_messages(
+            self.config.get("monitor_chat_username", "").strip(),
+            since_ts=max(0, checkpoint - overlap_seconds),
+            limit=context_limit + max(1, int(raw_limit)),
+            page_forward=False,
+        )
+        current_ids = {
+            str(message.get("source_message_id") or "")
+            for message in messages
+        }
+        context = [
+            message
+            for message in scanned
+            if self._message_timestamp(message) <= checkpoint
+            and str(message.get("source_message_id") or "") not in current_ids
+        ]
+        context.sort(key=lambda message: (
+            self._message_timestamp(message),
+            str(message.get("source_message_id") or ""),
+        ))
+        return context[-context_limit:]
 
     def _ai_backoff_result(self, state):
         try:
@@ -467,7 +657,14 @@ class TopicMonitor:
             return self.review_queue
         return ReviewQueue.from_config(self.config, now_func=self.now_func)
 
-    def _process_with_knowledge(self, decision, messages, messages_text, dry_run=False):
+    def _process_with_knowledge(
+        self,
+        decision,
+        messages,
+        messages_text,
+        dry_run=False,
+        source_batch_id="",
+    ):
         candidate = normalize_candidate(decision)
         candidate["source_chat"] = self.config.get("monitor_chat_display_name", "监控群聊")
         candidate["source_chat_username"] = str(self.config.get("monitor_chat_username") or "").strip()
@@ -533,7 +730,25 @@ class TopicMonitor:
                 relation_decision["related_topic_ids"] = related_ids
 
         status = "duplicate" if relation == "duplicate" else "notified"
-        knowledge = store.apply_event(candidate, messages, self.config, relation_decision)
+        if source_batch_id:
+            knowledge = store.apply_event(
+                candidate,
+                messages,
+                self.config,
+                relation_decision,
+                source_batch_id=source_batch_id,
+            )
+        else:
+            knowledge = store.apply_event(
+                candidate,
+                messages,
+                self.config,
+                relation_decision,
+            )
+        knowledge_reused = bool(knowledge.get("reused"))
+        if knowledge_reused:
+            status = "duplicate"
+            relation = normalize_relation(knowledge.get("relation") or relation)
         source_window = {
             "start": candidate.get("window_start", ""),
             "end": candidate.get("window_end", ""),
@@ -549,7 +764,10 @@ class TopicMonitor:
             "topic_key": decision["topic_key"],
             "knowledge_topic_id": knowledge.get("topic_id"),
             "knowledge_event_id": knowledge.get("event_id"),
-            "knowledge_event_written": knowledge.get("event_id") is not None,
+            "knowledge_event_written": (
+                knowledge.get("event_id") is not None and not knowledge_reused
+            ),
+            "knowledge_event_reused": knowledge_reused,
             "source_window": source_window,
             "affected_dates": source_window_dates(
                 self.config,
@@ -1270,9 +1488,13 @@ lead_key 用稳定短语描述这条资源线索，便于去重；没有 resourc
         last_notified = state.get("last_notified_ts", 0)
         return self.now_func() - float(last_notified or 0) < cooldown_min * 60
 
-    def _save_hit(self, messages, decision):
+    def _save_hit(self, messages, decision, *, source_batch_id=""):
         os.makedirs(self.hits_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = (
+            str(source_batch_id).removeprefix("wgbatch_")[:20]
+            if source_batch_id
+            else datetime.now().strftime("%Y%m%d_%H%M%S")
+        )
         safe_key = re.sub(r"[^0-9A-Za-z._-]+", "_", decision["topic_key"])[:40] or "hit"
         path = os.path.join(self.hits_dir, f"{timestamp}_{safe_key}.txt")
 
