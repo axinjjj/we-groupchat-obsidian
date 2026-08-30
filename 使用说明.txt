@@ -71,6 +71,11 @@ app process/session 内存里有效，重启后自动关闭。
      ./launchers/安装自动启动.command
      ./launchers/卸载自动启动.command
 
+“补跑遗漏笔记”默认只 audit。加 --apply 后，它会先停 managed LaunchAgent，再获取
+menu app 的同一把 singleton lock；如果显示 menu_app_active，不会写 monitor state、
+SQLite 或 Obsidian projection。不要同时开着手动 menu app 强行补跑，也不要手改
+monitor state JSON；corrupt/symlink state 会 fail closed，不会自动跳到 now。
+
 微信更新后先跑“健康检查”，只有它提示 DB key / re-sign / missing shard 问题时，
 再运行“刷新数据源”。普通健康检查默认 redacted；只有本机私下排查才考虑
 加 --sensitive。

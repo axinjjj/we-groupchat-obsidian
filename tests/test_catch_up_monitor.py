@@ -6,6 +6,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from core.app_runtime import AppAlreadyRunning
 from core.knowledge import KnowledgeStore, build_message_hash
 from core.monitor import save_state
 from scripts.catch_up_monitor import (
@@ -40,6 +41,18 @@ class FakeMonitor:
 
 
 class CatchUpMonitorTests(unittest.TestCase):
+    def setUp(self):
+        self.instance_lock = MagicMock()
+        self.instance_lock.acquire.return_value = self.instance_lock
+        self.instance_lock_patcher = patch(
+            "scripts.catch_up_monitor.AppInstanceLock",
+            return_value=self.instance_lock,
+        )
+        self.instance_lock_patcher.start()
+
+    def tearDown(self):
+        self.instance_lock_patcher.stop()
+
     def test_pending_messages_preserves_unprocessed_same_timestamp_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = os.path.join(tmp, "state.json")
@@ -233,6 +246,8 @@ class CatchUpMonitorTests(unittest.TestCase):
 
         self.assertEqual(result, 1)
         stop.assert_called_once_with(record)
+        self.instance_lock.acquire.assert_called_once_with()
+        self.instance_lock.release.assert_called_once_with()
         restore.assert_called_once_with(record)
         self.assertEqual(write_receipt.call_args.args[0]["state"], "failed")
 
@@ -269,6 +284,7 @@ class CatchUpMonitorTests(unittest.TestCase):
             )
 
         self.assertEqual(result, 0)
+        self.instance_lock.release.assert_called_once_with()
         rebuild.assert_called_once_with({}, ["2026-08-02", "2026-08-03"])
         self.assertEqual(write_receipt.call_args.args[0]["state"], "complete")
 
@@ -326,6 +342,7 @@ class CatchUpMonitorTests(unittest.TestCase):
             result = apply_catch_up({}, chats, FakeDB([]), args)
 
         self.assertEqual(result, 1)
+        self.instance_lock.release.assert_called_once_with()
         restore.assert_called_once_with(record)
         receipt = write_receipt.call_args.args[0]
         self.assertEqual(receipt["state"], "partial")
@@ -354,6 +371,105 @@ class CatchUpMonitorTests(unittest.TestCase):
         receipt = write_receipt.call_args.args[0]
         self.assertEqual(receipt["state"], "complete")
         self.assertEqual(receipt["outcome"], "no_op")
+
+    def test_apply_with_active_menu_app_performs_no_canonical_writes(self):
+        args = SimpleNamespace(audit_limit=100, max_pages_per_chat=5, max_minutes=5)
+        record = MagicMock(label="test.agent", plist_path=Path("/tmp/test.plist"))
+        status = MagicMock(loaded=True)
+        chats = [{"username": "private-chat", "name": "Private Chat"}]
+        audit = [{
+            "name": "Private Chat",
+            "username": "private-chat",
+            "checkpoint": 10,
+            "count": 1,
+            "capped": False,
+        }]
+        self.instance_lock.acquire.side_effect = AppAlreadyRunning("menu_app_already_running")
+
+        with (
+            patch("scripts.catch_up_monitor.audit_pending", return_value=audit),
+            patch("scripts.catch_up_monitor.launch_agent_report", return_value=(record, status)),
+            patch("scripts.catch_up_monitor._stop_launch_agent"),
+            patch("scripts.catch_up_monitor._restore_launch_agent") as restore,
+            patch("scripts.catch_up_monitor.backup_runtime_state") as backup,
+            patch("scripts.catch_up_monitor.TopicMonitor") as topic_monitor,
+            patch("scripts.catch_up_monitor.drain_monitors") as drain,
+            patch("scripts.catch_up_monitor.rebuild_projections") as rebuild,
+            patch("scripts.catch_up_monitor.validate_knowledge_db") as validate,
+            patch("scripts.catch_up_monitor.write_reconciliation_receipt") as write_receipt,
+        ):
+            result = apply_catch_up({}, chats, FakeDB([]), args)
+
+        self.assertEqual(result, 1)
+        backup.assert_not_called()
+        topic_monitor.assert_not_called()
+        drain.assert_not_called()
+        rebuild.assert_not_called()
+        validate.assert_not_called()
+        self.instance_lock.release.assert_not_called()
+        restore.assert_called_once_with(record)
+        receipt = write_receipt.call_args.args[0]
+        self.assertEqual(receipt["state"], "failed")
+        self.assertEqual(receipt["outcome"], "menu_app_active")
+        self.assertNotIn("Private Chat", str(receipt))
+        self.assertNotIn("private-chat", str(receipt))
+
+    def test_apply_holds_singleton_through_receipt_then_restores_agent(self):
+        args = SimpleNamespace(audit_limit=100, max_pages_per_chat=5, max_minutes=5)
+        record = MagicMock(label="test.agent", plist_path=Path("/tmp/test.plist"))
+        status = MagicMock(loaded=True)
+        chats = [{"username": "chat", "name": "Chat"}]
+        audit = [{
+            "name": "Chat",
+            "username": "chat",
+            "checkpoint": 10,
+            "count": 1,
+            "capped": False,
+        }]
+        drain_result = {
+            "complete": ["chat"],
+            "blocked": {},
+            "pages": {"chat": 1},
+            "statuses": {"no_match": 1},
+            "affected_dates": [],
+        }
+        events = []
+
+        class RecordingLock:
+            def acquire(self):
+                events.append("lock_acquired")
+                return self
+
+            def release(self):
+                events.append("lock_released")
+
+        with (
+            patch("scripts.catch_up_monitor.AppInstanceLock", return_value=RecordingLock()),
+            patch("scripts.catch_up_monitor.audit_pending", return_value=audit),
+            patch("scripts.catch_up_monitor.launch_agent_report", return_value=(record, status)),
+            patch("scripts.catch_up_monitor._stop_launch_agent", side_effect=lambda _record: events.append("agent_stopped")),
+            patch("scripts.catch_up_monitor.backup_runtime_state", side_effect=lambda *_args: events.append("backup") or Path("/tmp/backup")),
+            patch("scripts.catch_up_monitor.TopicMonitor"),
+            patch("scripts.catch_up_monitor.drain_monitors", side_effect=lambda *_args, **_kwargs: events.append("drain") or drain_result),
+            patch("scripts.catch_up_monitor.rebuild_projections", side_effect=lambda *_args: events.append("projections") or {"indexes": {}, "digests": []}),
+            patch("scripts.catch_up_monitor.validate_knowledge_db", side_effect=lambda *_args: events.append("validation") or {"ok": True}),
+            patch("scripts.catch_up_monitor.write_reconciliation_receipt", side_effect=lambda *_args: events.append("receipt") or Path("/tmp/receipt.json")),
+            patch("scripts.catch_up_monitor._restore_launch_agent", side_effect=lambda _record: events.append("agent_restored")),
+        ):
+            result = apply_catch_up({}, chats, FakeDB([]), args)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(events, [
+            "agent_stopped",
+            "lock_acquired",
+            "backup",
+            "drain",
+            "projections",
+            "validation",
+            "receipt",
+            "lock_released",
+            "agent_restored",
+        ])
 
 
 if __name__ == "__main__":

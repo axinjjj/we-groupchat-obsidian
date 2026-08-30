@@ -129,6 +129,12 @@ MCP 真实发送已经退休。prepare_send_message、confirm_send_message 与 s
 
 - ConfigStore 是 main config 的唯一 writer；每次写入都在 lock 内 patch latest revision。
 - 长驻 menu app 是 monitor、source guard 与 mounted-resource timer 的 runtime owner。
+- MonitorStateStore 是 per-chat checkpoint 的唯一 writer：valid legacy state 在成功 parse 后
+  才迁移；corrupt/symlink/non-regular fail closed；revision CAS 阻止 stale overwrite；AI
+  failure 不改 canonical state。
+- 补跑写入会在停 managed LaunchAgent 后再拿 menu app 同一把 AppInstanceLock，并持有到
+  backup、drain、projection、validation 与 receipt 全部结束；release 后才恢复 LaunchAgent。
+  `menu_app_active` 不做 canonical writes。
 - Retired short-lived source/resource LaunchAgent 只保留 inspect/uninstall cleanup，不能重装。
 - 所有 capture、backfill、archive、projection、handoff 都必须使用自己的 cross-process
   ownership locks；worker_busy 或 unknown 不是 success。

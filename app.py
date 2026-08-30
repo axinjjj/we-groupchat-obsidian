@@ -135,6 +135,7 @@ from core.monitor import (
     reset_state_to_now,
     state_file_for_chat,
 )
+from core.monitor_state import MonitorStateError
 from ai.factory import create_provider
 
 # Summary history save directory
@@ -1525,6 +1526,8 @@ class WeGroupchatObsidianApp(rumps.App):
 
         try:
             self._initialize_monitor_states_if_needed()
+        except MonitorStateError as exc:
+            print(f"[monitor] {exc.code}")
         except Exception:
             traceback.print_exc()
 
@@ -1585,7 +1588,11 @@ class WeGroupchatObsidianApp(rumps.App):
     def _last_monitor_checked_ts(self):
         values = []
         for chat in self._monitor_chats():
-            state = load_state(state_file_for_chat(chat["username"]))
+            try:
+                state = load_state(state_file_for_chat(chat["username"]))
+            except MonitorStateError as exc:
+                print(f"[monitor] {exc.code}")
+                return 0
             try:
                 values.append(float(state.get("last_checked_ts") or 0))
             except (TypeError, ValueError):
@@ -1610,8 +1617,12 @@ class WeGroupchatObsidianApp(rumps.App):
             self._delayed_run(self._show_monitor_chat_dialog)
             return
 
+        try:
+            self._initialize_monitor_states_if_needed()
+        except MonitorStateError as exc:
+            _notify("关注推送", "监控状态不可用", exc.code)
+            return
         self._update_config(patch={"monitor_enabled": True})
-        self._initialize_monitor_states_if_needed()
         self._configure_monitor_timer()
         _notify("关注推送", "已开启", "从当前时间开始，只检查新增消息")
         self._rebuild_monitor_menu()

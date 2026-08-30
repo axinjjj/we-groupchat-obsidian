@@ -11,7 +11,7 @@ import re
 import time
 from datetime import datetime
 
-from .config import DATA_DIR, ensure_private_dir, ensure_private_file
+from .config import DATA_DIR
 from .knowledge import (
     HUMAN_AI_INTIMACY_CATEGORIES,
     HUMAN_AI_INTIMACY_PROFILE,
@@ -34,6 +34,7 @@ from .link_preview import (
 from .api_errors import is_retryable_ai_error, normalize_ai_error
 from .review_queue import ReviewQueue
 from .daily_digest import source_window_dates
+from .monitor_state import MonitorStateError, MonitorStateStore
 
 STATE_FILE = os.path.join(DATA_DIR, "monitor_state.json")
 STATE_DIR = os.path.join(DATA_DIR, "monitor_state")
@@ -46,40 +47,31 @@ class MonitorConfigError(RuntimeError):
 
 
 def load_state(path=STATE_FILE):
-    """Load monitor state."""
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
+    """Compatibility reader backed by the canonical state store."""
+    return MonitorStateStore(path).read().data
 
 
 def save_state(state, path=STATE_FILE):
-    """Persist monitor state."""
-    ensure_private_dir(os.path.dirname(path))
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
-    ensure_private_file(path)
+    """Compatibility writer using one locked atomic update."""
+    MonitorStateStore(path).update(lambda _current: dict(state))
 
 
 def initialize_state_if_needed(path=STATE_FILE, now_func=time.time):
     """Set the first monitor checkpoint to now, avoiding historical floods."""
-    state = load_state(path)
-    if not state.get("last_checked_ts"):
-        state["last_checked_ts"] = now_func()
-        save_state(state, path)
-        return True
-    return False
+    snapshot = MonitorStateStore(path).initialize_if_absent({
+        "last_checked_ts": now_func(),
+    })
+    return not snapshot.existed
 
 
 def reset_state_to_now(path=STATE_FILE, now_func=time.time):
     """Reset the monitor checkpoint after changing target or interest text."""
-    state = load_state(path)
-    state["last_checked_ts"] = now_func()
-    state.pop("last_topic_key", None)
-    state.pop("last_notified_ts", None)
-    save_state(state, path)
+    def mutate(state):
+        state["last_checked_ts"] = now_func()
+        state.pop("last_topic_key", None)
+        state.pop("last_notified_ts", None)
+
+    MonitorStateStore(path).update(mutate)
 
 
 def state_file_for_chat(username, state_dir=STATE_DIR):
@@ -102,6 +94,7 @@ class TopicMonitor:
         knowledge_store=None,
         review_queue=None,
         link_preview_fetcher=None,
+        state_store=None,
         now_func=time.time,
     ):
         self.db = db
@@ -113,6 +106,7 @@ class TopicMonitor:
         self.knowledge_store = knowledge_store
         self.review_queue = review_queue
         self.link_preview_fetcher = link_preview_fetcher or fetch_link_preview
+        self.state_store = state_store or MonitorStateStore(state_file)
         self.now_func = now_func
 
     def check_once(self, dry_run=False):
@@ -129,11 +123,27 @@ class TopicMonitor:
         if not username:
             raise MonitorConfigError("监控群聊未配置")
 
-        state = load_state(self.state_file)
+        try:
+            snapshot = self.state_store.read()
+        except MonitorStateError as exc:
+            return self._state_error_result(exc)
+        state = dict(snapshot.data)
+        if not dry_run and not snapshot.existed:
+            try:
+                initialized = self.state_store.initialize_if_absent({
+                    "last_checked_ts": self.now_func(),
+                })
+            except MonitorStateError as exc:
+                return self._state_error_result(exc)
+            if not initialized.existed:
+                return {"status": "initialized", "message": "已从当前时间开始监控"}
+            snapshot = initialized
+            state = dict(snapshot.data)
         if not dry_run and not state.get("last_checked_ts"):
-            state["last_checked_ts"] = self.now_func()
-            save_state(state, self.state_file)
-            return {"status": "initialized", "message": "已从当前时间开始监控"}
+            return {
+                "status": "monitor_state_missing_checkpoint",
+                "message": "monitor_state_missing_checkpoint",
+            }
 
         if not dry_run:
             backoff_result = self._ai_backoff_result(state)
@@ -206,9 +216,7 @@ class TopicMonitor:
             decision = self._evaluate_with_retry(messages, messages_text, topic, link_context, context_text)
         except MonitorConfigError:
             raise
-        except Exception as e:
-            if not dry_run and is_retryable_ai_error(e):
-                self._record_ai_failure_state(state, e)
+        except Exception:
             raise
         normalized = self._normalize_decision(decision, messages)
         if not dry_run:
@@ -227,7 +235,7 @@ class TopicMonitor:
 
         if not normalized["match"] or normalized["score"] < 70:
             if not dry_run:
-                save_state(state, self.state_file)
+                return self._commit_state_result(snapshot, state, result)
             return result
 
         if self._knowledge_enabled():
@@ -244,20 +252,18 @@ class TopicMonitor:
 
             state["last_topic_key"] = normalized["topic_key"]
             if result.get("status") == "duplicate":
-                save_state(state, self.state_file)
-                return result
+                return self._commit_state_result(snapshot, state, result)
 
             if result.get("relation") in RELATION_NOTIFY:
                 state["last_notified_ts"] = self.now_func()
                 hit_path = self._save_hit(source_messages, normalized)
                 result["hit_path"] = hit_path
-            save_state(state, self.state_file)
-            return result
+            return self._commit_state_result(snapshot, state, result)
 
         if self._is_in_cooldown(state, normalized):
             result["status"] = "cooldown"
             if not dry_run:
-                save_state(state, self.state_file)
+                return self._commit_state_result(snapshot, state, result)
             return result
 
         result.update({
@@ -271,9 +277,21 @@ class TopicMonitor:
             hit_path = self._save_hit(source_messages, normalized)
             state["last_topic_key"] = normalized["topic_key"]
             state["last_notified_ts"] = self.now_func()
-            save_state(state, self.state_file)
             result["hit_path"] = hit_path
+            return self._commit_state_result(snapshot, state, result)
 
+        return result
+
+    @staticmethod
+    def _state_error_result(error):
+        code = error.code if isinstance(error, MonitorStateError) else "monitor_state_error"
+        return {"status": code, "message": code}
+
+    def _commit_state_result(self, snapshot, state, result):
+        try:
+            self.state_store.commit(snapshot.revision, state)
+        except MonitorStateError as exc:
+            return self._state_error_result(exc)
         return result
 
     def _get_since_ts(self, state, dry_run):
@@ -313,28 +331,6 @@ class TopicMonitor:
         except (TypeError, ValueError):
             delay = 3
         return max(0, min(60, delay))
-
-    def _ai_failure_backoff_minutes(self, failure_count):
-        try:
-            base_minutes = int(self.config.get("monitor_ai_failure_backoff_minutes", 10))
-        except (TypeError, ValueError):
-            base_minutes = 10
-        base_minutes = max(1, min(1440, base_minutes))
-        multiplier = 2 ** min(max(0, failure_count - 1), 3)
-        return min(60, base_minutes * multiplier)
-
-    def _record_ai_failure_state(self, state, error):
-        try:
-            failure_count = int(state.get("ai_failure_count") or 0) + 1
-        except (TypeError, ValueError):
-            failure_count = 1
-        now = self.now_func()
-        backoff_minutes = self._ai_failure_backoff_minutes(failure_count)
-        state["ai_failure_count"] = failure_count
-        state["ai_last_error"] = str(error)[:240]
-        state["ai_last_error_ts"] = int(now)
-        state["ai_next_retry_after"] = int(now + backoff_minutes * 60)
-        save_state(state, self.state_file)
 
     @staticmethod
     def _clear_ai_failure_state(state):

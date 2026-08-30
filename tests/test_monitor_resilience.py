@@ -1,8 +1,10 @@
 import os
+from pathlib import Path
 import tempfile
 import unittest
 
 from core.monitor import TopicMonitor, load_state, save_state
+from core.monitor_state import MonitorStateStore
 
 
 class FakeDB:
@@ -79,10 +81,10 @@ class TopicMonitorResilienceTests(unittest.TestCase):
         self.assertEqual(state["last_checked_ts"], 11)
         self.assertNotIn("ai_next_retry_after", state)
 
-    def test_retryable_ai_failure_sets_backoff_without_advancing_checkpoint(self):
+    def test_retryable_ai_failure_leaves_state_unchanged(self):
         self.config["monitor_ai_retry_attempts"] = 0
-        self.config["monitor_ai_failure_backoff_minutes"] = 10
         save_state({"last_checked_ts": 10}, self.state_file)
+        original = Path(self.state_file).read_bytes()
         calls = []
 
         def fail_evaluation(*_):
@@ -94,18 +96,13 @@ class TopicMonitorResilienceTests(unittest.TestCase):
 
         state = load_state(self.state_file)
         self.assertEqual(state["last_checked_ts"], 10)
-        self.assertEqual(state["ai_failure_count"], 1)
-        self.assertEqual(state["ai_next_retry_after"], 1600)
-
-        result = self.monitor(FakeDB([msg(11, "普通闲聊")]), fail_evaluation, now=1001).check_once()
-
-        self.assertEqual(result["status"], "ai_backoff")
         self.assertEqual(len(calls), 1)
-        self.assertEqual(load_state(self.state_file)["last_checked_ts"], 10)
+        self.assertEqual(Path(self.state_file).read_bytes(), original)
 
-    def test_empty_ai_response_sets_backoff_without_advancing_checkpoint(self):
+    def test_empty_ai_response_leaves_state_unchanged(self):
         self.config["monitor_ai_retry_attempts"] = 0
         save_state({"last_checked_ts": 10}, self.state_file)
+        original = Path(self.state_file).read_bytes()
 
         def empty_response(*_):
             raise RuntimeError("deepseek API 返回空响应，请稍后重试")
@@ -115,8 +112,42 @@ class TopicMonitorResilienceTests(unittest.TestCase):
 
         state = load_state(self.state_file)
         self.assertEqual(state["last_checked_ts"], 10)
-        self.assertEqual(state["ai_failure_count"], 1)
-        self.assertGreater(state["ai_next_retry_after"], 1000)
+        self.assertEqual(Path(self.state_file).read_bytes(), original)
+
+    def test_corrupt_state_fails_closed_without_calling_ai_or_initializing(self):
+        original = b'{"last_checked_ts":'
+        Path(self.state_file).write_bytes(original)
+        calls = []
+
+        result = self.monitor(
+            FakeDB([msg(11, "可能值得记录的新内容")]),
+            lambda *_: calls.append(True),
+        ).check_once()
+
+        self.assertEqual(result["status"], "monitor_state_corrupt")
+        self.assertEqual(calls, [])
+        self.assertEqual(Path(self.state_file).read_bytes(), original)
+
+    def test_stale_monitor_commit_returns_conflict_without_overwrite(self):
+        save_state({"last_checked_ts": 10}, self.state_file)
+        store = MonitorStateStore(self.state_file)
+
+        def concurrent_evaluation(*_):
+            def mutate(state):
+                state["concurrent_writer"] = True
+
+            store.update(mutate)
+            return {"match": False, "score": 20}
+
+        result = self.monitor(
+            FakeDB([msg(11, "普通闲聊")]),
+            concurrent_evaluation,
+        ).check_once()
+
+        self.assertEqual(result["status"], "monitor_state_conflict")
+        state = load_state(self.state_file)
+        self.assertEqual(state["last_checked_ts"], 10)
+        self.assertTrue(state["concurrent_writer"])
 
 
 if __name__ == "__main__":
