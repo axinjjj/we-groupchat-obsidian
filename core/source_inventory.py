@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import fcntl
 import hashlib
 import json
 import os
@@ -11,11 +10,16 @@ import stat
 import tempfile
 import threading
 
-from .config import DATA_DIR, ensure_private_dir, ensure_private_file
+from .project_identity import DATA_DIR_NAME
 
 
 SOURCE_INVENTORY_SCHEMA = "we-groupchat-obsidian.source-inventory.v1"
-SOURCE_INVENTORY_FILE = os.path.join(DATA_DIR, "source_inventory.json")
+SOURCE_INVENTORY_FILE = os.path.join(
+    os.path.expanduser(
+        os.environ.get("WE_GROUPCHAT_OBSIDIAN_DATA_DIR", f"~/{DATA_DIR_NAME}")
+    ),
+    "source_inventory.json",
+)
 SOURCE_STATES = frozenset({
     "present",
     "missing_file",
@@ -40,6 +44,27 @@ class SourceInventoryError(RuntimeError):
     def __init__(self, code: str):
         self.code = str(code)
         super().__init__(self.code)
+
+
+def _fcntl_module():
+    """Load the POSIX lock primitive only when durable storage is used."""
+    try:
+        import fcntl
+    except ModuleNotFoundError as exc:
+        raise SourceInventoryError("source_inventory_lock_unavailable") from exc
+    return fcntl
+
+
+def _ensure_private_dir(path: str) -> None:
+    from .config import ensure_private_dir
+
+    ensure_private_dir(path)
+
+
+def _ensure_private_file(path: str) -> None:
+    from .config import ensure_private_file
+
+    ensure_private_file(path)
 
 
 def normalize_relative_source_path(value: str) -> str:
@@ -262,8 +287,9 @@ class SourceInventoryStore:
                 os.close(fd)
 
     def _lock(self) -> int:
+        fcntl = _fcntl_module()
         try:
-            ensure_private_dir(os.path.dirname(self.path))
+            _ensure_private_dir(os.path.dirname(self.path))
             fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         except OSError as exc:
             raise SourceInventoryError("source_inventory_lock_unavailable") from exc
@@ -280,6 +306,7 @@ class SourceInventoryStore:
 
     @staticmethod
     def _unlock(fd: int) -> None:
+        fcntl = _fcntl_module()
         try:
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
@@ -305,7 +332,7 @@ class SourceInventoryStore:
                 os.fsync(handle.fileno())
             os.replace(temp_path, self.path)
             temp_path = ""
-            ensure_private_file(self.path)
+            _ensure_private_file(self.path)
             try:
                 directory_fd = os.open(directory, os.O_RDONLY)
             except OSError:

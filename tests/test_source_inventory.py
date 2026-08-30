@@ -1,6 +1,8 @@
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -19,6 +21,29 @@ def _sqlite_file(path, table="messages"):
 
 
 class SourceInventoryStoreTests(unittest.TestCase):
+    def test_wechat_db_import_does_not_require_posix_lock_module(self):
+        script = """
+import builtins
+original_import = builtins.__import__
+
+def guarded_import(name, *args, **kwargs):
+    if name == "fcntl":
+        raise ModuleNotFoundError("fcntl intentionally unavailable")
+    return original_import(name, *args, **kwargs)
+
+builtins.__import__ = guarded_import
+import core.wechat_db
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.path.dirname(os.path.dirname(__file__)),
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
     def test_inspect_absent_inventory_is_read_only(self):
         with tempfile.TemporaryDirectory() as root:
             path = os.path.join(root, "private", "source_inventory.json")
