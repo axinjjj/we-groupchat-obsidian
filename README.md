@@ -3,8 +3,8 @@
 Local-first WeChat group chat summaries, monitor review, and Obsidian knowledge output.
 
 Status: functional, source-distributed macOS application. It has a menu-bar app,
-MCP server, operator CLIs, durable local state, recovery/backup workers and a
-full regression suite; review the data-flow and account-safety notes before
+an optional legacy read-only MCP compatibility server, operator CLIs, durable
+local state, recovery/backup workers and a full regression suite; review the data-flow and account-safety notes before
 using it on real chat data. A bundled Python runtime or signed installer is not
 currently distributed.
 
@@ -17,7 +17,7 @@ backup, autostart, packaging, or sending. See
 
 A local-first macOS tool for reading your own WeChat desktop database, summarizing group chats, searching messages, and turning high-value group-chat updates into an Obsidian-friendly Markdown knowledge base.
 
-This is not official WeChat/Tencent software, not a WeChat bot, not employee-monitoring software, and not fully offline when you enable cloud AI, remote link preview, or MCP sending. It does not use a WeChat API, does not run a remote service, and does not send your chat history to this project. The app reads local database files on your Mac and calls the AI provider you configure.
+This is not official WeChat/Tencent software, not a WeChat bot, not employee-monitoring software, and not fully offline when you enable cloud AI or remote link preview. It does not use a WeChat API, does not run a remote service, and does not send your chat history to this project. The app reads local database files on your Mac and calls the AI provider you configure. Optional MCP read tools separately expose selected local chat-derived data to the MCP client you configure.
 
 Project lineage: this standalone derivative builds on [Qizhan7/mac-wechat-summary](https://github.com/Qizhan7/mac-wechat-summary), which established the local macOS menu-bar summary and MCP foundation. This repository is not connected through GitHub's fork network and is not maintained as an upstream pull-request branch; it continues as a separate local-first Obsidian workflow project. See [NOTICE.md](NOTICE.md).
 
@@ -152,9 +152,8 @@ Its most important boundaries are:
   Ollama can keep AI interpretation local, while public URL context remains off
   by default and is treated as untrusted input.
 - Saving knowledge, interrupting with a notification, and creating later action
-  in Review Queue are separate decisions. WeChat UI sending is a separate,
-  guarded path that is disabled by default and requires an unchanged
-  `prepare_send_message` / `confirm_send_message` nonce flow.
+  in Review Queue are separate decisions. MCP is an optional legacy read-only
+  compatibility surface; its former WeChat UI sending path is retired.
 
 The boxes are logical responsibilities inside one local application, not
 independently deployed microservices. Editable sources:
@@ -178,7 +177,7 @@ independently deployed microservices. Editable sources:
 - Optional advanced selected-chat file sync through the Google Drive API, with a separate selection/control plane, durable queue, chat/month shortcuts, retry/reconcile, and no automatic deletion.
 - Optional link preview context for public URLs; it is off by default and must be enabled explicitly.
 - CLI and `.command` maintenance entrypoints for users whose menu bar icon is hidden.
-- MCP server for read-only chat lookup, search, summaries, images, and optional UI-based sending.
+- Optional legacy read-only MCP compatibility server for chat lookup, search, summaries, images, and existing group/bookmark inspection. It cannot send messages or mutate local metadata.
 
 ## Privacy and Safety
 
@@ -212,8 +211,8 @@ independently deployed microservices. Editable sources:
   attachment cache.
 - Cloud AI providers receive the text you ask them to summarize. Use Ollama if you want the AI step to stay local.
 - Remote link previews are disabled by default. If you set `monitor_fetch_links: true`, the app fetches public URLs found in monitored messages, and those remote sites may receive your request metadata. Link preview has a conservative SSRF guard, but it is still a best-effort public URL preview, not a hardened crawler.
-- MCP read tools expose local chat-derived data to the MCP client. Some management tools can mutate local metadata such as groups or config-derived state.
-- MCP sending is disabled by default. Real UI-based sending requires `mcp_send_mode` (`allowlist` or `enabled`), macOS Accessibility permission, and the `prepare_send_message` -> user confirmation -> `confirm_send_message` nonce flow.
+- MCP read tools expose local chat-derived data to the configured MCP client and may pass it to the configured AI provider for summaries. MCP is read-only: it does not advance bookmarks or mutate group metadata.
+- MCP message sending is retired, not merely disabled. The legacy `prepare_send_message`, `confirm_send_message`, and `send_message` tool names return the stable content-free code `mcp_send_retired` and never touch WeChat UI. Legacy send config keys remain loadable but are inert.
 
 Before making a fork public, run a local scan:
 
@@ -638,33 +637,18 @@ Example Claude Desktop config:
 }
 ```
 
-The MCP server is read-oriented by default, but read tools can expose local chat-derived data to the MCP client, and management tools may mutate local metadata such as group configuration. Message sending is controlled by an explicit local mode:
+The MCP server is an **optional legacy read-only compatibility surface**. Its
+read and summary tools expose local chat-derived data to the MCP client and,
+for AI summaries, to the AI provider configured by the user. Summary calls do
+not advance bookmarks. `manage_chat_groups` permits only `list`; its former
+create/delete/add/remove actions return `mcp_mutation_retired`.
 
-```json
-{
-  "mcp_send_mode": "disabled"
-}
-```
-
-Supported modes:
-
-- `disabled`: never send.
-- `dry_run`: report the target and text without touching WeChat; no nonce is needed.
-- `allowlist`: only send to stable usernames in `mcp_send_allowlist`.
-- `enabled`: allow named-target sends.
-
-Blank targets are rejected in every non-disabled mode. For allowlists, use stable WeChat usernames such as `example@chatroom`, not display names:
-
-```json
-{
-  "mcp_send_mode": "allowlist",
-  "mcp_send_allowlist": ["example@chatroom"]
-}
-```
-
-The old `mcp_enable_send_message: true` setting is still read as a backward-compatible shortcut for `enabled`, but new installs should use `mcp_send_mode`.
-
-Real sends use a two-step confirmation flow. First call `prepare_send_message(text, chat_name)` and show the returned nonce, target, text preview, and expiry to the user. Only after the user confirms, call `confirm_send_message(nonce, text, chat_name)` with the exact same target and text. The compatibility `send_message` tool now prepares a nonce in real-send modes instead of sending immediately.
+MCP message sending is retired. The legacy `prepare_send_message`,
+`confirm_send_message`, and `send_message` tool names remain registered for one
+compatibility release, but every call returns `mcp_send_retired` without
+reading send configuration, importing a UI sender, or touching WeChat. Existing
+`mcp_enable_send_message`, `mcp_send_mode`, and `mcp_send_allowlist` config keys
+remain loadable so old config files continue to parse; their values are inert.
 
 ## Repository Layout
 
@@ -756,7 +740,7 @@ This fork started from the same core idea as the upstream project: read the user
 - Attachment durability is split into a catalog, session-local byte consent, private CAS, and filesystem snapshots. Identical bytes deduplicate; images are a separate opt-in; archive failure does not roll back a knowledge event or monitor checkpoint.
 - The default no-OAuth selected-resource lane preserves exact link/file occurrences and hands ready-local CAS objects, a privacy-bounded catalog, and resource indexes to a mounted filesystem. Selection mutation, archive claims, projection roots, handoff targets, and manifest archive identity have explicit cross-process ownership/CAS boundaries.
 - Direct Google Drive API sync is a separate opt-in advanced backend with its own selection, OAuth, durable queue, server-confirmed resumable upload, chat/month shortcuts, and reconciliation semantics.
-- The public repository removes personal runtime defaults and carries regression coverage for config, source snapshots/guard, attachment archive/backup, resource capture/projection/handoff, Drive, monitor, review queue, daily digest, notifications, MCP confirmation, and exact-commit publication contracts.
+- The public repository removes personal runtime defaults and carries regression coverage for config, source snapshots/guard, attachment archive/backup, resource capture/projection/handoff, Drive, monitor, review queue, daily digest, notifications, MCP read-only retirement, and exact-commit publication contracts.
 
 ## Upstream
 

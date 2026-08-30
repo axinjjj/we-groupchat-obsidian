@@ -253,10 +253,11 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg["mcp_send_mode"], "allowlist")
         self.assertEqual(cfg["mcp_send_allowlist"], ["room@chatroom", "wxid_example"])
 
-    def test_legacy_mcp_send_boolean_maps_to_enabled_mode(self):
+    def test_legacy_mcp_send_boolean_does_not_activate_send_mode(self):
         cfg = _sanitize_config({"mcp_enable_send_message": True})
 
-        self.assertEqual(cfg["mcp_send_mode"], "enabled")
+        self.assertTrue(cfg["mcp_enable_send_message"])
+        self.assertEqual(cfg["mcp_send_mode"], "disabled")
 
     def test_daily_digest_defaults_and_sanitized_config(self):
         cfg = _sanitize_config({

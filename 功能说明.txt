@@ -116,14 +116,11 @@ monitor checkpoint 倒退成“没处理过”。
 MCP 可以让 Claude Desktop、Claude Code、Cursor、OpenClaw 等 client 查询 chat list、
 读取消息、搜索、总结和查看图片。Read tools 会把本机 chat-derived data 暴露给 client。
 
-真实 UI 发送默认 disabled：
-
-- dry_run 只展示目标和内容，不触碰微信。
-- allowlist 只允许稳定 username 列表。
-- enabled 仍然拒绝空目标。
-- allowlist/enabled 必须先 prepare_send_message，给人核对 exact target/text，再以
-  未过期 nonce 调 confirm_send_message；compatibility send_message 不会绕过确认。
-- 真实发送还需要 macOS Accessibility permission，并在写入后做数据库 readback。
+它是可选 legacy read-only compatibility surface：summary 不推进 bookmark；
+manage_chat_groups 只允许 list；旧 mutation actions 返回 mcp_mutation_retired。
+MCP 真实发送已经退休。prepare_send_message、confirm_send_message 与 send_message
+暂时保留旧 tool name，但始终只返回 mcp_send_retired，不读 config、不 import sender、
+不触碰微信 UI。旧 send config keys 完全 inert。
 
 
 ============================================

@@ -152,15 +152,15 @@
   <rect x="540" y="910" width="180" height="34" rx="17.0" fill="#FFFFFF" fill-opacity="1.0" stroke="#64748B" stroke-width="1.5"/>
   <text x="630.0" y="930.808" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="11.2" font-weight="600" font-style="normal" letter-spacing="0" fill="#334155" opacity="1.0">.command + CLI</text>
   <rect x="740" y="910" width="210" height="34" rx="17.0" fill="#FFFFFF" fill-opacity="1.0" stroke="#64748B" stroke-width="1.5"/>
-  <text x="845.0" y="930.706" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="10.9" font-weight="600" font-style="normal" letter-spacing="0" fill="#334155" opacity="1.0">MCP&#xFF08;&#x8BFB;&#x4F18;&#x5148;&#xFF09; &#xB7; MCP (read-first)</text>
+  <text x="845.0" y="930.706" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="10.9" font-weight="600" font-style="normal" letter-spacing="0" fill="#334155" opacity="1.0">MCP &#x65E7;&#x7248;&#x53EA;&#x8BFB; &#xB7; MCP legacy read-only</text>
   <rect x="970" y="904" width="280" height="46" rx="23.0" fill="#FEF2F2" fill-opacity="1.0" stroke="#DC2626" stroke-width="1.5"/>
-  <text x="1110.0" y="930.536" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="10.4" font-weight="600" font-style="normal" letter-spacing="0" fill="#B91C1C" opacity="1.0">&#x53D1;&#x9001;&#x9ED8;&#x8BA4;&#x5173;&#x95ED; &#xB7; send disabled by default</text>
-  <text x="1110" y="968" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="10.2" font-weight="620" font-style="normal" letter-spacing="0" fill="#B91C1C" opacity="1.0">allowlist &#xB7; prepare / confirm nonce</text>
+  <text x="1110.0" y="930.536" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="10.4" font-weight="600" font-style="normal" letter-spacing="0" fill="#B91C1C" opacity="1.0">MCP &#x53D1;&#x9001;&#x5DF2;&#x9000;&#x4F11; &#xB7; MCP send retired</text>
+  <text x="1110" y="968" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="10.2" font-weight="620" font-style="normal" letter-spacing="0" fill="#B91C1C" opacity="1.0">mcp_send_retired &#xB7; &#x65E0; UI path</text>
   <rect x="1690" y="785" width="180" height="95" rx="18" fill="#FEF2F2" fill-opacity="1.0" stroke="#DC2626" stroke-width="2" stroke-dasharray="7 5"/>
-  <text x="1780" y="814" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="14" font-weight="760" font-style="normal" letter-spacing="0" fill="#0F172A" opacity="1.0">&#x5FAE;&#x4FE1; UI &#x53D1;&#x9001; &#xB7; WeChat UI send</text>
+  <text x="1780" y="814" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="14" font-weight="760" font-style="normal" letter-spacing="0" fill="#0F172A" opacity="1.0">MCP &#x65E0; UI &#x53D1;&#x9001; &#xB7; No MCP UI send</text>
   <text x="1780" y="838" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="10.5" font-weight="500" fill="#475569">
-    <tspan x="1780" dy="0">&#x53D7;&#x63A7;&#x80FD;&#x529B; &#xB7; guarded</tspan>
-    <tspan x="1780" dy="16">&#x5185;&#x5BB9;&#x53D8;&#x5316;&#x5373;&#x62D2;&#x7EDD; &#xB7; reject on change</tspan>
+    <tspan x="1780" dy="0">sender &#x5DF2;&#x79FB;&#x9664; &#xB7; sender removed</tspan>
+    <tspan x="1780" dy="16">&#x517C;&#x5BB9; tool &#x65E0;&#x526F;&#x4F5C;&#x7528; &#xB7; inert compatibility stubs</tspan>
   </text>
   <rect x="100" y="1010" width="700" height="170" rx="22" fill="#FAF5FF" fill-opacity="1.0" stroke="#9333EA" stroke-width="2.2"/>
   <text x="124" y="1044" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="18" font-weight="780" font-style="normal" letter-spacing="0" fill="#0F172A" opacity="1.0">&#x6709;&#x754C;&#x589E;&#x957F;&#x8F68;</text>

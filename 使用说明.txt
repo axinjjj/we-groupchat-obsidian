@@ -102,8 +102,8 @@ archive；Obsidian note 可以链接到私有归档 object，但附件 bytes 不
   actionable Review Queue。
 - 可选 source guard、本地附件 CAS、filesystem snapshot、selected-resource
   mounted backup，以及独立 opt-in 的 Google Drive API advanced lane。
-- 默认关闭远程 URL preview、附件 bytes 解析、archive、resource backup、
-  source guard 和 MCP 真实发送；不要因为看到命令存在就把它们当成已经启用。
+- 默认关闭远程 URL preview、附件 bytes 解析、archive、resource backup 和
+  source guard；MCP 真实发送已经退休，不存在可重新启用的 mode。
 - Mounted target 只证明目标 filesystem bytes/readback，不证明云端 provider 已上传。
 - 每轮 mounted backup 会维护 wgo-resource-backup/00-打开微信资源备份.md；也可从菜单
   “在 Finder 打开文件备份”直接进入。入口分成“文件备份”“待补齐附件”“资源索引”：
@@ -112,9 +112,10 @@ archive；Obsidian note 可以链接到私有归档 object，但附件 bytes 不
   “已备份”只表示 mounted target 已交付并即时校验，不表示 provider 云端同步已经完成。
 - 历史 resource backfill 先生成 bounded plan，再用同一个未过期 run_id apply；
   不会在确认后重新无限 rescan。
-- MCP 读取会把本机 chat-derived data 暴露给 MCP client。真实发送默认 disabled，
-  必须显式选择 allowlist/enabled，并走 prepare_send_message -> 人工确认 ->
-  confirm_send_message 的 nonce 流程。
+- MCP 是可选 legacy read-only compatibility surface；读取会把本机
+  chat-derived data 暴露给 MCP client，AI summary 还会进入用户配置的 provider。
+  它不推进 bookmark、不改分组，也不能发送微信消息。旧 send tool 只返回
+  mcp_send_retired。
 
 更完整的能力索引见 功能说明.txt；准确的 architecture、commands 和 privacy contract
 仍请以 README.zh-CN.md、docs/source-reliability.zh-CN.md 和

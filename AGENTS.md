@@ -4,6 +4,11 @@
 
 - `app.py` is the macOS menu-bar and py2app application entrypoint.
 - `mcp_server.py` is the direct FastMCP entrypoint.
+- MCP is an optional legacy read-only compatibility surface. It may query and
+  summarize, but must not mutate bookmarks/groups or touch WeChat UI. The old
+  send tool names are inert `mcp_send_retired` stubs; legacy send config keys
+  remain loadable but inactive. Do not restore sender/policy/confirmation
+  modules or a send-side effect path.
 - `setup.py` is the py2app packaging entrypoint. These are the only Python
   files that belong at repository root.
 - `core/` owns domain behavior, durable state, privacy boundaries, recovery,

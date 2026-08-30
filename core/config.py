@@ -365,12 +365,11 @@ def _sanitize_config(saved):
         if isinstance(value, bool):
             cfg[key] = value
 
-    if cfg.get("mcp_enable_send_message") and "mcp_send_mode" not in saved:
-        cfg["mcp_send_mode"] = "enabled"
-    else:
-        mode = str(saved.get("mcp_send_mode") or cfg["mcp_send_mode"]).strip().lower()
-        if mode in {"disabled", "dry_run", "allowlist", "enabled"}:
-            cfg["mcp_send_mode"] = mode
+    # Legacy MCP send keys remain loadable for old config files, but are inert.
+    # In particular, never translate the retired boolean into an active mode.
+    mode = str(saved.get("mcp_send_mode") or cfg["mcp_send_mode"]).strip().lower()
+    if mode in {"disabled", "dry_run", "allowlist", "enabled"}:
+        cfg["mcp_send_mode"] = mode
 
     allowlist = saved.get("mcp_send_allowlist")
     if isinstance(allowlist, list):

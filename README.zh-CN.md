@@ -2,7 +2,7 @@
 
 本地优先的微信群聊总结、关注推送与 Obsidian 知识库工具。
 
-当前状态：可完整运行的 source-distributed macOS app。它已经拥有菜单栏 app、MCP Server、
+当前状态：可完整运行的 source-distributed macOS app。它已经拥有菜单栏 app、可选的 legacy read-only MCP compatibility Server、
 operator CLI、持久化本地状态、recovery/backup workers 和完整 regression suite；请先读完
 数据流和账号安全边界，再在真实聊天数据上使用。当前不分发 bundled Python runtime
 或已签名 installer。
@@ -14,7 +14,7 @@ Windows 迁移当前处于 **W0.1 模块清单与 import 边界阶段**；完整
 
 一个本地优先的 macOS 微信群聊总结工具。它读取你电脑上的微信本地数据库，生成群聊摘要、关键词搜索结果，并把值得关注的新消息整理成 Obsidian-friendly Markdown 笔记。
 
-它不是微信/Tencent 官方软件，不是微信机器人，不是员工监控工具；当你启用云端 AI、远程链接预览或 MCP 发送时，它也不是完全离线工具。它不接入微信官方/非官方接口，也不会替你把聊天记录上传到项目作者的服务器。所有运行状态、数据库 key、知识库和导出文件默认都保存在你自己的 Mac 上。
+它不是微信/Tencent 官方软件，不是微信机器人，不是员工监控工具；当你启用云端 AI 或远程链接预览时，它也不是完全离线工具。它不接入微信官方/非官方接口，也不会替你把聊天记录上传到项目作者的服务器。所有运行状态、数据库 key、知识库和导出文件默认都保存在你自己的 Mac 上；可选 MCP read tools 会另外把你选择读取的本机 chat-derived data 暴露给你配置的 MCP client。
 
 项目来源说明：本项目是基于 [Qizhan7/mac-wechat-summary](https://github.com/Qizhan7/mac-wechat-summary) 的 standalone derivative。原项目打下了 macOS 菜单栏总结、本地微信数据库读取和 MCP 访问的基础；这个仓库没有挂在 GitHub fork network 里，也不作为 upstream PR 分支维护，而是继续发展成一个独立的 local-first Obsidian workflow 项目。见 [NOTICE.md](NOTICE.md)。
 
@@ -120,8 +120,8 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
   持有，不由可见名称或路径持有。
 - 远程 AI 调用和显式开启的公开网页预览会跨出 Mac 本地边界；Ollama 可以让 AI 解释留在本机，
   而公开网页上下文默认关闭，并始终按 untrusted input 处理。
-- 保存知识、立刻发通知、进入 Review Queue 供以后行动，是三个独立判断。微信 UI 发送属于另一条受控路径，
-  默认关闭，并要求内容和目标不变的 `prepare_send_message` / `confirm_send_message` nonce 确认。
+- 保存知识、立刻发通知、进入 Review Queue 供以后行动，是三个独立判断。MCP 只保留可选的
+  legacy read-only compatibility surface；原微信 UI 发送路径已经退休。
 
 图中的方框表示同一个本地应用内的逻辑责任边界，不是独立部署的 microservices。可编辑源文件：
 [中文主版 Excalidraw](docs/architecture/we-groupchat-obsidian-architecture.zh-CN.excalidraw) ·
@@ -143,7 +143,7 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
 - 默认 no-OAuth selected-resource mounted backup：把 exact links 与共享 CAS files 交给现有 Google Drive for Desktop 等挂载目录，同时生成轻量 Obsidian index、catalog snapshot 和诚实的 `sync_delegated` receipt。
 - 可选 advanced Google Drive API lane：拥有独立 selection/control plane、durable queue、群聊/月 shortcut 与 retry/reconcile，不自动删除。
 - 链接和转发展开：可选择补充公开网页标题/摘要；远程链接预览默认关闭。本地微信 XML 里可见的转发聊天记录会尽量解析。
-- MCP Server：让 Claude Desktop、Claude Code、Cursor、OpenClaw 等 MCP 客户端只读查询群聊、搜索、总结、查看图片；发送消息默认关闭。
+- MCP Server：面向 Claude Desktop、Claude Code、Cursor、OpenClaw 等 client 的可选 legacy read-only compatibility surface；可查询、搜索、总结、查看图片与已有 metadata，但不能发送消息或修改本地状态。
 - 运维命令：即使菜单栏图标被隐藏，也可以用 `.command` 文件配置关注推送、健康检查、刷新数据源、历史回填和安装自启动。
 
 ## 隐私和风险边界
@@ -170,8 +170,8 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
   上传到用户自己的 Drive；raw `@chatroom` username、消息 body/XML、`source_message_id`、`wxid` 与
   WeChat cache path 不进入 Drive metadata。程序不删除 Drive 文件、微信 cache 或本地 CAS object。
 - 远程链接预览默认关闭。只有显式设置 `monitor_fetch_links: true` 后，程序才会请求关注消息里的公开 URL；远端网站可能收到你的请求元数据。链接预览有保守的 SSRF 防护，但它仍然只是 best-effort public URL preview，不是 hardened crawler。
-- MCP read tools 会把本地 chat-derived data 暴露给 MCP client；部分管理工具可以修改本地 metadata，例如分组或配置衍生状态。
-- MCP 的发送微信消息能力默认关闭。真实 UI 发送需要显式设置 `mcp_send_mode`（`allowlist` 或 `enabled`）、授予辅助功能权限，并走 `prepare_send_message` -> 用户确认 -> `confirm_send_message` nonce 流程。
+- MCP read tools 会把本地 chat-derived data 暴露给已配置的 MCP client；AI summary 还会把相应内容交给用户配置的 AI provider。MCP 不推进 bookmark，也不修改群聊分组 metadata。
+- MCP 发送微信消息已经退休，不是“默认关闭”。旧 `prepare_send_message`、`confirm_send_message` 与 `send_message` tool name 只返回稳定、content-free 的 `mcp_send_retired`，绝不触碰微信 UI；旧 send config keys 仍可读取，但完全 inert。
 
 公开 fork 前建议跑：
 
@@ -566,39 +566,17 @@ attachment bytes 仍不会复制进 vault 本身。
 }
 ```
 
-MCP 默认偏只读，但 read tools 会把本地 chat-derived data 暴露给 MCP client，管理工具也可能修改本地 metadata，例如群聊分组配置。发送微信消息由本地 `mcp_send_mode` 控制：
+MCP Server 是一个**可选 legacy read-only compatibility surface**。Read 与
+summary tools 会把本机 chat-derived data 暴露给 MCP client；AI summary 还会
+交给用户配置的 AI provider。Summary 不推进 bookmark。`manage_chat_groups`
+只允许 `list`，旧 create/delete/add/remove actions 返回
+`mcp_mutation_retired`。
 
-```json
-{
-  "mcp_send_mode": "disabled"
-}
-```
-
-可选模式：
-
-- `disabled`：永不发送。
-- `dry_run`：只回显目标和内容，不触碰微信，不需要 nonce。
-- `allowlist`：只允许发送到 `mcp_send_allowlist` 里的稳定 username。
-- `enabled`：允许发送到非空目标。
-
-所有非 disabled 模式都拒绝空目标，不会再发送到“当前打开聊天”。allowlist 请使用 `example@chatroom` 这类稳定 username，不要用群显示名：
-
-```json
-{
-  "mcp_send_mode": "allowlist",
-  "mcp_send_allowlist": ["example@chatroom"]
-}
-```
-
-旧配置 `mcp_enable_send_message: true` 仍会作为 backward-compatible shortcut 映射到 `enabled`，新配置建议使用 `mcp_send_mode`。
-
-真实发送必须走两步确认。先调用 `prepare_send_message(text, chat_name)`，把返回的 nonce、目标、内容预览和过期时间展示给用户；用户确认后，再用完全相同的目标和内容调用 `confirm_send_message(nonce, text, chat_name)`。兼容旧客户端的 `send_message` 工具在真实发送模式下只会准备 nonce，不会直接发送。
-
-真实发送还需要在 macOS 中授权运行 MCP Server 的应用：
-
-```text
-系统设置 -> 隐私与安全性 -> 辅助功能
-```
+MCP message sending 已退休。旧 `prepare_send_message`、
+`confirm_send_message` 与 `send_message` tool name 暂留一个 compatibility
+release，但每次调用只返回 `mcp_send_retired`：不读 send config、不 import UI
+sender、不触碰微信。旧 `mcp_enable_send_message`、`mcp_send_mode` 与
+`mcp_send_allowlist` keys 仍可加载，避免旧 config 解析失败；其值完全 inert。
 
 ## 微信更新后的维护
 
@@ -646,7 +624,6 @@ core/
   resource_backup.py            # mounted target projection、handoff 与 receipts
   wechat_source_guard.py        # 长驻 app 内的 optional source guard
   google_drive_*.py             # 独立 advanced Drive API queue/OAuth/projection
-  mcp_send_*.py / sender.py     # 两步确认 policy 与可选 UI send
 ui/                      # 可复用 macOS UI 组件
 scripts/
   configure_monitor.py / health_check.py / refresh_data_source.py
@@ -775,7 +752,7 @@ macOS 菜单栏图标太多、刘海区域或菜单栏管理工具都可能把�
 - Attachment durability 被拆成 catalog、session-local byte consent、private CAS 与 filesystem snapshot。相同 bytes dedup；image 独立 opt-in；archive 失败不回滚 knowledge event 或 monitor checkpoint。
 - 默认 no-OAuth selected-resource lane 保存 exact link/file occurrence，并把 ready-local CAS object、privacy-bounded catalog 与 resource indexes 交给 mounted filesystem；selection mutation、archive occurrence、projection root、handoff target 和 manifest archive identity 都有跨进程 ownership/CAS 边界。
 - Direct Google Drive API 是另一个独立 opt-in advanced backend：拥有自己的 selection、OAuth、durable queue、server-confirmed resumable upload、per-chat/month shortcut 和 reconcile，不与 mounted backup 混用成功语义。
-- 为公开使用做了清理和完整 regression coverage：移除个人 runtime defaults，并覆盖 config、source snapshot/guard、attachment archive/backup、resource capture/projection/handoff、Drive、monitor、Review Queue、Daily Digest、notification、MCP confirmation 与 exact-commit publication contracts。
+- 为公开使用做了清理和完整 regression coverage：移除个人 runtime defaults，并覆盖 config、source snapshot/guard、attachment archive/backup、resource capture/projection/handoff、Drive、monitor、Review Queue、Daily Digest、notification、MCP read-only retirement 与 exact-commit publication contracts。
 
 ## 致谢
 

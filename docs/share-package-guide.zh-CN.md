@@ -5,7 +5,7 @@
 <https://github.com/IndelibleVivi/we-groupchat-obsidian>
 
 这份文件只随 exact-commit sanitized zip 生成，用于没有 Git/网络条件或需要冻结
-archival artifact 的历史 offline fallback。完整隐私边界、MCP 发送规则、Obsidian
+archival artifact 的历史 offline fallback。完整隐私边界、MCP read-only / sending retirement 规则、Obsidian
 工作流和开发说明请看 `README.zh-CN.md`。
 
 ## 先确认
