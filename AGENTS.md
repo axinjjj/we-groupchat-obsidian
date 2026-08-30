@@ -13,6 +13,15 @@
   write authority. Existing state migrates only after a valid parse; corrupt,
   symlink or non-regular state fails closed. TopicMonitor commits one expected
   revision after successful work and never advances state after an AI failure.
+  `core/monitor_source.py` owns the bounded raw-row reader. Canonical progress
+  is per chat x logical-shard generation in `source_cursors`; `last_checked_ts`
+  is derived compatibility evidence, not source authority. Raw pages merge by
+  `create_time` then `source_message_id`, and only actually consumed rows may
+  advance tentative cursors. Filtered rows advance without entering an AI
+  prompt; `no_messages` requires verified raw EOF under the same complete
+  inventory. A generation change or state-revision conflict commits no cursor.
+  Knowledge events created before a state conflict reuse their stable
+  `source_batch_id` on retry and must not create a second canonical event.
   Catch-up apply must stop the managed LaunchAgent, acquire the same
   `AppInstanceLock` as the menu app, hold it through backup/drain/projection/
   validation/receipt, release it, and only then restore the LaunchAgent.

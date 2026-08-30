@@ -84,7 +84,7 @@ class CatchUpMonitorTests(unittest.TestCase):
                     "knowledge_event_id": 9,
                     "affected_dates": ["2026-08-03"],
                 },
-                {"status": "no_messages"},
+                {"status": "no_messages", "source_eof": True},
             ])),
         ]
 

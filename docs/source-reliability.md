@@ -122,6 +122,29 @@ and Direct Drive scanners may continue consuming the listed present generations,
 but their result remains `source_degraded`; when a missing shard returns, its own
 cursor resumes and occurrence deduplication prevents duplicates.
 
+### Monitor raw-row cursor authority
+
+`core/monitor_source.py` turns that complete inventory into one bounded monitor
+batch. Durable `source_cursors` are keyed by logical shard and bind the current
+generation ID plus its opaque `(create_time, rowid)` token. A legacy timestamp
+checkpoint is used only once to seed missing generation cursors; an old
+generation's token is never inherited by a replacement generation.
+
+The reader keeps a bounded page for each present shard, performs a k-way merge
+by `create_time` and stable `source_message_id`, and stops at the configured raw
+row budget. It derives each committed token from the last row actually consumed,
+not from a fetched page end. Rows removed by presentation cleaning still consume
+that budget and advance their shard cursor, but they never enter the AI prompt.
+Filtered-only progress returns `source_advanced_no_visible`; `no_messages` is
+reserved for verified raw EOF on every shard under the same complete inventory.
+
+Visible rows may use separately queried, read-only overlap context. Context never
+changes tentative cursor positions. AI/provider failure commits no cursor, and a
+generation change is rechecked after AI/Knowledge work and before the monitor
+state CAS. Knowledge writes use a source-ID-derived `source_batch_id`; if the
+event commits but the state revision loses its CAS, the retry adopts that exact
+event instead of inserting another canonical event.
+
 Encrypted WAL reconstruction validates the SQLite WAL header and cumulative
 frame checksums, applies frames only through the last valid commit marker,
 honors the committed database-page count, and discards an uncommitted tail.

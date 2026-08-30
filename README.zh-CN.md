@@ -514,8 +514,14 @@ Review Queue 文件保存在 `~/.we-groupchat-obsidian/review_queue/`；里面�
 ```
 
 Monitor state 现在由 locked、revisioned、atomic store 持有。只有 state 文件真的不存在时
-才会初始化到 now；corrupt JSON、symlink 或 non-regular file 一律 fail closed；stale writer
-返回 `monitor_state_conflict`；AI 失败完全不改 canonical state。`--apply` 会先停 managed
+才会初始化到 now；corrupt JSON、symlink 或 non-regular file 一律 fail closed。Canonical
+progress 是 per-chat × logical-shard generation 的 `source_cursors`，持有 opaque raw-row token；
+`last_checked_ts` 只保留为 derived compatibility/diagnostic 值。每批在同一份 complete inventory
+下有界读取所有 shard，按 `create_time`、`source_message_id` 合并，只推进真正消费的 raw row。
+filtered/system row 会推进 cursor 但不进入 AI prompt，因此 `source_advanced_no_visible` 是有效进度，
+只有 unchanged complete inventory 下的 raw EOF 才能返回 `no_messages`。AI 失败、generation 变化或
+stale writer 返回 `monitor_state_conflict` 时都不提交 cursor；若 Knowledge event 已写而 state CAS
+冲突，retry 会复用 source-batch identity，不再插入第二条 canonical event。`--apply` 会先停 managed
 LaunchAgent，再获取 menu app 使用的同一把 singleton lock。若手动启动的 menu app 仍占锁，
 结果是 `failed / menu_app_active`，不会执行 backup、monitor、SQLite 或 projection 写入。
 取得 ownership 后，锁会覆盖 backup、drain、projection rebuild、canonical validation 与

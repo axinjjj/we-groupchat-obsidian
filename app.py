@@ -2003,6 +2003,7 @@ class WeGroupchatObsidianApp(rumps.App):
                 messages = {
                     "initialized": ("已开始监控", "正式检查会从当前时间之后的新消息开始"),
                     "no_messages": ("后台检查完成", "没有新消息"),
+                    "source_advanced_no_visible": ("后台检查完成", "已跳过系统或不可展示消息"),
                     "no_match": ("后台检查完成", f"检查了 {result.get('message_count', 0)} 条，未命中关注内容"),
                     "cooldown": ("命中但在冷却中", "同一主题短时间内不会重复提醒"),
                     "duplicate": ("重复内容", "知识库判断没有新线索，这次不推送"),
@@ -2016,6 +2017,7 @@ class WeGroupchatObsidianApp(rumps.App):
             "initialized": ("已开始监控", "正式检查会从当前时间之后的新消息开始"),
             "missing_topic": ("还没设置关注描述", "设置后才会调用 AI 检查"),
             "no_messages": ("没有新消息", "这次测试窗口里没有新增内容"),
+            "source_advanced_no_visible": ("没有可展示消息", "源游标已安全推进"),
             "no_match": ("未命中", f"检查了 {result.get('message_count', 0)} 条，没有值得提醒的内容"),
             "cooldown": ("命中但在冷却中", "同一主题短时间内不会重复提醒"),
             "duplicate": ("重复内容，已静默记录", "知识库判断没有新线索，这次不推送"),

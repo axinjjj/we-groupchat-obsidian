@@ -999,6 +999,7 @@ class KnowledgeStore:
                 links_json TEXT NOT NULL,
                 files_json TEXT NOT NULL DEFAULT '[]',
                 message_hash TEXT NOT NULL,
+                source_batch_id TEXT NOT NULL DEFAULT '',
                 messages_excerpt TEXT NOT NULL,
                 created_at REAL NOT NULL,
                 FOREIGN KEY(topic_id) REFERENCES topics(topic_id)
@@ -1100,12 +1101,20 @@ class KnowledgeStore:
         self._ensure_column(conn, "events", "semantic_tags_json", "TEXT NOT NULL DEFAULT '[]'")
         self._ensure_column(conn, "events", "taxonomy_profile", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "events", "taxonomy_version", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "events", "source_batch_id", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "attachment_mentions", "attempt_count", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column(conn, "attachment_mentions", "next_retry_at", "REAL NOT NULL DEFAULT 0")
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_attachment_mentions_retry
             ON attachment_mentions(status, next_retry_at, mention_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_events_source_batch
+            ON events(source_batch_id)
+            WHERE source_batch_id <> ''
             """
         )
         conn.execute(
@@ -1183,7 +1192,15 @@ class KnowledgeStore:
         finally:
             conn.close()
 
-    def apply_event(self, candidate, messages, config, relation_decision):
+    def apply_event(
+        self,
+        candidate,
+        messages,
+        config,
+        relation_decision,
+        *,
+        source_batch_id="",
+    ):
         if self.read_only:
             raise RuntimeError("knowledge store is read-only")
 
@@ -1193,9 +1210,14 @@ class KnowledgeStore:
         ctx = event_context(messages, config)
         candidate = self._prepare_candidate_for_context(candidate, ctx, config)
         now = self.now_func()
+        source_batch_id = str(source_batch_id or "").strip()[:96]
 
         conn = self.connect()
         try:
+            if source_batch_id:
+                existing = self._source_batch_result(conn, source_batch_id)
+                if existing:
+                    return existing
             projection_warnings = []
             linked_topic_id = None
             if relation == "new" or not target_topic_id:
@@ -1212,7 +1234,26 @@ class KnowledgeStore:
                 else:
                     topic_id = int(row["topic_id"])
 
-            event_id = self._insert_event(conn, topic_id, candidate, ctx, relation, now)
+            try:
+                event_id = self._insert_event(
+                    conn,
+                    topic_id,
+                    candidate,
+                    ctx,
+                    relation,
+                    now,
+                    source_batch_id=source_batch_id,
+                )
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                existing = (
+                    self._source_batch_result(conn, source_batch_id)
+                    if source_batch_id
+                    else None
+                )
+                if existing:
+                    return existing
+                raise
             self._register_attachment_mentions(
                 conn,
                 event_id,
@@ -1278,9 +1319,34 @@ class KnowledgeStore:
                     else ""
                 ),
                 "projection_warnings": projection_warnings,
+                "reused": False,
             }
         finally:
             conn.close()
+
+    def _source_batch_result(self, conn, source_batch_id):
+        row = conn.execute(
+            """
+            SELECT e.event_id, e.topic_id, e.relation, t.obsidian_path
+            FROM events AS e
+            JOIN topics AS t ON t.topic_id = e.topic_id
+            WHERE e.source_batch_id = ?
+            LIMIT 1
+            """,
+            (str(source_batch_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        obsidian_path = str(row["obsidian_path"] or "")
+        return {
+            "relation": str(row["relation"] or "duplicate"),
+            "topic_id": int(row["topic_id"]),
+            "event_id": int(row["event_id"]),
+            "obsidian_path": obsidian_path,
+            "knowledge_path": self.full_obsidian_path(obsidian_path),
+            "projection_warnings": [],
+            "reused": True,
+        }
 
     @staticmethod
     def _register_attachment_mentions(conn, event_id, topic_id, messages, config, now):
@@ -1505,16 +1571,26 @@ class KnowledgeStore:
             (now, topic_id),
         )
 
-    def _insert_event(self, conn, topic_id, candidate, ctx, relation, now):
+    def _insert_event(
+        self,
+        conn,
+        topic_id,
+        candidate,
+        ctx,
+        relation,
+        now,
+        *,
+        source_batch_id="",
+    ):
         cursor = conn.execute(
             """
             INSERT INTO events (
                 topic_id, relation, title, summary, category, semantic_tags_json, event_type,
                 status_hint, source_chat, source_chat_username, vault_chat_name, taxonomy_profile, taxonomy_version,
                 window_start, window_end, senders_json, links_json, files_json,
-                message_hash, messages_excerpt, created_at
+                message_hash, source_batch_id, messages_excerpt, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 topic_id,
@@ -1536,6 +1612,7 @@ class KnowledgeStore:
                 _json_dumps(candidate.get("links")),
                 _json_dumps(_merge_file_refs(candidate.get("files"), ctx.get("files"), limit=30)),
                 ctx["message_hash"],
+                str(source_batch_id or ""),
                 ctx["messages_excerpt"],
                 now,
             ),
