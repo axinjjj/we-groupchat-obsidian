@@ -293,16 +293,167 @@ class GoogleDriveFileSync:
             conn.close()
 
     def _meta_set(self, key, value):
+        self._meta_set_many({key: value})
+
+    def _meta_set_many(self, values):
         conn = self._connect()
         try:
-            conn.execute(
+            conn.executemany(
                 "INSERT INTO drive_meta(key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (key, str(value)),
+                [(str(key), str(value)) for key, value in values.items()],
             )
             conn.commit()
         finally:
             conn.close()
+
+    def _source_inventory_binding(self, chats):
+        chats = list(chats or [])
+        if self.source is None:
+            evidence = {
+                "schema": "we-groupchat-obsidian.source-inventory.v1",
+                "source_namespace": "",
+                "inventory_revision": 0,
+                "inventory_digest": "",
+                "complete": False,
+                "counts": {},
+                "error_codes": ["source_unavailable"],
+            }
+            return {
+                "complete": False,
+                "inventory_digest": "",
+                "inventory_revision": 0,
+                "counts": {},
+                "error_codes": ["source_unavailable"],
+                "error_code": "source_unavailable",
+                "degraded_shards": 1,
+                "shards_by_username": {},
+                "evidence": evidence,
+            }
+        inventory_reader = getattr(self.source, "get_source_inventory", None)
+        if callable(inventory_reader):
+            try:
+                inventory = dict(inventory_reader(update=True, sensitive=False) or {})
+            except WeChatSourceDegraded as exc:
+                code = self._source_error_code(exc)
+                evidence = {
+                    "schema": "we-groupchat-obsidian.source-inventory.v1",
+                    "source_namespace": "",
+                    "inventory_revision": 0,
+                    "inventory_digest": "",
+                    "complete": False,
+                    "counts": {},
+                    "error_codes": [code],
+                }
+                return {
+                    "complete": False,
+                    "inventory_digest": "",
+                    "inventory_revision": 0,
+                    "counts": {},
+                    "error_codes": [code],
+                    "error_code": code,
+                    "degraded_shards": 1,
+                    "shards_by_username": {},
+                    "evidence": evidence,
+                }
+            source_shards = [
+                str(value)
+                for value in inventory.get("present_generation_ids") or []
+                if str(value)
+            ]
+            counts = {
+                str(key): int(value or 0)
+                for key, value in (inventory.get("counts") or {}).items()
+            }
+            error_codes = [
+                str(value)
+                for value in inventory.get("error_codes") or []
+                if str(value)
+            ]
+            complete = bool(inventory.get("complete"))
+            error_code = error_codes[0] if error_codes else (
+                "" if complete else "source_inventory_incomplete"
+            )
+            degraded_shards = sum(
+                counts.get(state, 0)
+                for state in ("missing_file", "key_missing", "cache_only", "unreadable")
+            )
+            evidence = {
+                "schema": str(inventory.get("schema") or ""),
+                "source_namespace": str(inventory.get("source_namespace") or ""),
+                "inventory_revision": int(inventory.get("inventory_revision") or 0),
+                "inventory_digest": str(inventory.get("inventory_digest") or ""),
+                "complete": complete,
+                "counts": counts,
+                "error_codes": error_codes,
+            }
+            return {
+                **evidence,
+                "error_code": error_code,
+                "degraded_shards": max(1, degraded_shards) if not complete else 0,
+                "shards_by_username": {
+                    chat["username"]: list(source_shards) for chat in chats
+                },
+                "evidence": evidence,
+            }
+
+        shards_by_username = {}
+        degraded_shards = 0
+        error_codes = []
+        for chat in chats:
+            username = chat["username"]
+            failed = False
+            try:
+                source_shards = list(self.source.get_message_shards(username))
+            except WeChatSourceDegraded as exc:
+                source_shards = []
+                degraded_shards += 1
+                error_codes.append(self._source_error_code(exc))
+                failed = True
+            if not source_shards and not failed:
+                degraded_shards += 1
+                if not error_codes:
+                    error_codes.append("source_shards_unavailable")
+            shards_by_username[username] = source_shards
+        complete = degraded_shards == 0
+        return {
+            "complete": complete,
+            "inventory_digest": "",
+            "inventory_revision": 0,
+            "counts": {},
+            "error_codes": list(dict.fromkeys(error_codes)),
+            "error_code": error_codes[0] if error_codes else "",
+            "degraded_shards": degraded_shards,
+            "shards_by_username": shards_by_username,
+            "evidence": {},
+        }
+
+    def _record_source_inventory_evidence(
+        self,
+        binding,
+        *,
+        degraded_shards=None,
+        error_code="",
+    ):
+        evidence = dict((binding or {}).get("evidence") or {})
+        degraded = (
+            int((binding or {}).get("degraded_shards") or 0)
+            if degraded_shards is None
+            else int(degraded_shards or 0)
+        )
+        self._meta_set_many({
+            "last_scan_at": self.now_func(),
+            "source_state": "source_degraded" if degraded else "healthy",
+            "source_error_code": str(
+                error_code or (binding or {}).get("error_code") or ""
+            ),
+            "source_inventory_evidence": json.dumps(
+                evidence,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        })
 
     def _ensure_archive_id(self):
         archive_id = self._meta_get("archive_id")
@@ -392,6 +543,17 @@ class GoogleDriveFileSync:
             "source_shard_unavailable",
             "source_shard_unknown",
             "source_shards_unavailable",
+            "source_cache_only",
+            "source_inventory_incomplete",
+            "source_inventory_uninitialized",
+            "source_inventory_scan_failed",
+            "source_inventory_corrupt",
+            "source_inventory_lock_unavailable",
+            "source_inventory_write_failed",
+            "source_missing_file",
+            "source_key_missing",
+            "source_unreadable",
+            "source_snapshot_failed",
         }:
             return code
         return "source_shard_unavailable"
@@ -502,12 +664,13 @@ class GoogleDriveFileSync:
         chats = self.selected_chats()
         if not chats:
             return {"state": "no_selected_chats", "scanned": 0, "queued": 0}
+        binding = self._source_inventory_binding(chats)
         max_messages = max(1, int(self.config.get("google_drive_file_sync_max_messages_per_scan", 500)))
         scanned = 0
         queued = 0
         initialized = 0
-        degraded_shards = 0
-        source_error_code = ""
+        degraded_shards = int(binding.get("degraded_shards") or 0)
+        source_error_code = str(binding.get("error_code") or "")
         for chat in chats:
             conn = self._connect()
             try:
@@ -521,15 +684,10 @@ class GoogleDriveFileSync:
                 self.initialize_selected_chat_cursors()
                 initialized += 1
                 continue
-            try:
-                source_shards = list(self.source.get_message_shards(chat["username"]))
-            except WeChatSourceDegraded as exc:
-                degraded_shards += 1
-                source_error_code = self._source_error_code(exc)
-                continue
+            source_shards = list(
+                (binding.get("shards_by_username") or {}).get(chat["username"], [])
+            )
             if not source_shards:
-                degraded_shards += 1
-                source_error_code = "source_shards_unavailable"
                 continue
             for source_shard_id in source_shards:
                 shard_state = self._shard_state(chat["username"], source_shard_id, state)
@@ -579,9 +737,11 @@ class GoogleDriveFileSync:
                 finally:
                     conn.close()
                 scanned += len(messages)
-        self._meta_set("last_scan_at", self.now_func())
-        self._meta_set("source_state", "source_degraded" if degraded_shards else "healthy")
-        self._meta_set("source_error_code", source_error_code)
+        self._record_source_inventory_evidence(
+            binding,
+            degraded_shards=degraded_shards,
+            error_code=source_error_code,
+        )
         return {
             "state": "source_degraded" if degraded_shards else "healthy",
             "scanned": scanned,
@@ -589,6 +749,11 @@ class GoogleDriveFileSync:
             "initialized_chats": initialized,
             "degraded_shards": degraded_shards,
             "error_code": source_error_code,
+            "source_complete": bool(binding.get("complete")),
+            "inventory_digest": str(binding.get("inventory_digest") or ""),
+            "inventory_revision": int(binding.get("inventory_revision") or 0),
+            "source_counts": dict(binding.get("counts") or {}),
+            "source_error_codes": list(binding.get("error_codes") or []),
         }
 
     def backfill(self, from_timestamp, *, apply=False):
@@ -600,23 +765,19 @@ class GoogleDriveFileSync:
 
     def _backfill(self, from_timestamp, *, apply=False):
         chats = self.selected_chats()
+        binding = self._source_inventory_binding(chats)
         max_messages = max(1, int(self.config.get("google_drive_file_sync_max_messages_per_scan", 500)))
         max_messages = max(max_messages, BACKFILL_PAGE_SIZE)
         scanned = 0
         discovered = 0
         inserted = 0
-        degraded_shards = 0
-        source_error_code = ""
+        degraded_shards = int(binding.get("degraded_shards") or 0)
+        source_error_code = str(binding.get("error_code") or "")
         for chat in chats:
-            try:
-                source_shards = list(self.source.get_message_shards(chat["username"]))
-            except WeChatSourceDegraded as exc:
-                degraded_shards += 1
-                source_error_code = self._source_error_code(exc)
-                continue
+            source_shards = list(
+                (binding.get("shards_by_username") or {}).get(chat["username"], [])
+            )
             if not source_shards:
-                degraded_shards += 1
-                source_error_code = "source_shards_unavailable"
                 continue
             for source_shard_id in source_shards:
                 cursor_timestamp = int(from_timestamp)
@@ -657,6 +818,11 @@ class GoogleDriveFileSync:
                     )
                     if len(page) < max_messages:
                         break
+        self._record_source_inventory_evidence(
+            binding,
+            degraded_shards=degraded_shards,
+            error_code=source_error_code,
+        )
         return {
             "state": (
                 "source_degraded"
@@ -668,6 +834,11 @@ class GoogleDriveFileSync:
             "inserted": inserted,
             "degraded_shards": degraded_shards,
             "error_code": source_error_code,
+            "source_complete": bool(binding.get("complete")) and degraded_shards == 0,
+            "inventory_digest": str(binding.get("inventory_digest") or ""),
+            "inventory_revision": int(binding.get("inventory_revision") or 0),
+            "source_counts": dict(binding.get("counts") or {}),
+            "source_error_codes": list(binding.get("error_codes") or []),
         }
 
     def _retry_delay(self, attempt_count, retry_after=0):

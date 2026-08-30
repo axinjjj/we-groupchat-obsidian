@@ -98,7 +98,7 @@ def _get_db():
             "未找到数据库密钥。请先运行菜单栏 app 的「🔄 刷新数据源」功能。"
         )
 
-    _db = WeChatDB(db_dir, keys)
+    _db = WeChatDB.for_runtime(db_dir, keys)
     _keys_mtime = cur_mtime
     return _db
 

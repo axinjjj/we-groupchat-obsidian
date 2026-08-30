@@ -52,7 +52,7 @@ def _source(config):
     keys = get_cached_keys() or {}
     if not keys or not config.get("db_dir"):
         raise SystemExit("WeChat source is unavailable: configure db_dir and extract database keys first.")
-    return WeChatDB(config["db_dir"], keys)
+    return WeChatDB.for_runtime(config["db_dir"], keys)
 
 
 def _service(config, *, source=False, remote=False):

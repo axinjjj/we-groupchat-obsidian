@@ -1738,6 +1738,23 @@ class MountedResourceBackup:
     def _write_snapshot(self, records, object_rows, delivery_map):
         resources_bytes = _canonical_jsonl_bytes(records)
         resources_sha256 = hashlib.sha256(resources_bytes).hexdigest()
+        source_evidence_reader = getattr(
+            self.capture,
+            "source_inventory_evidence",
+            None,
+        )
+        source_observation = (
+            dict(source_evidence_reader() or {})
+            if callable(source_evidence_reader)
+            else {
+                "schema": "we-groupchat-obsidian.source-inventory.v1",
+                "inventory_revision": 0,
+                "inventory_digest": "",
+                "complete": False,
+                "counts": {},
+                "error_codes": ["source_inventory_uninitialized"],
+            }
+        )
         unresolved_files = sum(
             1 for row in records
             if row["kind"] == "file" and row["capture_status"] != "ready_local"
@@ -1754,6 +1771,7 @@ class MountedResourceBackup:
                 and manifest.get("archive_id") == self.capture.archive_id
                 and manifest.get("link_export_mode") == self.link_export_mode
                 and manifest.get("handoff_semantics") == handoff_semantics
+                and manifest.get("source_observation") == source_observation
             ):
                 return {
                     "state": "unchanged",
@@ -1761,6 +1779,7 @@ class MountedResourceBackup:
                     "catalog_sha256": resources_sha256,
                     "handoff_semantics": handoff_semantics,
                     "unresolved_files": unresolved_files,
+                    "source_complete": bool(source_observation.get("complete")),
                 }
 
         snapshot_id = self._snapshot_id()
@@ -1776,6 +1795,7 @@ class MountedResourceBackup:
                 self.now_func(), tz=timezone.utc
             ).isoformat(),
             "snapshot_completeness": "catalog_complete",
+            "source_observation": source_observation,
             "handoff_semantics": handoff_semantics,
             "remote_verification": False,
             "link_export_mode": self.link_export_mode,
@@ -1820,6 +1840,7 @@ class MountedResourceBackup:
             "catalog_sha256": resources_sha256,
             "handoff_semantics": handoff_semantics,
             "unresolved_files": unresolved_files,
+            "source_complete": bool(source_observation.get("complete")),
         }
 
     def _render_month(

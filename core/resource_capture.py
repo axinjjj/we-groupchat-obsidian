@@ -34,7 +34,7 @@ from .link_preview import URL_RE
 from .wechat_db import WeChatSourceDegraded
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 BACKFILL_PAGE_SIZE = 1_000
 BACKFILL_RUN_TTL_SECONDS = 24 * 60 * 60
 LINK_ID_DOMAIN = b"we-groupchat-resource-link-v1\0"
@@ -395,6 +395,7 @@ class SelectedResourceCapture:
                     mode TEXT NOT NULL,
                     from_timestamp INTEGER NOT NULL,
                     selected_chat_digest TEXT NOT NULL,
+                    inventory_digest TEXT NOT NULL DEFAULT '',
                     source_manifest_digest TEXT NOT NULL DEFAULT '',
                     candidate_digest TEXT NOT NULL DEFAULT '',
                     source_complete INTEGER NOT NULL DEFAULT 0,
@@ -471,6 +472,15 @@ class SelectedResourceCapture:
                     "ALTER TABLE resource_shards "
                     "ADD COLUMN source_cursor_token TEXT NOT NULL DEFAULT ''"
                 )
+            backfill_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(resource_backfill_runs)")
+            }
+            if "inventory_digest" not in backfill_columns:
+                conn.execute(
+                    "ALTER TABLE resource_backfill_runs "
+                    "ADD COLUMN inventory_digest TEXT NOT NULL DEFAULT ''"
+                )
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.commit()
         finally:
@@ -489,16 +499,202 @@ class SelectedResourceCapture:
             conn.close()
 
     def _meta_set(self, key, value):
+        self._meta_set_many({key: value})
+
+    def _meta_set_many(self, values):
         conn = self._connect()
         try:
-            conn.execute(
+            conn.executemany(
                 "INSERT INTO resource_meta(key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (key, str(value)),
+                [(str(key), str(value)) for key, value in values.items()],
             )
             conn.commit()
         finally:
             conn.close()
+
+    def _source_inventory_binding(self, chats):
+        """Read one source revision and map its present generations to chats."""
+        chats = list(chats or [])
+        if self.source is None:
+            evidence = {
+                "schema": "we-groupchat-obsidian.source-inventory.v1",
+                "source_namespace": "",
+                "inventory_revision": 0,
+                "inventory_digest": "",
+                "complete": False,
+                "counts": {},
+                "error_codes": ["source_unavailable"],
+            }
+            return {
+                "complete": False,
+                "inventory_digest": "",
+                "inventory_revision": 0,
+                "source_namespace": "",
+                "counts": {},
+                "error_codes": ["source_unavailable"],
+                "error_code": "source_unavailable",
+                "degraded_shards": 1,
+                "shards_by_username": {},
+                "evidence": evidence,
+            }
+
+        inventory_reader = getattr(self.source, "get_source_inventory", None)
+        if callable(inventory_reader):
+            try:
+                inventory = dict(inventory_reader(update=True, sensitive=False) or {})
+            except WeChatSourceDegraded as exc:
+                code = self._source_error_code(exc)
+                evidence = {
+                    "schema": "we-groupchat-obsidian.source-inventory.v1",
+                    "source_namespace": "",
+                    "inventory_revision": 0,
+                    "inventory_digest": "",
+                    "complete": False,
+                    "counts": {},
+                    "error_codes": [code],
+                }
+                return {
+                    "complete": False,
+                    "inventory_digest": "",
+                    "inventory_revision": 0,
+                    "source_namespace": "",
+                    "counts": {},
+                    "error_codes": [code],
+                    "error_code": code,
+                    "degraded_shards": 1,
+                    "shards_by_username": {},
+                    "evidence": evidence,
+                }
+            source_shards = [
+                str(value)
+                for value in inventory.get("present_generation_ids") or []
+                if str(value)
+            ]
+            counts = {
+                str(key): int(value or 0)
+                for key, value in (inventory.get("counts") or {}).items()
+            }
+            error_codes = [
+                str(value)
+                for value in inventory.get("error_codes") or []
+                if str(value)
+            ]
+            complete = bool(inventory.get("complete"))
+            error_code = error_codes[0] if error_codes else (
+                "" if complete else "source_inventory_incomplete"
+            )
+            degraded_shards = sum(
+                counts.get(state, 0)
+                for state in ("missing_file", "key_missing", "cache_only", "unreadable")
+            )
+            evidence = {
+                "schema": str(inventory.get("schema") or ""),
+                "source_namespace": str(inventory.get("source_namespace") or ""),
+                "inventory_revision": int(inventory.get("inventory_revision") or 0),
+                "inventory_digest": str(inventory.get("inventory_digest") or ""),
+                "complete": complete,
+                "counts": counts,
+                "error_codes": error_codes,
+            }
+            return {
+                **evidence,
+                "error_code": error_code,
+                "degraded_shards": max(1, degraded_shards) if not complete else 0,
+                "shards_by_username": {
+                    chat["username"]: list(source_shards) for chat in chats
+                },
+                "evidence": evidence,
+            }
+
+        shards_by_username = {}
+        error_codes = []
+        degraded_shards = 0
+        for chat in chats:
+            username = chat["username"]
+            source_failed = False
+            try:
+                source_shards = list(self.source.get_message_shards(username))
+            except WeChatSourceDegraded as exc:
+                degraded_shards += 1
+                error_codes.append(self._source_error_code(exc))
+                source_shards = []
+                source_failed = True
+            if not source_shards and not source_failed:
+                degraded_shards += 1
+                if not error_codes:
+                    error_codes.append("source_shards_unavailable")
+            shards_by_username[username] = source_shards
+        manifest = [
+            {
+                "chat_key": chat["chat_key"],
+                "source_shards": list(shards_by_username.get(chat["username"], [])),
+            }
+            for chat in chats
+        ]
+        digest = self._digest_json(manifest)
+        complete = degraded_shards == 0
+        evidence = {
+            "schema": "legacy-source-adapter.v1",
+            "source_namespace": "",
+            "inventory_revision": 0,
+            "inventory_digest": digest,
+            "complete": complete,
+            "counts": {},
+            "error_codes": list(dict.fromkeys(error_codes)),
+        }
+        return {
+            **evidence,
+            "error_code": error_codes[0] if error_codes else "",
+            "degraded_shards": degraded_shards,
+            "shards_by_username": shards_by_username,
+            "evidence": evidence,
+        }
+
+    def _record_source_inventory_evidence(
+        self,
+        binding,
+        *,
+        degraded_shards=None,
+        error_code="",
+    ):
+        evidence = dict((binding or {}).get("evidence") or {})
+        degraded = (
+            int((binding or {}).get("degraded_shards") or 0)
+            if degraded_shards is None
+            else int(degraded_shards or 0)
+        )
+        self._meta_set_many({
+            "source_state": "source_degraded" if degraded else "healthy",
+            "source_error_code": str(
+                error_code or (binding or {}).get("error_code") or ""
+            ),
+            "source_inventory_evidence": json.dumps(
+                evidence,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            "last_scan_at": self.now_func(),
+        })
+
+    def source_inventory_evidence(self):
+        """Return path-free source completeness evidence for backup snapshots."""
+        raw = self._meta_get("source_inventory_evidence", "")
+        try:
+            value = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            value = {}
+        if not isinstance(value, dict) or not value:
+            return {
+                "schema": "we-groupchat-obsidian.source-inventory.v1",
+                "inventory_revision": 0,
+                "inventory_digest": "",
+                "complete": False,
+                "counts": {},
+                "error_codes": ["source_inventory_uninitialized"],
+            }
+        return value
 
     def _ensure_archive_id(self):
         conn = self._connect()
@@ -748,6 +944,15 @@ class SelectedResourceCapture:
             "source_shard_unknown",
             "source_shards_unavailable",
             "source_cache_only",
+            "source_inventory_incomplete",
+            "source_inventory_uninitialized",
+            "source_inventory_scan_failed",
+            "source_inventory_corrupt",
+            "source_inventory_lock_unavailable",
+            "source_inventory_write_failed",
+            "source_missing_file",
+            "source_key_missing",
+            "source_unreadable",
             "source_snapshot_failed",
         }:
             return code
@@ -1021,13 +1226,21 @@ class SelectedResourceCapture:
                 "captured_files": 0,
             }
         if self.source is None:
+            binding = self._source_inventory_binding(chats)
+            self._record_source_inventory_evidence(binding)
             return {
                 "state": "source_unavailable",
                 "scanned": 0,
                 "captured_links": 0,
                 "captured_files": 0,
                 "error_code": "source_unavailable",
+                "source_complete": False,
+                "inventory_digest": "",
+                "inventory_revision": 0,
+                "source_counts": {},
+                "source_error_codes": ["source_unavailable"],
             }
+        binding = self._source_inventory_binding(chats)
         initialized = self._initialize_selected_chat_cursors_locked()["new_chats"]
         max_messages = max(1, int(
             self.config.get("resource_backup_max_messages_per_scan", 500)
@@ -1035,22 +1248,17 @@ class SelectedResourceCapture:
         scanned = 0
         captured_links = 0
         captured_files = 0
-        degraded_shards = 0
-        source_error_code = ""
+        degraded_shards = int(binding.get("degraded_shards") or 0)
+        source_error_code = str(binding.get("error_code") or "")
 
         for chat in chats:
             chat_row = self._chat_row(chat["username"])
             if chat_row is None:
                 raise ResourceCaptureError("chat_state_missing")
-            try:
-                source_shards = list(self.source.get_message_shards(chat["username"]))
-            except WeChatSourceDegraded as exc:
-                degraded_shards += 1
-                source_error_code = self._source_error_code(exc)
-                continue
+            source_shards = list(
+                (binding.get("shards_by_username") or {}).get(chat["username"], [])
+            )
             if not source_shards:
-                degraded_shards += 1
-                source_error_code = "source_shards_unavailable"
                 continue
 
             for source_shard_id in source_shards:
@@ -1110,9 +1318,11 @@ class SelectedResourceCapture:
                 captured_files += files
                 scanned += len(messages)
 
-        self._meta_set("source_state", "source_degraded" if degraded_shards else "healthy")
-        self._meta_set("source_error_code", source_error_code)
-        self._meta_set("last_scan_at", self.now_func())
+        self._record_source_inventory_evidence(
+            binding,
+            degraded_shards=degraded_shards,
+            error_code=source_error_code,
+        )
         return {
             "state": "source_degraded" if degraded_shards else "healthy",
             "scanned": scanned,
@@ -1121,6 +1331,11 @@ class SelectedResourceCapture:
             "initialized_chats": initialized,
             "degraded_shards": degraded_shards,
             "error_code": source_error_code,
+            "source_complete": bool(binding.get("complete")),
+            "inventory_digest": str(binding.get("inventory_digest") or ""),
+            "inventory_revision": int(binding.get("inventory_revision") or 0),
+            "source_counts": dict(binding.get("counts") or {}),
+            "source_error_codes": list(binding.get("error_codes") or []),
         }
 
     def backfill(self, from_timestamp, *, apply=False, run_id=""):
@@ -1304,6 +1519,7 @@ class SelectedResourceCapture:
             "run_id": str(value.get("run_id") or ""),
             "candidate_digest": str(value.get("candidate_digest") or ""),
             "selected_chat_digest": str(value.get("selected_chat_digest") or ""),
+            "inventory_digest": str(value.get("inventory_digest") or ""),
             "source_manifest_digest": str(value.get("source_manifest_digest") or ""),
             "scanned": int(value.get("scanned") or 0),
             "discovered_links": int(value.get("discovered_links") or 0),
@@ -1327,6 +1543,7 @@ class SelectedResourceCapture:
         scanned,
         discovered_links,
         discovered_files,
+        inventory_digest,
         source_manifest,
         error_code="",
     ):
@@ -1336,13 +1553,14 @@ class SelectedResourceCapture:
             conn.execute(
                 """
                 UPDATE resource_backfill_runs
-                SET source_manifest_digest = ?, candidate_digest = ?,
+                SET inventory_digest = ?, source_manifest_digest = ?, candidate_digest = ?,
                     source_complete = ?, state = ?, scanned = ?,
                     discovered_links = ?, discovered_files = ?, error_code = ?
                 WHERE run_id = ?
                 """,
                 (
-                    self._digest_json(source_manifest), candidate_digest,
+                    str(inventory_digest or ""), self._digest_json(source_manifest),
+                    candidate_digest,
                     1 if source_complete else 0, state, scanned,
                     discovered_links, discovered_files, error_code, run_id,
                 ),
@@ -1380,6 +1598,7 @@ class SelectedResourceCapture:
                 "error_code": "source_unavailable",
             })
         self.cleanup_backfill_runs()
+        binding = self._source_inventory_binding(chats)
         run_id = self._create_backfill_run(mode, from_timestamp, chats)
         page_size = min(2_000, max(500, int(
             self.config.get("resource_backup_max_messages_per_scan", BACKFILL_PAGE_SIZE)
@@ -1387,23 +1606,22 @@ class SelectedResourceCapture:
         scanned = 0
         discovered_links = 0
         discovered_files = 0
-        degraded_shards = 0
-        source_error_code = ""
-        source_manifest = []
-        for chat in chats:
-            try:
-                source_shards = list(self.source.get_message_shards(chat["username"]))
-            except WeChatSourceDegraded as exc:
-                degraded_shards += 1
-                source_error_code = self._source_error_code(exc)
-                continue
-            source_manifest.append({
+        degraded_shards = int(binding.get("degraded_shards") or 0)
+        source_error_code = str(binding.get("error_code") or "")
+        source_manifest = [
+            {
                 "chat_key": chat["chat_key"],
-                "source_shards": list(source_shards),
-            })
+                "source_shards": list(
+                    (binding.get("shards_by_username") or {}).get(chat["username"], [])
+                ),
+            }
+            for chat in chats
+        ]
+        for chat in chats:
+            source_shards = list(
+                (binding.get("shards_by_username") or {}).get(chat["username"], [])
+            )
             if not source_shards:
-                degraded_shards += 1
-                source_error_code = "source_shards_unavailable"
                 continue
             for source_shard_id in source_shards:
                 cursor_timestamp = from_timestamp
@@ -1438,13 +1656,19 @@ class SelectedResourceCapture:
                     cursor_token = next_cursor_token
                     if exhausted:
                         break
+        self._record_source_inventory_evidence(
+            binding,
+            degraded_shards=degraded_shards,
+            error_code=source_error_code,
+        )
         return self._finish_backfill_plan(
             run_id,
             state="source_degraded" if degraded_shards else "planned",
-            source_complete=degraded_shards == 0,
+            source_complete=bool(binding.get("complete")) and degraded_shards == 0,
             scanned=scanned,
             discovered_links=discovered_links,
             discovered_files=discovered_files,
+            inventory_digest=str(binding.get("inventory_digest") or ""),
             source_manifest=source_manifest,
             error_code=source_error_code,
         )
@@ -1494,6 +1718,34 @@ class SelectedResourceCapture:
                     state="selection_changed",
                     source_complete=False,
                     error_code="selected_chat_digest_mismatch",
+                )
+            if self.source is None:
+                return self._backfill_result(
+                    row,
+                    state="inventory_unavailable",
+                    source_complete=False,
+                    error_code="source_inventory_unavailable",
+                )
+            current_binding = self._source_inventory_binding(self.selected_chats())
+            self._record_source_inventory_evidence(current_binding)
+            if not bool(current_binding.get("complete")):
+                return self._backfill_result(
+                    row,
+                    state="source_degraded",
+                    source_complete=False,
+                    error_code=str(
+                        current_binding.get("error_code")
+                        or "source_inventory_incomplete"
+                    ),
+                )
+            if str(row["inventory_digest"] or "") != str(
+                current_binding.get("inventory_digest") or ""
+            ):
+                return self._backfill_result(
+                    row,
+                    state="inventory_changed",
+                    source_complete=False,
+                    error_code="inventory_digest_mismatch",
                 )
             if str(row["candidate_digest"]) != self._staged_candidate_digest(conn, run_id):
                 return self._backfill_result(

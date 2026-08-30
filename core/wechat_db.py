@@ -18,6 +18,7 @@ from urllib.parse import quote
 import zstandard as zstd
 
 from .decryptor import WALSnapshotError, decrypt_database, decrypt_wal
+from .source_inventory import COMPLETE_STATES, SourceInventoryError, SourceInventoryStore
 
 _zstd_dctx = zstd.ZstdDecompressor()
 
@@ -315,7 +316,7 @@ class WeChatDB:
 
     CACHE_DIR = os.path.join(tempfile.gettempdir(), "we_groupchat_obsidian_cache")
 
-    def __init__(self, db_dir, keys):
+    def __init__(self, db_dir, keys, *, source_inventory_store=None):
         """
         Args:
             db_dir: WeChat db_storage directory path.
@@ -330,17 +331,33 @@ class WeChatDB:
         self._emoticon_map = None  # {md5: {cdn_url, aes_key, thumb_url}}
         self._source_snapshot_depth = 0
         self._source_snapshot_paths = {}
+        self.source_inventory_store = (
+            source_inventory_store
+            if source_inventory_store is not None
+            else SourceInventoryStore(path=None)
+        )
+        self._inventory_specs_by_generation = {}
         source_root = os.path.realpath(self.db_dir)
+        source_stat = None
         try:
             source_stat = os.stat(source_root)
             source_identity = (
                 f"{source_root}\0{source_stat.st_dev}\0{source_stat.st_ino}"
             )
         except OSError:
-            source_identity = f"{source_root}\00\00"
+            source_identity = f"{source_root}\0missing"
         self.cache_namespace = hashlib.sha256(
             source_identity.encode("utf-8")
         ).hexdigest()
+        if source_stat is not None:
+            namespace_identity = (
+                f"{source_root}\0{source_stat.st_dev}:{source_stat.st_ino}"
+            )
+        else:
+            namespace_identity = self.cache_namespace
+        self.source_namespace = hashlib.sha256(
+            f"wechat-source-namespace-v1\0{namespace_identity}".encode("utf-8")
+        ).hexdigest()[:32]
         self.cache_dir = os.path.join(self.CACHE_DIR, self.cache_namespace)
         os.makedirs(self.cache_dir, exist_ok=True)
         try:
@@ -348,6 +365,15 @@ class WeChatDB:
             os.chmod(self.cache_dir, 0o700)
         except OSError:
             pass
+
+    @classmethod
+    def for_runtime(cls, db_dir, keys):
+        """Create a source reader bound to the durable private inventory."""
+        return cls(
+            db_dir,
+            keys,
+            source_inventory_store=SourceInventoryStore(),
+        )
 
     @staticmethod
     def _file_identity(path):
@@ -1041,19 +1067,32 @@ class WeChatDB:
 
         return messages
 
-    def _source_generation_marker(self, rel_key, *, cache_path=""):
-        path = cache_path or os.path.join(self.db_dir, rel_key)
+    @staticmethod
+    def _opened_regular_prefix(path):
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         try:
-            source_stat = os.lstat(path)
+            source_stat = os.fstat(fd)
             if not stat.S_ISREG(source_stat.st_mode):
-                return "not-regular"
-            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                raise OSError("not regular")
+            prefix = os.read(fd, 16)
+        finally:
+            os.close(fd)
+        return source_stat, prefix
+
+    def _source_generation_marker(
+        self,
+        rel_key,
+        *,
+        cache_path="",
+        source_stat=None,
+        prefix=None,
+    ):
+        if source_stat is None or prefix is None:
+            path = cache_path or os.path.join(self.db_dir, rel_key)
             try:
-                prefix = os.read(fd, 16)
-            finally:
-                os.close(fd)
-        except OSError:
-            return "missing"
+                source_stat, prefix = self._opened_regular_prefix(path)
+            except OSError:
+                return "missing"
         return hashlib.sha256(
             b"wechat-db-generation-v1\0"
             + f"{source_stat.st_dev}:{source_stat.st_ino}\0".encode("ascii")
@@ -1062,12 +1101,21 @@ class WeChatDB:
             + self._key_fingerprint(rel_key).encode("ascii")
         ).hexdigest()
 
-    def _source_shard_identity(self, rel_key, *, cache_path=""):
+    def _source_shard_identity(
+        self,
+        rel_key,
+        *,
+        cache_path="",
+        source_stat=None,
+        prefix=None,
+    ):
         normalized = str(rel_key or "").replace("\\", "/").lower()
-        namespace = str(getattr(self, "cache_namespace", "legacy-unscoped"))
+        namespace = str(getattr(self, "source_namespace", "legacy-unscoped"))
         generation = self._source_generation_marker(
             rel_key,
             cache_path=cache_path,
+            source_stat=source_stat,
+            prefix=prefix,
         )
         return hashlib.sha256(
             f"wechat-message-source-shard-v3\0{namespace}\0{normalized}\0{generation}".encode(
@@ -1075,8 +1123,10 @@ class WeChatDB:
             )
         ).hexdigest()[:20]
 
-    def _message_shard_specs(self):
-        specs = []
+    def _message_shard_observations(self, known_paths=()):
+        observations = []
+        specs_by_generation = {}
+        error_codes = []
         keys = getattr(self, "keys", {}) or {}
         db_dir = str(getattr(self, "db_dir", "") or "")
         rel_key_set = {
@@ -1084,6 +1134,7 @@ class WeChatDB:
             for key in keys
             if re.search(r"message/(?:biz_)?message_\d+\.db$", str(key).replace("\\", "/"))
         }
+        rel_key_set.update(str(value).replace("\\", "/") for value in known_paths)
         message_dir = os.path.join(db_dir, "message") if db_dir else ""
         if message_dir and os.path.isdir(message_dir):
             try:
@@ -1093,44 +1144,121 @@ class WeChatDB:
                     ):
                         rel_key_set.add("message/" + entry.name)
             except OSError:
-                pass
-        rel_keys = sorted(rel_key_set)
-        for rel_key in rel_keys:
-            if db_dir and os.path.exists(os.path.join(db_dir, rel_key)):
-                specs.append({
-                    "source_shard_id": self._source_shard_identity(rel_key),
-                    "rel_key": rel_key,
-                    "cache_path": "",
-                    "cache_only": False,
-                })
-        if specs:
-            return specs
+                error_codes.append("source_inventory_scan_failed")
+        elif message_dir and os.path.lexists(message_dir):
+            error_codes.append("source_inventory_scan_failed")
 
-        # Compatibility for an old decrypted cache when no live message shard is available.
+        # Recover compatibility cache candidates even when neither a current
+        # key nor a live file names the old shard.
         for prefix in ("message", "biz_message"):
             for index in range(10):
                 rel_key = f"message/{prefix}_{index}.db"
-                if rel_key in rel_keys:
-                    continue
-                cache_path = self._fallback_cache_path(rel_key)
-                if os.path.isfile(cache_path):
-                    specs.append({
-                        "source_shard_id": self._source_shard_identity(
-                            rel_key,
-                            cache_path=cache_path,
-                        ),
+                if self._fallback_cache_path(rel_key):
+                    rel_key_set.add(rel_key)
+
+        for rel_key in sorted(rel_key_set):
+            source_path = os.path.join(db_dir, rel_key) if db_dir else ""
+            cache_path = self._fallback_cache_path(rel_key)
+            state = "missing_file"
+            generation_id = ""
+            spec = None
+            if source_path and os.path.lexists(source_path):
+                try:
+                    source_stat, prefix = self._opened_regular_prefix(source_path)
+                except OSError:
+                    state = "unreadable"
+                else:
+                    generation_id = self._source_shard_identity(
+                        rel_key,
+                        source_stat=source_stat,
+                        prefix=prefix,
+                    )
+                    is_plain = prefix[:15] == b"SQLite format 3"
+                    if not is_plain and not self._get_key(rel_key):
+                        state = "key_missing"
+                    else:
+                        state = "present"
+                        spec = {
+                            "source_shard_id": generation_id,
+                            "rel_key": rel_key,
+                            "cache_path": "",
+                            "cache_only": False,
+                        }
+            elif cache_path:
+                try:
+                    cache_stat, cache_prefix = self._opened_regular_prefix(cache_path)
+                except OSError:
+                    state = "unreadable"
+                else:
+                    state = "cache_only"
+                    generation_id = self._source_shard_identity(
+                        rel_key,
+                        cache_path=cache_path,
+                        source_stat=cache_stat,
+                        prefix=cache_prefix,
+                    )
+                    spec = {
+                        "source_shard_id": generation_id,
                         "rel_key": rel_key,
                         "cache_path": cache_path,
                         "cache_only": True,
-                    })
-        return specs
+                    }
+
+            observations.append({
+                "relative_path": rel_key,
+                "generation_id": generation_id,
+                "state": state,
+            })
+            if spec is not None:
+                specs_by_generation[generation_id] = spec
+        return observations, specs_by_generation, error_codes
+
+    def _source_inventory_snapshot(self, *, update=True):
+        try:
+            if not update:
+                return self.source_inventory_store.inspect(self.source_namespace)
+            prior = self.source_inventory_store.inspect(self.source_namespace)
+            known_paths = [row["relative_path"] for row in prior.shards]
+            observations, specs, error_codes = self._message_shard_observations(
+                known_paths
+            )
+            snapshot = self.source_inventory_store.reconcile(
+                self.source_namespace,
+                observations,
+                error_codes=error_codes,
+            )
+        except SourceInventoryError as exc:
+            raise WeChatSourceDegraded(exc.code) from exc
+        self._inventory_specs_by_generation = specs
+        return snapshot
+
+    def get_source_inventory(self, *, update=True, sensitive=False):
+        """Return one completeness snapshot without absolute source paths."""
+        return self._source_inventory_snapshot(update=update).as_dict(
+            sensitive=bool(sensitive)
+        )
+
+    def _message_shard_specs(self):
+        snapshot = self._source_inventory_snapshot(update=True)
+        return [
+            dict(self._inventory_specs_by_generation[generation_id])
+            for generation_id in snapshot.present_generation_ids
+            if generation_id in self._inventory_specs_by_generation
+        ]
 
     def get_message_shards(self, _username):
         """Return privacy-safe identities for every known message shard."""
-        specs = self._message_shard_specs()
-        if specs and all(spec.get("cache_only") for spec in specs):
-            raise WeChatSourceDegraded("source_cache_only")
-        return [spec["source_shard_id"] for spec in specs]
+        snapshot = self._source_inventory_snapshot(update=True)
+        if not snapshot.complete:
+            if (
+                snapshot.counts.get("cache_only")
+                and sum(snapshot.counts.get(state, 0) for state in COMPLETE_STATES) == 0
+            ):
+                raise WeChatSourceDegraded("source_cache_only")
+            if snapshot.counts.get("key_missing"):
+                raise WeChatSourceDegraded("source_key_missing")
+            raise WeChatSourceDegraded("source_inventory_incomplete")
+        return list(snapshot.present_generation_ids)
 
     def get_messages_for_shard(
         self,

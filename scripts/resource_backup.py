@@ -49,7 +49,7 @@ def _source(config):
     keys = get_cached_keys() or {}
     if not keys or not config.get("db_dir"):
         return None
-    return WeChatDB(config["db_dir"], keys)
+    return WeChatDB.for_runtime(config["db_dir"], keys)
 
 
 def _from_timestamp(value):
@@ -98,6 +98,8 @@ def _exit_code(result):
         "run_not_found",
         "selection_changed",
         "candidate_mismatch",
+        "inventory_unavailable",
+        "inventory_changed",
         "consent_revoked",
         "not_run_worker_busy",
         "projection_failed",
@@ -315,13 +317,13 @@ def main(argv=None):
     elif args.command == "scan":
         result = _capture(config, source=True).scan()
     elif args.command == "backfill":
-        result = _capture(config, source=not args.apply).backfill(
+        result = _capture(config, source=True).backfill(
             0 if args.all else _from_timestamp(args.from_date),
             apply=args.apply,
             run_id=args.run_id,
         )
     elif args.command == "backfill-links":
-        result = _capture(config, source=not args.apply).backfill_links(
+        result = _capture(config, source=True).backfill_links(
             0 if args.all else _from_timestamp(args.from_date),
             apply=args.apply,
             run_id=args.run_id,

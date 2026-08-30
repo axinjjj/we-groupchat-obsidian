@@ -472,7 +472,9 @@ A snapshot contains only currently eligible occurrences. It must not include raw
 
 `resources.jsonl` is canonical JSON Lines sorted by occurrence order. Each record includes occurrence identity, selected-chat identity, source time/sender, resource metadata, local capture state, and mounted handoff state.
 
-`manifest.json` records `archive_id`, counts, object identities, link export mode, and the SHA-256 of `resources.jsonl`.
+`manifest.json` records `archive_id`, counts, object identities, link export
+mode, the SHA-256 of `resources.jsonl`, and a separate path-free
+`source_observation` copied from the authoritative shard inventory.
 
 `COMPLETE` is written last and binds the manifest and resource catalog hashes. An incomplete directory without a valid `COMPLETE` marker is not a complete snapshot.
 
@@ -481,9 +483,17 @@ listed objects are internally bound and independently readable. It does not turn
 an unresolved file occurrence into a completed byte handoff. Such a manifest
 records `handoff_semantics=pending_resources` and a non-zero
 `unresolved_file_count`; the run remains non-successful until those bytes are
-resolved and delivered.
+resolved and delivered. It also does not claim a complete WeChat source
+observation. Only `source_observation.complete=true` proves that the current
+expected logical-shard set was present/readable when captured; the same object
+records `inventory_revision`, `inventory_digest`, state counts, and
+content-free error codes.
 
-A new snapshot is skipped only when the canonical resource catalog hash is unchanged, the recorded target snapshot still has a valid hash-bound `COMPLETE`, and its `link_export_mode` plus handoff semantics match the current run. A missing or invalid target snapshot is rebuilt even when local SQLite still holds the old catalog hash.
+A new snapshot is skipped only when the canonical resource catalog hash is
+unchanged, the recorded target snapshot still has a valid hash-bound `COMPLETE`,
+and its `link_export_mode`, handoff semantics, and `source_observation` match the
+current run. A missing/invalid snapshot or changed source evidence is rebuilt
+even when local SQLite still holds the old catalog hash.
 
 ## 13. Link privacy modes
 
@@ -502,6 +512,9 @@ Keys such as token, access_token, secret, password, signature, auth, authorizati
 ## 14. Failure semantics
 
 - Source failure: do not advance the failed shard cursor.
+- Incomplete inventory: Topic Monitor/catch-up refuse all partial reads;
+  resource/Drive scanners may consume listed present generations but keep the
+  run `source_degraded` and never claim `source_complete`.
 - Source unavailable at process start: return structured `source_unavailable`, then continue due local resolution, Obsidian projection, and mounted handoff from the existing ledger/CAS; the composite CLI exit remains non-zero.
 - CAS resolution failure: retain the occurrence and retry according to local archive policy.
 - Target unavailable: retain all local state; do not alter source cursors or CAS;
@@ -571,8 +584,10 @@ python scripts/resource_backup.py enable
 `init` is from-now only. Re-selection also starts a new from-now epoch. Explicit
 `backfill --apply` does not move that live cursor. `backfill --all` means all
 history still locally readable from known WeChat shards. `backfill-links`
-requires a complete known-shard scan and atomically writes only exact link
-occurrences; it never resolves files. Ordinary `run` remains safe before the
+requires a complete authoritative inventory and atomically writes only exact
+link occurrences; the plan binds `inventory_digest`, and apply re-reads that
+exact digest before consuming staging without rescanning message rows. It never
+resolves files. Ordinary `run` remains safe before the
 target is available and skips attachment bytes unless `--resolve-files` is
 explicit: it captures eligible metadata occurrences and refreshes the local
 Obsidian index, then reports the target state without fabricating a remote
@@ -593,6 +608,10 @@ At minimum, automated tests must prove:
 - two same-name files with different bytes become two CAS objects;
 - source cursor and occurrence inserts commit atomically;
 - a degraded shard does not advance;
+- an expected shard missing from the current filesystem keeps inventory
+  incomplete while present shards remain consumable by resource/Drive scans;
+- a returned shard resumes its own cursor and is captured exactly once;
+- backfill apply fails closed when its bound inventory digest changes;
 - links-only backfill writes no rows unless every known shard completes, then
   commits all new link occurrences atomically;
 - shard A may fail while shard B advances; after A recovers its unseen file is
@@ -611,6 +630,8 @@ At minimum, automated tests must prove:
 - snapshots without a valid `COMPLETE` marker are rejected;
 - unresolved files may appear in a catalog-complete snapshot but never produce a
   `sync_delegated` run state;
+- catalog-complete snapshots separately preserve incomplete source-observation
+  evidence and are rebuilt when that evidence changes;
 - Obsidian indexes reference CAS files but do not duplicate bytes.
 - long-lived app timers use non-blocking overlap guards; retired source/resource
   command modes do not touch protected data, installation is refused, and

@@ -75,7 +75,7 @@ class WeChatDBCacheRefreshTests(unittest.TestCase):
         conn.commit()
         conn.close()
         db = WeChatDB(self.tmp.name, keys={})
-        first = db.get_message_shards(self.username)
+        first = db.get_source_inventory()["present_generation_ids"]
 
         replacement = os.path.join(self.tmp.name, "replacement.db")
         conn = sqlite3.connect(replacement)
@@ -83,7 +83,7 @@ class WeChatDBCacheRefreshTests(unittest.TestCase):
         conn.commit()
         conn.close()
         os.replace(replacement, source_path)
-        second = db.get_message_shards(self.username)
+        second = db.get_source_inventory()["present_generation_ids"]
 
         self.assertEqual(len(first), 1)
         self.assertEqual(len(second), 1)
@@ -98,10 +98,10 @@ class WeChatDBCacheRefreshTests(unittest.TestCase):
         db = WeChatDB(self.tmp.name, keys={
             rel_path: {"enc_key": "11" * 32},
         })
-        first = db.get_message_shards(self.username)
+        first = db.get_source_inventory()["present_generation_ids"]
 
         db.keys[rel_path] = {"enc_key": "22" * 32}
-        second = db.get_message_shards(self.username)
+        second = db.get_source_inventory()["present_generation_ids"]
 
         self.assertNotEqual(first, second)
 

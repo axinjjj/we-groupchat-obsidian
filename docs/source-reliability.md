@@ -104,6 +104,24 @@ same relative path therefore starts a new shard cursor instead of reusing the
 old generation. A decrypted cache with no corresponding live source is marked
 `source_cache_only` and cannot produce an applicable backfill plan.
 
+### Authoritative shard inventory
+
+`core/source_inventory.py` persists the expected union of current message DB
+files, key-inventory paths, and every previously observed non-retired logical
+shard. Logical identity is an opaque source namespace plus normalized relative
+path; a file replacement or key rotation changes the separate generation ID
+without erasing the logical shard from history. Each reconciliation publishes a
+path-free `inventory_revision`, `inventory_digest`, completeness flag, state
+counts, content-free error codes, and the generation IDs that are currently
+readable.
+
+`missing_file`, `key_missing`, `cache_only`, and `unreadable` make the inventory
+incomplete. They are never interpreted as an empty source. Topic Monitor and
+catch-up refuse to advance while the inventory is incomplete. Selected-resource
+and Direct Drive scanners may continue consuming the listed present generations,
+but their result remains `source_degraded`; when a missing shard returns, its own
+cursor resumes and occurrence deduplication prevents duplicates.
+
 Encrypted WAL reconstruction validates the SQLite WAL header and cumulative
 frame checksums, applies frames only through the last valid commit marker,
 honors the committed database-page count, and discards an uncommitted tail.
@@ -314,7 +332,10 @@ cursors. Historical backfill is an identity-bound staged plan/apply and
 does not move live cursors. Planning freezes the selection/source manifest and
 writes bounded 500-2,000-row keyset pages; it does not mutate canonical chat,
 cursor, or occurrence rows. Apply requires the exact unexpired `run_id`, checks
-the staged candidate and current selection digests, and never rescans source.
+the staged candidate and current selection digests, reopens the source, and
+requires the exact `inventory_digest` recorded by the plan. It never rescans
+message rows. An unavailable, incomplete, or changed inventory fails closed
+before staged rows enter the canonical occurrence catalog.
 `backfill --all` means history still locally readable from known shards.
 `backfill-links` never reads attachment bytes and leaves canonical occurrence
 count unchanged if any known shard is degraded.
@@ -375,8 +396,12 @@ verified on the mounted filesystem. It never means provider-side upload or
 remote checksum verification. If any eligible file remains unresolved, the
 catalog may still publish a hash-bound `COMPLETE` snapshot, but the run state is
 `pending_resources`, the manifest says `snapshot_completeness=catalog_complete`,
-and the CLI exits non-zero. `COMPLETE` binds the catalog; it does not fabricate
-missing bytes.
+and the CLI exits non-zero. `COMPLETE` binds the durable catalog; it does not
+fabricate missing bytes or prove that every expected WeChat shard was observed.
+The separate path-free `source_observation` object records the inventory digest,
+revision, state counts, error codes, and `complete` truth for that run. A change
+to this evidence creates a new snapshot even when the durable catalog is
+unchanged.
 
 All surfaces consume one classifier: `ready_local` plus a valid mounted receipt
 is delivered; `queued`, `waiting_cache`, `retry_wait`, and

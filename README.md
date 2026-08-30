@@ -121,6 +121,12 @@ Its most important boundaries are:
   short-lived wakes. It can request a normal background WeChat launch after
   grace, budget, and backoff checks, but never kills or re-signs WeChat, drives
   its UI, performs login, or treats an unknown process lookup as absence.
+- A durable, path-free source inventory tracks the expected logical message-DB
+  shards separately from their current generations. Missing files/keys,
+  cache-only copies, and unreadable shards remain explicit incomplete states;
+  they are never converted into “no new messages.” Monitor/catch-up stop before
+  advancing, while selected-resource and Direct Drive scans may process present
+  shards only with a `source_degraded` result.
 - File attachment bytes can be preserved in a private local SHA-256
   content-addressed archive. An optional backup copies immutable objects to an
   ordinary filesystem target; verification proves the target bytes only, not a
@@ -424,7 +430,10 @@ links-only staged plan/apply entry: it never reads attachment bytes, and no
 canonical occurrence is written if a known shard is incomplete. Planning uses
 bounded 500-2,000-row keyset pages and does not create or advance live cursors.
 Apply requires the exact unexpired `run_id` returned by that plan and consumes
-only its staged rows; it never rescans source after confirmation. Ordinary
+only its staged rows; it reopens the source and requires the exact
+`inventory_digest` recorded by the plan, but never rescans message rows after
+confirmation. Mounted `COMPLETE` snapshots bind the durable catalog separately
+from their path-free `source_observation.complete` evidence. Ordinary
 resource `run` skips attachment-byte resolution. `--resolve-files` authorizes
 only that explicit CLI run, while menu consent lasts only for the current app
 process and is rechecked before every attachment-byte operation. Each mounted
