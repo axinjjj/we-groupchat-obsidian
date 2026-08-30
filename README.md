@@ -17,7 +17,7 @@ backup, autostart, packaging, or sending. See
 
 A local-first macOS tool for reading your own WeChat desktop database, summarizing group chats, searching messages, and turning high-value group-chat updates into an Obsidian-friendly Markdown knowledge base.
 
-This is not official WeChat/Tencent software, not a WeChat bot, not employee-monitoring software, and not fully offline when you enable cloud AI or remote link preview. It does not use a WeChat API, does not run a remote service, and does not send your chat history to this project. The app reads local database files on your Mac and calls the AI provider you configure. Optional MCP read tools separately expose selected local chat-derived data to the MCP client you configure.
+This is not official WeChat/Tencent software, not a WeChat bot, not employee-monitoring software, and not fully offline when you enable cloud AI. It does not use a WeChat API, does not run a remote service, and does not send your chat history to this project. The app reads local database files on your Mac and calls the AI provider you configure. Built-in remote link preview is disabled and makes zero network requests. Optional MCP read tools separately expose selected local chat-derived data to the MCP client you configure.
 
 Project lineage: this standalone derivative builds on [Qizhan7/mac-wechat-summary](https://github.com/Qizhan7/mac-wechat-summary), which established the local macOS menu-bar summary and MCP foundation. This repository is not connected through GitHub's fork network and is not maintained as an upstream pull-request branch; it continues as a separate local-first Obsidian workflow project. See [NOTICE.md](NOTICE.md).
 
@@ -154,9 +154,10 @@ Its most important boundaries are:
   transfers larger than 5 MiB resume from server-confirmed offsets, and
   human-readable chat/month shortcuts provide the visible projection. Google
   Drive file IDs, not visible names or paths, own remote identity.
-- Remote AI calls and opt-in public URL previews cross the Mac-local boundary.
-  Ollama can keep AI interpretation local, while public URL context remains off
-  by default and is treated as untrusted input.
+- Remote AI calls cross the Mac-local boundary. Ollama can keep AI
+  interpretation local. Built-in remote URL preview is disabled; URL
+  credentials are redacted before links enter AI prompts or human-readable
+  projections while exact URL identity stays in the private local ledger.
 - Saving knowledge, interrupting with a notification, and creating later action
   in Review Queue are separate decisions. MCP is an optional legacy read-only
   compatibility surface; its former WeChat UI sending path is retired.
@@ -181,7 +182,7 @@ independently deployed microservices. Editable sources:
 - Provider-neutral filesystem snapshots for the attachment archive, including plan, run, verify, and read-only restore planning.
 - Default no-OAuth selected-resource backup through an existing mounted filesystem such as Google Drive for Desktop, with exact link occurrences, shared-CAS files, lightweight Obsidian indexes, catalog snapshots, and honest `sync_delegated` receipts.
 - Optional advanced selected-chat file sync through the Google Drive API, with a separate selection/control plane, durable queue, chat/month shortcuts, retry/reconcile, and no automatic deletion.
-- Optional link preview context for public URLs; it is off by default and must be enabled explicitly.
+- Exact URL extraction with credential-safe display/export redaction; built-in remote link preview is disabled and performs zero network requests.
 - CLI and `.command` maintenance entrypoints for users whose menu bar icon is hidden.
 - Optional legacy read-only MCP compatibility server for chat lookup, search, summaries, images, and existing group/bookmark inspection. It cannot send messages or mutate local metadata.
 
@@ -216,7 +217,7 @@ independently deployed microservices. Editable sources:
   before its next attachment-byte operation. Link-only backfill never reads the
   attachment cache.
 - Cloud AI providers receive the text you ask them to summarize. Use Ollama if you want the AI step to stay local.
-- Remote link previews are disabled by default. If you set `monitor_fetch_links: true`, the app fetches public URLs found in monitored messages, and those remote sites may receive your request metadata. Link preview has a conservative SSRF guard, but it is still a best-effort public URL preview, not a hardened crawler.
+- Built-in remote link preview is retired from normal runtime and performs zero network requests. A legacy saved `monitor_fetch_links: true` value is accepted only for compatibility and is forced off; there is no menu or CLI path that re-enables it. Exact observed URLs remain in the private local ledger for deterministic identity. Human-readable projections, snapshots/exports, Review Queue, Daily Digest, AI prompts, and error text use one canonical display form that redacts credential-bearing query and fragment fields, including common AWS, GCS, and Azure signed-URL parameters. This repository does not claim to provide a hardened crawler.
 - MCP read tools expose local chat-derived data to the configured MCP client and may pass it to the configured AI provider for summaries. MCP is read-only: it does not advance bookmarks or mutate group metadata.
 - MCP message sending is retired, not merely disabled. The legacy `prepare_send_message`, `confirm_send_message`, and `send_message` tool names return the stable content-free code `mcp_send_retired` and never touch WeChat UI. Legacy send config keys remain loadable but are inert.
 
@@ -742,7 +743,7 @@ This fork started from the same core idea as the upstream project: read the user
 - Local operations are more explicit: setup-only, health check, monitor configuration, data-source refresh, historical backfill, Obsidian re-export, and autostart install/uninstall all have CLI or `launchers/*.command` entrypoints.
 - WeChat update recovery is documented and scriptable through `./launchers/健康检查.command` and `./launchers/刷新数据源.command`, instead of depending on the menu bar UI being reachable.
 - LaunchAgent handling is public-safe and compatible: new installs use a neutral label, while older project-managed plists are discovered by path and preserved unless migration is explicitly requested.
-- Topic monitoring has been tuned toward high-signal, value-first summaries, with support for multiple chats, provider/model configuration, opt-in link preview context, forwarded-record parsing, local wake-from-sleep catch-up, and `P1/P2/P3` notification gating.
+- Topic monitoring has been tuned toward high-signal, value-first summaries, with support for multiple chats, provider/model configuration, credential-redacted URL references, forwarded-record parsing, local wake-from-sleep catch-up, and `P1/P2/P3` notification gating. Built-in remote link preview remains disabled.
 - Resource-lead handling keeps "can private-share / will share later / repo not public yet" opportunities visible even before a file or link appears.
 - Obsidian output is treated as a first-class local knowledge base: notes are organized by chat/category, include safer resource sections, generate root-level link-only date maps, and can be re-exported without re-calling the AI provider.
 - Daily digest and actionable review queue support were added so high-signal notes stay browsable in Obsidian while only concrete follow-up, import, reference-evaluation, or risk-review work becomes pending queue work.

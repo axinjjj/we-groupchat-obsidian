@@ -1,6 +1,8 @@
+import io
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 from core.monitor import TopicMonitor, load_state, save_state
@@ -1284,11 +1286,12 @@ class TopicMonitorTests(unittest.TestCase):
         self.assertEqual(preview_calls, [])
         self.assertNotIn("<link_previews>", seen_prompt[0])
 
-    def test_link_preview_context_is_included_in_monitor_prompt(self):
+    def test_old_enabled_link_preview_config_remains_zero_network(self):
         self.config["monitor_fetch_links"] = True
         save_state({"last_checked_ts": 10}, self.state_file)
         db = FakeDB([msg(11, "Claude Code 新功能介绍 https://example.com/codex")])
         seen_prompt = []
+        preview_calls = []
 
         monitor = TopicMonitor(
             db,
@@ -1296,7 +1299,7 @@ class TopicMonitorTests(unittest.TestCase):
             state_file=self.state_file,
             hits_dir=self.hits_dir,
             ai_evaluator=lambda prompt, *_: seen_prompt.append(prompt) or {"match": False},
-            link_preview_fetcher=lambda url: {
+            link_preview_fetcher=lambda url: preview_calls.append(url) or {
                 "url": url,
                 "status": "ok",
                 "title": "Claude Code 新功能说明",
@@ -1308,18 +1311,81 @@ class TopicMonitorTests(unittest.TestCase):
         result = monitor.check_once()
 
         self.assertEqual(result["status"], "no_match")
-        self.assertIn("<link_context>", seen_prompt[0])
-        self.assertIn("Claude Code 新功能说明", seen_prompt[0])
-        self.assertIn("介绍了一个可以启发实际项目的功能更新", seen_prompt[0])
+        self.assertEqual(preview_calls, [])
+        self.assertNotIn("<link_context>", seen_prompt[0])
+        self.assertNotIn("Claude Code 新功能说明", seen_prompt[0])
+        self.assertIn("Remote link preview 已禁用", seen_prompt[0])
 
-    def test_wechat_record_link_is_marked_unavailable_without_network_guessing(self):
+    def test_signed_url_credentials_never_enter_ai_prompts(self):
+        secret_url = (
+            "https://example.com/object?X-Amz-Credential=prompt-secret"
+            "&X-Amz-Signature=signature-secret&view=1"
+            "#access_token=fragment-secret"
+        )
+        save_state({"last_checked_ts": 10}, self.state_file)
+        seen_prompt = []
+        db = FakeDB([msg(11, f"资源在这里 {secret_url}")])
+        monitor = TopicMonitor(
+            db,
+            self.config,
+            state_file=self.state_file,
+            hits_dir=self.hits_dir,
+            ai_evaluator=lambda prompt, *_: seen_prompt.append(prompt) or {
+                "match": False,
+            },
+            now_func=lambda: 1000,
+        )
+
+        result = monitor.check_once()
+        relation_prompt = monitor._build_relation_prompt(
+            {"links": [secret_url]},
+            [{"topic_id": 1, "links": [secret_url]}],
+            f"source {secret_url}",
+        )
+
+        self.assertEqual(result["status"], "no_match")
+        for prompt in (seen_prompt[0], relation_prompt):
+            for secret in ("prompt-secret", "signature-secret", "fragment-secret"):
+                self.assertNotIn(secret, prompt)
+            self.assertIn("REDACTED", prompt)
+            self.assertIn("view=1", prompt)
+
+    def test_ai_error_output_redacts_url_credentials(self):
+        self.config.update({
+            "monitor_ai_retry_attempts": 1,
+            "monitor_ai_retry_delay_seconds": 0,
+        })
+        save_state({"last_checked_ts": 10}, self.state_file)
+        db = FakeDB([msg(11, "一条普通消息")])
+        error_url = "https://example.com/fail?token=error-secret&view=1"
+        monitor = TopicMonitor(
+            db,
+            self.config,
+            state_file=self.state_file,
+            hits_dir=self.hits_dir,
+            ai_evaluator=lambda *_: (_ for _ in ()).throw(
+                TimeoutError(f"request timed out at {error_url}")
+            ),
+            now_func=lambda: 1000,
+        )
+        output = io.StringIO()
+
+        with redirect_stdout(output), self.assertRaises(RuntimeError) as raised:
+            monitor.check_once()
+
+        self.assertNotIn("error-secret", output.getvalue())
+        self.assertNotIn("error-secret", str(raised.exception))
+        self.assertIn("token=REDACTED", output.getvalue())
+        self.assertIn("view=1", str(raised.exception))
+
+    def test_wechat_record_link_preview_is_also_disabled(self):
         preview = fetch_link_preview(
             "https://support.weixin.qq.com/cgi-bin/mmsupport-bin/readtemplate"
             "?t=page/favorite_record__w_unsupport&from=singlemessage"
         )
 
-        self.assertEqual(preview["status"], "unavailable")
-        self.assertIn("无法读取被转发的聊天记录正文", preview["summary"])
+        self.assertEqual(preview["status"], "link_preview_disabled")
+        self.assertEqual(preview["network_requests"], 0)
 
     def _knowledge_decision(self, **overrides):
         data = {

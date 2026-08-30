@@ -47,8 +47,8 @@ DEFAULT_CONFIG = {
     "monitor_context_overlap_minutes": 12,
     "monitor_context_max_messages": 80,
     "monitor_cooldown_minutes": 15,
+    # Inert compatibility key: the in-process remote preview path is retired.
     "monitor_fetch_links": False,
-    "monitor_max_links_per_run": 5,
     "background_notifications_enabled": True,
     "monitor_notify_writes": True,
     "monitor_notify_checkins": False,
@@ -351,7 +351,7 @@ def _sanitize_config(saved):
 
     for key in (
         "auto_refresh_on_open", "show_group_nickname", "monitor_enabled",
-        "monitor_knowledge_enabled", "monitor_fetch_links",
+        "monitor_knowledge_enabled",
         "background_notifications_enabled",
         "monitor_notify_writes", "monitor_notify_checkins",
         "daily_digest_enabled", "daily_digest_notify",
@@ -364,6 +364,10 @@ def _sanitize_config(saved):
         value = saved.get(key)
         if isinstance(value, bool):
             cfg[key] = value
+
+    # Old configs may contain monitor_fetch_links=true. Never revive the
+    # retired network path while loading or rewriting those files.
+    cfg["monitor_fetch_links"] = False
 
     # Legacy MCP send keys remain loadable for old config files, but are inert.
     # In particular, never translate the retired boolean into an active mode.
@@ -387,7 +391,6 @@ def _sanitize_config(saved):
         "monitor_context_overlap_minutes": (0, 120),
         "monitor_context_max_messages": (0, 300),
         "monitor_cooldown_minutes": (0, 1440),
-        "monitor_max_links_per_run": (0, 20),
         "monitor_ai_retry_attempts": (0, 3),
         "monitor_ai_retry_delay_seconds": (0, 60),
         "monitor_ai_failure_backoff_minutes": (1, 1440),

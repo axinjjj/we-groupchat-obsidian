@@ -279,6 +279,14 @@ backup selection：
 Target 与 link-export policy 存在独立 private `resource_backup.json` 中。目标目录必须已经存在；
 worker 不会在 mount 缺失时把那个路径重新创建成普通本地目录。
 
+Exact observed URL 及其 digest-bound identity 只保留在 private local ledger。所有人类可读
+Markdown projection、snapshot/export value、Review Queue、Daily Digest、AI prompt 与对外 error
+统一以 `core/url_safety.py` 作为 canonical display-redaction authority；query 与 fragment 中的
+credential-bearing values 都会脱敏，包括常见 AWS、GCS 与 Azure signed-URL fields。支持的 export
+mode 只有默认 `redacted` 与 `off`；旧配置里的 `full` 会迁移为 `redacted`，不再允许把 exact
+credential-bearing URL 导出。内置远程链接预览保持 inert，即使旧 main config 写有
+`monitor_fetch_links: true` 也产生零网络请求。本项目不声称提供 hardened crawler。
+
 ```bash
 .venv/bin/python scripts/resource_backup.py set-target "<已经存在的挂载目录>"
 .venv/bin/python scripts/resource_backup.py set-link-export-mode redacted

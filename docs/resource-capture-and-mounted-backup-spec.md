@@ -224,8 +224,8 @@ captured occurrences and shows link/file/month counts. Each chat-level
 reading surface grouped by day and show:
 
 - time;
-- a clickable observed title when present;
-- otherwise the full exact URL as the visible clickable label;
+- a clickable credential-redacted observed title when present;
+- otherwise the canonical credential-redacted URL as the visible clickable label;
 - a clickable file name when the CAS or mounted object is available;
 - one short unavailable state only when a file cannot be opened.
 
@@ -500,14 +500,25 @@ even when local SQLite still holds the old catalog hash.
 The mounted export supports:
 
 ```text
-redacted  default; sensitive query values are replaced with REDACTED
-full      exact observed URLs are exported
- off      URL values are omitted; URL identity remains
+redacted  default; credential-bearing query and fragment values are replaced with REDACTED
+ off      URL values are omitted; exact URL identity remains private
 ```
 
-The local occurrence ledger always preserves the exact observed URL. Redaction affects only exported projections.
+The local occurrence ledger always preserves the exact observed URL and its
+stable hash identity. Human-readable Markdown projections, snapshots/exports,
+Review Queue, Daily Digest, AI prompts, and surfaced error text never use that
+exact value directly; they share `core/url_safety.py` as the canonical display
+redaction authority. A legacy stored `full` mode migrates to `redacted` and is
+not a supported output mode.
 
-Keys such as token, access_token, secret, password, signature, auth, authorization, credential, credentials, jwt, signed-URL credential/signature variants, code, and similar variants are treated as sensitive for redacted output. A URL that cannot be parsed safely exports `REDACTED_INVALID_URL`; parse failure never falls back to the exact URL and never terminates the worker.
+Keys such as token, access_token, api_key/apikey, secret, password, session,
+sessionid, signature/sig, auth/authorization, credential, jwt, credential-like
+code, and AWS/GCS/Azure signed-URL credential variants are sensitive. The same
+rule applies in the query and fragment. A URL that cannot be parsed safely
+exports `REDACTED_INVALID_URL`; parse failure never falls back to the exact URL
+and never terminates the worker. Built-in remote link preview is disabled and
+must report `link_preview_disabled` with `network_requests=0`; a legacy
+`monitor_fetch_links: true` value must not activate network access.
 
 ## 14. Failure semantics
 
@@ -604,7 +615,11 @@ At minimum, automated tests must prove:
 - a CAS object shared with an unselected occurrence exports only selected provenance;
 - case-distinct URLs remain distinct;
 - exact duplicate URLs in one message collapse;
-- sensitive query values are redacted only in mounted output;
+- exact URL strings and hashes remain unchanged in the private ledger while
+  credential-bearing query and fragment values are redacted from every
+  human-readable, export, AI-prompt, and surfaced-error projection;
+- legacy preview-enable and `full` export settings fail closed with zero remote
+  preview requests and redacted output;
 - two same-name files with different bytes become two CAS objects;
 - source cursor and occurrence inserts commit atomically;
 - a degraded shard does not advance;

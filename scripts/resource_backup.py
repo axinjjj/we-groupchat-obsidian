@@ -122,9 +122,9 @@ def build_parser():
     )
     parser.add_argument(
         "--link-export-mode",
-        choices=("redacted", "full", "off"),
+        choices=("redacted", "off"),
         default=None,
-        help="How exact link URLs are written to the mounted backup catalog.",
+        help="Export redacted link URLs or omit URL values from the mounted catalog.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status")
@@ -184,7 +184,7 @@ def build_parser():
     target.add_argument("path")
     sub.add_parser("clear-target")
     mode = sub.add_parser("set-link-export-mode")
-    mode.add_argument("mode", choices=("redacted", "full", "off"))
+    mode.add_argument("mode", choices=("redacted", "off"))
     install_agent = sub.add_parser("install-agent")
     install_agent.add_argument("--interval-seconds", type=int, default=None)
     sub.add_parser("uninstall-agent")

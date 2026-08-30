@@ -948,10 +948,11 @@ class ResourceBackupTests(unittest.TestCase):
         with open(month_files[0], encoding="utf-8") as handle:
             text = handle.read()
         self.assertIn(
-            "[https://example.com/A?token=secret-value]"
-            "(<https://example.com/A?token=secret-value>)",
+            "[https://example.com/A?token=REDACTED]"
+            "(<https://example.com/A?token=REDACTED>)",
             text,
         )
+        self.assertNotIn("secret-value", text)
         self.assertIn("📎 [report.pdf]", text)
         self.assertNotIn("Faye", text)
         self.assertNotIn("URL identity", text)
@@ -991,7 +992,7 @@ class ResourceBackupTests(unittest.TestCase):
         )
 
         self.assertIn(
-            "[Observed title](<https://example.com/A?token=secret-value>)",
+            "[Observed title](<https://example.com/A?token=REDACTED>)",
             text,
         )
         self.assertIn(
@@ -999,6 +1000,65 @@ class ResourceBackupTests(unittest.TestCase):
             text,
         )
         self.assertNotIn("[链接]", text)
+
+    def test_signed_cloud_urls_are_redacted_in_catalog_and_markdown(self):
+        capture = self._ready_capture()
+        links = [
+            row for row in capture.occurrences() if row["kind"] == "link"
+        ]
+        links[0]["observed_url"] = (
+            "https://bucket.example.com/object?X-Amz-Credential=export-secret"
+            "&X-Amz-Signature=signature-secret&view=1"
+            "#access_token=fragment-secret"
+        )
+        links[1]["observed_url"] = (
+            "https://account.blob.example.com/object?sv=2026-01-01&sp=r"
+            "&se=2026-09-01&sr=b&sig=azure-secret&filename=report.pdf"
+        )
+        backup = self._backup(capture)
+
+        catalog = json.dumps(
+            backup._catalog_records(links, {}),
+            ensure_ascii=False,
+        )
+        markdown = backup._render_month(
+            "猫猫研究群",
+            "2026-08",
+            links,
+            {},
+            target_view=False,
+        )
+        combined = catalog + markdown
+
+        for secret in (
+            "export-secret",
+            "signature-secret",
+            "fragment-secret",
+            "azure-secret",
+            "2026-01-01",
+            "2026-09-01",
+        ):
+            self.assertNotIn(secret, combined)
+        self.assertIn("X-Amz-Credential=REDACTED", combined)
+        self.assertIn("access_token=REDACTED", combined)
+        self.assertIn("filename=report.pdf", combined)
+
+    def test_legacy_full_link_export_mode_migrates_to_redacted(self):
+        capture = self._ready_capture()
+        backup = MountedResourceBackup(
+            self.config,
+            capture=capture,
+            link_export_mode="full",
+            now_func=lambda: 300,
+        )
+
+        self.assertEqual(backup.link_export_mode, "redacted")
+        self.assertNotIn(
+            "legacy-secret",
+            backup._export_url(
+                "https://example.com/object?token=legacy-secret&view=1"
+            ),
+        )
 
     def test_resource_indexes_have_a_discoverable_scope_root(self):
         capture = self._ready_capture()
@@ -2513,25 +2573,25 @@ class ResourceBackupTests(unittest.TestCase):
         )
         capture.initialize_selected_chat_cursors(start_timestamp=0)
         capture.scan()
-        identifiers = iter(("full", "redacted"))
-        full = MountedResourceBackup(
-            self.config, capture=capture, link_export_mode="full",
-            now_func=lambda: 300, id_factory=lambda: next(identifiers),
-        )
-        first = full.run()
+        identifiers = iter(("redacted", "off"))
         redacted = MountedResourceBackup(
             self.config, capture=capture, link_export_mode="redacted",
             now_func=lambda: 300, id_factory=lambda: next(identifiers),
         )
+        first = redacted.run()
+        off = MountedResourceBackup(
+            self.config, capture=capture, link_export_mode="off",
+            now_func=lambda: 300, id_factory=lambda: next(identifiers),
+        )
 
-        second = redacted.run()
+        second = off.run()
 
         self.assertEqual(second["snapshot"]["state"], "written")
         self.assertNotEqual(
             second["snapshot"]["snapshot_id"], first["snapshot"]["snapshot_id"]
         )
         self.assertEqual(
-            redacted._load_snapshot()["manifest"]["link_export_mode"], "redacted"
+            off._load_snapshot()["manifest"]["link_export_mode"], "off"
         )
 
     def test_redacted_mode_covers_authorization_and_credential_variants(self):
@@ -2732,7 +2792,7 @@ class ResourceBackupTests(unittest.TestCase):
         )
         mode = context.Process(
             target=_settings_patch_worker,
-            args=(path, {"link_export_mode": "full"}, start),
+            args=(path, {"link_export_mode": "off"}, start),
         )
         target.start()
         mode.start()
@@ -2744,7 +2804,7 @@ class ResourceBackupTests(unittest.TestCase):
         self.assertEqual(mode.exitcode, 0)
         settings = load_resource_backup_settings(path)
         self.assertEqual(settings["target"], self.target)
-        self.assertEqual(settings["link_export_mode"], "full")
+        self.assertEqual(settings["link_export_mode"], "off")
 
     def test_delivery_receipt_does_not_trust_a_symlink_replacement(self):
         capture = self._ready_capture()

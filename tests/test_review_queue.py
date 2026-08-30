@@ -60,6 +60,28 @@ class ReviewQueueTests(unittest.TestCase):
         self.assertEqual(saved["summary"], "示例成员分享了 example-toolkit.zip，可用于评估测试部署。")
         self.assertEqual(saved["resources"]["files"][0]["month_dir"], "/private/wechat/msg/file/2026-06")
 
+    def test_review_queue_redacts_signed_urls_in_every_display_field(self):
+        exact = (
+            "https://example.com/object?X-Amz-Credential=queue-secret"
+            "&X-Amz-Signature=signature-secret&view=1"
+            "#access_token=fragment-secret"
+        )
+
+        item = self.queue.create_or_reuse({
+            "source_chat": "示例技术群",
+            "title": f"资源 {exact}",
+            "summary": f"请审阅 {exact}",
+            "resources": {"files": [], "links": [exact]},
+            "message_hash": "signed-review-item",
+        })
+
+        serialized = json.dumps(item, ensure_ascii=False)
+        for secret in ("queue-secret", "signature-secret", "fragment-secret"):
+            self.assertNotIn(secret, serialized)
+        self.assertIn("X-Amz-Credential=REDACTED", serialized)
+        self.assertIn("view=1", serialized)
+        self.assertIn("access_token=REDACTED", serialized)
+
     def test_mark_updates_status_without_creating_new_pending_item(self):
         item = self.queue.create_or_reuse(
             {

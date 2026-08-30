@@ -12,6 +12,7 @@ from .config import DATA_DIR, ensure_private_dir, ensure_private_file
 from .knowledge import _obsidian_link, ensure_obsidian_vault, safe_obsidian_subdir
 from .review_queue import QUEUE_ACTIONABILITIES, ReviewQueue, priority_for_item
 from .source_contract import projection_source_lines
+from .url_safety import redact_url_for_display, redact_urls_in_text
 
 DAILY_DIGEST_DIR = os.path.join(DATA_DIR, "daily_digests")
 DAILY_DIGEST_STATE_FILE = os.path.join(DATA_DIR, "daily_digest_state.json")
@@ -229,19 +230,22 @@ def _new_notes_count(
 def _topic_from_row(row: sqlite3.Row) -> dict:
     resources = {
         "files": _json_loads(row["files_json"]),
-        "links": _json_loads(row["links_json"]),
+        "links": [
+            redact_url_for_display(link)
+            for link in _json_loads(row["links_json"])
+        ],
     }
     item = {
-        "title": row["title"],
-        "summary": row["summary"],
+        "title": redact_urls_in_text(row["title"]),
+        "summary": redact_urls_in_text(row["summary"]),
         "resources": resources,
     }
     return {
         "topic_id": int(row["topic_id"]),
-        "title": row["title"],
-        "summary": row["summary"],
-        "category": row["category"],
-        "source_chat": row["source_chat"],
+        "title": item["title"],
+        "summary": item["summary"],
+        "category": redact_urls_in_text(row["category"]),
+        "source_chat": redact_urls_in_text(row["source_chat"]),
         "last_seen": row["last_seen"],
         "obsidian_path": row["obsidian_path"],
         "priority": priority_for_item(item),
@@ -275,7 +279,7 @@ def _topic_note_refs(config: dict, topic_ids: list[int]) -> dict[int, dict]:
         ).fetchall()
         return {
             int(row["topic_id"]): {
-                "title": row["title"],
+                "title": redact_urls_in_text(row["title"]),
                 "obsidian_path": row["obsidian_path"],
             }
             for row in rows
@@ -338,7 +342,7 @@ def _today_action_items(config: dict, start_ts: float, end_ts: float) -> list[di
 
 
 def _short(value: str, limit: int = 180) -> str:
-    text = " ".join(str(value or "").split())
+    text = " ".join(redact_urls_in_text(value).split())
     if len(text) <= limit:
         return text
     return text[: limit - 1].rstrip() + "..."

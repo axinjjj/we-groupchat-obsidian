@@ -25,12 +25,8 @@ from .knowledge import (
     vault_chat_name,
 )
 from .taxonomy_assignment import resolve_taxonomy_profile
-from .link_preview import (
-    extract_links,
-    fetch_link_preview,
-    format_link_previews,
-    is_wechat_record_url,
-)
+from .link_preview import is_wechat_record_url
+from .url_safety import URL_RE, redact_urls_in_text
 from .api_errors import is_retryable_ai_error, normalize_ai_error
 from .review_queue import ReviewQueue
 from .daily_digest import source_window_dates
@@ -46,7 +42,6 @@ from .monitor_source import (
 STATE_FILE = os.path.join(DATA_DIR, "monitor_state.json")
 STATE_DIR = os.path.join(DATA_DIR, "monitor_state")
 HITS_DIR = os.path.join(DATA_DIR, "monitor_hits")
-URL_RE = re.compile(r"https?://[^\s<>'\"，。；：！？、（）()【】\[\]{}]+")
 
 
 class MonitorConfigError(RuntimeError):
@@ -120,7 +115,9 @@ class TopicMonitor:
         self.relation_evaluator = relation_evaluator
         self.knowledge_store = knowledge_store
         self.review_queue = review_queue
-        self.link_preview_fetcher = link_preview_fetcher or fetch_link_preview
+        # Retained as an inert constructor argument for caller compatibility.
+        # The normal monitor has no remote-preview network path.
+        self.link_preview_fetcher = None
         self.state_store = state_store or MonitorStateStore(state_file)
         self.now_func = now_func
 
@@ -269,22 +266,26 @@ class TopicMonitor:
             if not messages:
                 return {"status": "no_messages", "message": "没有新消息"}
 
-        messages_text = self.db.format_messages_for_ai(
+        messages_text = redact_urls_in_text(self.db.format_messages_for_ai(
             messages,
             show_group_nickname=self.config.get("show_group_nickname", True),
-        )
-        context_text = self.db.format_messages_for_ai(
+        ))
+        context_text = redact_urls_in_text(self.db.format_messages_for_ai(
             context_messages,
             show_group_nickname=self.config.get("show_group_nickname", True),
-        ) if context_messages else ""
+        )) if context_messages else ""
         source_messages = self._source_messages(context_messages, messages)
-        source_messages_text = self.db.format_messages_for_ai(
+        source_messages_text = redact_urls_in_text(self.db.format_messages_for_ai(
             source_messages,
             show_group_nickname=self.config.get("show_group_nickname", True),
-        )
-        link_context = self._build_link_context(source_messages)
+        ))
         try:
-            decision = self._evaluate_with_retry(messages, messages_text, topic, link_context, context_text)
+            decision = self._evaluate_with_retry(
+                messages,
+                messages_text,
+                topic,
+                context_text,
+            )
         except MonitorConfigError:
             raise
         except Exception:
@@ -1020,8 +1021,13 @@ class TopicMonitor:
         return related_ids
 
     def _build_relation_prompt(self, candidate, candidates, messages_text):
-        candidate_text = json.dumps(candidate, ensure_ascii=False, indent=2)
-        candidates_text = json.dumps(candidates, ensure_ascii=False, indent=2)
+        candidate_text = redact_urls_in_text(
+            json.dumps(candidate, ensure_ascii=False, indent=2)
+        )
+        candidates_text = redact_urls_in_text(
+            json.dumps(candidates, ensure_ascii=False, indent=2)
+        )
+        messages_text = redact_urls_in_text(messages_text)
         return f"""你是微信群关注推送的本地知识库判重助手。请判断这次新命中的候选内容与已有主题的关系。
 
 关系只能是：
@@ -1063,67 +1069,40 @@ class TopicMonitor:
             return f"反转/辟谣: {decision['title']}"
         return decision["title"]
 
-    def _build_link_context(self, messages):
-        if not self.config.get("monitor_fetch_links", False):
-            return ""
-
-        try:
-            max_links = int(self.config.get("monitor_max_links_per_run", 5))
-        except (TypeError, ValueError):
-            max_links = 5
-        if max_links <= 0:
-            return ""
-
-        links = []
-        seen = set()
-        for msg in messages:
-            for url in extract_links(msg.get("text", "")):
-                key = url.lower()
-                if key in seen:
-                    continue
-                links.append(url)
-                seen.add(key)
-                if len(links) >= max_links:
-                    break
-            if len(links) >= max_links:
-                break
-
-        previews = []
-        for url in links:
-            try:
-                previews.append(self.link_preview_fetcher(url))
-            except Exception as e:
-                previews.append({
-                    "url": url,
-                    "status": "error",
-                    "title": "",
-                    "summary": f"链接读取失败：{type(e).__name__}",
-                })
-        return format_link_previews(previews)
-
-    def _evaluate(self, messages, messages_text, topic, link_context="", context_text=""):
-        prompt = self._build_prompt(messages, messages_text, topic, link_context, context_text)
+    def _evaluate(self, messages, messages_text, topic, context_text=""):
+        prompt = self._build_prompt(messages, messages_text, topic, context_text)
         if self.ai_evaluator:
             return self.ai_evaluator(prompt, self.config)
         return self._call_ai_provider(prompt)
 
-    def _evaluate_with_retry(self, messages, messages_text, topic, link_context="", context_text=""):
+    def _evaluate_with_retry(self, messages, messages_text, topic, context_text=""):
         attempts = self._ai_retry_attempts() + 1
         delay = self._ai_retry_delay_seconds()
         for attempt in range(1, attempts + 1):
             try:
-                return self._evaluate(messages, messages_text, topic, link_context, context_text)
+                return self._evaluate(messages, messages_text, topic, context_text)
             except MonitorConfigError:
                 raise
             except Exception as e:
                 if attempt >= attempts or not is_retryable_ai_error(e):
+                    safe_error = redact_urls_in_text(e)
+                    if safe_error != str(e):
+                        raise RuntimeError(safe_error) from None
                     raise
-                print(f"[monitor] AI 调用失败，准备短重试 {attempt}/{attempts - 1}: {e}")
+                print(
+                    "[monitor] AI 调用失败，准备短重试 "
+                    f"{attempt}/{attempts - 1}: {redact_urls_in_text(e)}"
+                )
                 if delay:
                     time.sleep(delay)
 
-    def _build_prompt(self, messages, messages_text, topic, link_context="", context_text=""):
-        group_name = self.config.get("monitor_chat_display_name", "监控群聊")
+    def _build_prompt(self, messages, messages_text, topic, context_text=""):
+        group_name = redact_urls_in_text(
+            self.config.get("monitor_chat_display_name", "监控群聊")
+        )
+        topic = redact_urls_in_text(topic)
+        messages_text = redact_urls_in_text(messages_text)
+        context_text = redact_urls_in_text(context_text)
         start_time = messages[0].get("time_str", "")
         end_time = messages[-1].get("time_str", "")
         taxonomy_context = self._build_taxonomy_context()
@@ -1140,10 +1119,6 @@ class TopicMonitor:
 时间：{start_time} ~ {end_time}
 消息数：{len(messages)}
 </chat_context>
-
-<link_context>
-{link_context or "无"}
-</link_context>
 
 <recent_context>
 {context_text or "无"}
@@ -1169,7 +1144,7 @@ class TopicMonitor:
 9. 如果用户关注描述包含新功能、产品更新、AI 工具、链接、教程、实验报告、具体做法、自建 app 或 agent 设计，那么“明确对象 + 明确变化/功能/做法/链接/结论”的单条消息也可以通知；不要因为只有单条就降到 70 分以下。
 10. 如果同一时间窗里有多个候选都达到通知门槛，不要只保留最热门、最严肃或最后出现的一条；digest 可以同时列出多个话题，title 和 topic_key 用能覆盖这些话题的稳定短语。
 11. 如果消息讨论的是 AI/agent/模型互动实验、可玩玩法、角色/场景测试、模型行为边界或偏好反馈，即使语气轻松、带玩笑或关系向表达，也要先按大类判断是否有方法、结果或启发；不要按单个敏感词字面过滤或命中。
-12. link_context 是程序尝试展开链接后的辅助材料：如果有标题/摘要，可以结合原消息判断链接内容；如果状态是 unavailable、error 或 unsupported，必须承认链接正文不可见，不要臆造链接内容，只根据聊天上下文判断是否提醒。
+12. Remote link preview 已禁用；消息中的 URL 只能作为未读取的引用，不要臆造网页正文。URL credential 会在发送给模型前替换为 REDACTED。
 13. recent_context 是上一轮已经检查过的少量前文，只用来理解新增消息里的“这个/这样/对呀/role 不对”等省略、指代和断续讨论。不要因为 recent_context 自己有价值就通知；只有新增消息延续、补充、纠错或形成结论时，才把前文和新增内容合并成一个完整话题。
 14. 不要把亲密关系、身体体验、情感陪伴或 AI 伴侣交互内容自动当作低价值或需要过滤；如果它们处在 skill、prompt、interaction design、agent/system design、资源分享、模型行为观察或人机关系设计语境下，按正常资源/设计/实验信息判断。
 15. 识别 resource lead：如果有人表示自己有/做了/愿意发/可私发某个资源，群友开始索要，但当前消息窗口还没有实际文件或链接，例如“可以私发吗”“求一份/伸手/发我”“晚点发/回头发/不方便公开”“repo 还没公开”，应标记 resource_lead=true，resource_status=mentioned_private 或 mentioned_pending。
@@ -1292,7 +1267,9 @@ lead_key 用稳定短语描述这条资源线索，便于去重；没有 resourc
             raise MonitorConfigError(str(e)) from None
         except Exception as e:
             provider = provider_config.get("ai_provider", "AI")
-            raise RuntimeError(normalize_ai_error(e, provider)) from None
+            raise RuntimeError(
+                redact_urls_in_text(normalize_ai_error(e, provider))
+            ) from None
 
     def _normalize_decision(self, decision, messages=None):
         if isinstance(decision, str):
@@ -1300,10 +1277,16 @@ lead_key 用稳定短语描述这条资源线索，便于去重；没有 resourc
         if not isinstance(decision, dict):
             decision = {}
 
-        title = str(decision.get("title") or "发现关注内容").strip()
-        summary = self._normalize_digest(decision)
-        topic_key = str(decision.get("topic_key") or title).strip()
-        raw_category = self._clean_short_text(decision.get("category"), "未分类", 80)
+        title = redact_urls_in_text(
+            str(decision.get("title") or "发现关注内容").strip()
+        )
+        summary = redact_urls_in_text(self._normalize_digest(decision))
+        topic_key = redact_urls_in_text(
+            str(decision.get("topic_key") or title).strip()
+        )
+        raw_category = redact_urls_in_text(
+            self._clean_short_text(decision.get("category"), "未分类", 80)
+        )
         links = self._normalize_links(decision, summary, messages)
         has_private_record_link = self._has_wechat_record_link(decision, summary, messages)
         event_type = self._clean_short_text(decision.get("event_type"), "", 80)
@@ -1328,15 +1311,26 @@ lead_key 用稳定短语描述这条资源线索，便于去重；没有 resourc
             "topic_key": self._clean_topic_key(topic_key),
             "category": raw_category[:40],
             "raw_category": raw_category,
-            "entities": self._normalize_list(decision.get("entities"), 16),
-            "semantic_tags": self._normalize_list(decision.get("semantic_tags"), 12),
-            "key_facts": self._normalize_list(decision.get("key_facts"), 20),
+            "entities": [
+                redact_urls_in_text(value)
+                for value in self._normalize_list(decision.get("entities"), 16)
+            ],
+            "semantic_tags": [
+                redact_urls_in_text(value)
+                for value in self._normalize_list(decision.get("semantic_tags"), 12)
+            ],
+            "key_facts": [
+                redact_urls_in_text(value)
+                for value in self._normalize_list(decision.get("key_facts"), 20)
+            ],
             "links": links,
             "event_type": event_type,
             "status_hint": status_hint,
             "resource_lead": resource_lead,
             "resource_status": resource_status,
-            "lead_key": self._clean_topic_key(str(decision.get("lead_key") or topic_key)),
+            "lead_key": self._clean_topic_key(redact_urls_in_text(
+                str(decision.get("lead_key") or topic_key)
+            )),
         }
 
     def _normalize_digest(self, decision):
@@ -1505,7 +1499,7 @@ lead_key 用稳定短语描述这条资源线索，便于去重；没有 resourc
             f"时间: {messages[0].get('time_str', '')} ~ {messages[-1].get('time_str', '')}",
             f"主题: {decision['topic_key']}",
             "",
-            decision["summary"],
+            redact_urls_in_text(decision["summary"]),
         ]
 
         with open(path, "w", encoding="utf-8") as f:
