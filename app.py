@@ -2771,7 +2771,7 @@ class WeGroupchatObsidianApp(rumps.App):
             return
 
         print("[init] 正在加载数据库...")
-        self.db = WeChatDB(self.config["db_dir"], keys)
+        self.db = WeChatDB.for_runtime(self.config["db_dir"], keys)
         if self.config.get("attachment_archive_enabled", False):
             self._start_attachment_archive_consumer()
         if self.config.get("resource_backup_enabled", False):
@@ -4311,7 +4311,7 @@ class WeGroupchatObsidianApp(rumps.App):
             keys = extract_keys()
             print(f"[keys] extract_keys 返回: {len(keys) if keys else 0} 个密钥")
             if keys:
-                self.db = WeChatDB(self.config["db_dir"], keys)
+                self.db = WeChatDB.for_runtime(self.config["db_dir"], keys)
                 self._run_on_main(self._rebuild_chat_menu)
                 _notify("微信总结", "数据源刷新成功", f"已同步 {len(keys)} 个数据库")
             else:

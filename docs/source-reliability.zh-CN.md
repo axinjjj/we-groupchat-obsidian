@@ -87,6 +87,20 @@ database-generation evidence（file identity 加 encrypted-page salt/header pref
 上的 DB 被替换或 rekey 后会得到新 shard cursor，不会沿用旧 generation。只有 decrypted cache、没有
 对应 live source 时会明确报告 `source_cache_only`，不能生成 applicable backfill plan。
 
+### Authoritative shard inventory
+
+`core/source_inventory.py` 持久保存 expected shard union：当前 message DB 文件、key inventory
+中的路径，以及此前见过且未显式 retired 的全部 logical shard。Logical identity 由 opaque source
+namespace 加 normalized relative path 构成；文件替换或 key rotation 只改变独立的 generation ID，
+不会把原 logical shard 从历史里抹掉。每次 reconcile 都发布 path-free 的
+`inventory_revision`、`inventory_digest`、completeness、state counts、content-free error codes，
+以及当前可读的 generation IDs。
+
+`missing_file`、`key_missing`、`cache_only`、`unreadable` 都会让 inventory incomplete，绝不能被
+解释成“source 为空”。Topic Monitor 与 catch-up 在 inventory incomplete 时拒绝推进；selected-resource
+与 Direct Drive scanner 可以继续消费明确列出的 present generation，但整轮仍报告
+`source_degraded`。缺失 shard 回来后从自己的 cursor 继续，occurrence dedup 会阻止重复写入。
+
 Encrypted WAL reconstruction 会验证 SQLite WAL header 与 cumulative frame checksum，只回放到最后一个
 valid commit marker，按 committed database-page count 截断，并丢弃 uncommitted tail。发布 decrypted
 cache 前还会重新核对 main/WAL identity；并发 checkpoint、reset 或 replacement 只做一次 bounded retry，
@@ -270,7 +284,9 @@ worker 不会在 mount 缺失时把那个路径重新创建成普通本地目录
 不推进 epoch，也不清空 shard cursor。历史 backfill 是 identity-bound staged plan/apply，不移动 live cursor。Plan 冻结
 selection/source manifest，以 500-2,000 rows 的 bounded keyset page 写 staging，且不改 canonical
 chat、cursor 或 occurrence；apply 必须使用 exact unexpired `run-id`，复核 candidate digest 与 current
-selection digest，并且不重新扫描 source。`backfill --all` 表示 known local WeChat shards 中仍然可读的
+selection digest，再重新打开 source 并要求 inventory digest 与 plan 记录完全一致；它不会重新扫描
+message row。Inventory unavailable、incomplete 或 changed 时，会在 staging 进入 canonical occurrence
+catalog 之前 fail closed。`backfill --all` 表示 known local WeChat shards 中仍然可读的
 全部历史。`backfill-links` 不读取附件 bytes；任一 known shard degraded 时 canonical occurrence 写入 0 rows。普通 `run`
 捕获 deterministic metadata occurrence、默认跳过 file-byte resolution、即使 target 不可用也继续刷新
 本地 Obsidian index，然后才尝试 mounted handoff。`--resolve-files` 是显式授权。
@@ -316,7 +332,10 @@ placeholder；`plan` 与 `status` 也使用同一 metadata-only check。显式 `
 `sync_delegated` 只表示 resolved bytes 已写入 mounted filesystem 并立即验证；它绝不表示 provider-side
 upload 或 remote checksum verification。如果仍有 eligible file unresolved，系统可以发布 hash-bound
 `COMPLETE` catalog snapshot，但 run state 必须是 `pending_resources`，manifest 记录
-`snapshot_completeness=catalog_complete`，CLI 非零退出。`COMPLETE` 绑定 catalog，不会凭空补出缺失 bytes。
+`snapshot_completeness=catalog_complete`，CLI 非零退出。`COMPLETE` 只绑定 durable catalog，不会凭空
+补出缺失 bytes，也不证明 expected WeChat shards 已被完整观察。独立的 path-free
+`source_observation` 会记录 inventory digest、revision、state counts、error codes 与 `complete`；即使
+catalog 本身没变，只要这份 evidence 改变，也会生成新的 snapshot。
 
 所有 surface 共用一套 classifier：`ready_local` 加有效 mounted receipt 才是 delivered；`queued`、
 `waiting_cache`、`retry_wait`、`insufficient_local_space` 分别映射到对应 backlog；`ambiguous`、

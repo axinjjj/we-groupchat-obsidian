@@ -117,6 +117,33 @@ class RecoveringShardSource:
         return rows[:limit] if page_forward else rows[-limit:]
 
 
+class InventoryDriveSource(RecoveringShardSource):
+    def __init__(self, chat, shard_messages):
+        super().__init__(chat, shard_messages)
+        self.failed = set()
+        self.complete = False
+        self.digest = "inventory-missing-b"
+        self.present = ["shard-a"]
+
+    def get_source_inventory(self, *, update=True, sensitive=False):
+        del update, sensitive
+        missing = 0 if self.complete else 1
+        return {
+            "schema": "we-groupchat-obsidian.source-inventory.v1",
+            "source_namespace": "opaque-source",
+            "inventory_revision": 1,
+            "inventory_digest": self.digest,
+            "complete": self.complete,
+            "counts": {
+                "present": len(self.present),
+                "missing_file": missing,
+            },
+            "error_codes": [] if self.complete else ["source_missing_file"],
+            "present_generation_ids": list(self.present),
+            "shards": [],
+        }
+
+
 class FakeDrive:
     def __init__(self):
         self.items = {}
@@ -369,6 +396,36 @@ class GoogleDriveFileSyncTests(unittest.TestCase):
         self.assertEqual(
             [row["source_message_id"] for row in self.rows("drive_sync_items")],
             ["wgmsg_unseen_a"],
+        )
+
+    def test_incomplete_inventory_queues_present_shard_then_recovers_missing_once(self):
+        source = InventoryDriveSource(
+            self.chat_a,
+            {
+                "shard-a": [file_message("wgmsg_a", 100, "a.txt")],
+                "shard-b": [file_message("wgmsg_b", 200, "b.txt")],
+            },
+        )
+        service = self.service(source)
+        service.initialize_selected_chat_cursors(0)
+
+        first = service.scan()
+        source.complete = True
+        source.digest = "inventory-recovered"
+        source.present = ["shard-a", "shard-b"]
+        second = service.scan()
+        third = service.scan()
+
+        self.assertEqual(first["state"], "source_degraded")
+        self.assertFalse(first["source_complete"])
+        self.assertEqual(first["queued"], 1)
+        self.assertEqual(second["state"], "healthy")
+        self.assertTrue(second["source_complete"])
+        self.assertEqual(second["queued"], 1)
+        self.assertEqual(third["queued"], 0)
+        self.assertEqual(
+            [row["source_message_id"] for row in self.rows("drive_sync_items")],
+            ["wgmsg_a", "wgmsg_b"],
         )
 
     def test_default_cursor_skips_history_and_explicit_backfill_is_dry_then_apply(self):

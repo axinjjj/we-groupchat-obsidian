@@ -101,6 +101,10 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
   让受保护的微信访问维持同一个 process identity，而不是被短命 wake 反复索要授权。它只会在 grace、
   restart budget 和 backoff 判定通过后，请求 macOS 正常后台打开微信；不会 kill / re-sign 微信，
   不操作 UI 或登录，也不会把 `process lookup unknown` 当成“微信不存在”。
+- Durable、path-free 的 source inventory 会把 expected logical message-DB shards 与各自当前 generation
+  分开记录。Missing file/key、cache-only 与 unreadable 都是明确的 incomplete state，绝不会被折叠成
+  “没有新消息”。Monitor/catch-up 会在推进前停止；selected-resource 与 Direct Drive scan 只能继续处理
+  present shards，并保持 `source_degraded`。
 - 文件附件可以进入本机私有的 SHA-256 content-addressed archive，同一份 bytes 只保留一个 object。
   可选 backup 只把 immutable objects 复制到普通 filesystem target；验证的是目标目录 bytes，
   不是 sync provider 的云端上传状态。
@@ -377,6 +381,9 @@ Source guard 与 mounted-resource scheduling 都位于长驻菜单 app。旧 `in
 入口：不读附件 bytes；任一 known shard 不完整时 canonical occurrence 写入数必须为 0。Plan 以
 500-2,000 rows 的 bounded keyset page 写入 staging，不创建或推进 live cursor；apply 必须同时给出
 `--apply` 与 plan 返回的未过期 `--run-id`，只消费那一份 staged rows，不会确认后再扫描 source。
+Apply 会重新打开 source，并要求当下 `inventory_digest` 与 plan 完全一致，但不会重新扫描 message rows。
+Mounted `COMPLETE` snapshot 只绑定 durable catalog；path-free 的 `source_observation.complete` 单独说明
+expected source 是否完整观察。
 普通 resource `run` 默认不解析附件；`--resolve-files` 只授权该次显式 CLI run，菜单授权仅持续当前
 app process，并在每次附件 byte operation 前重新检查。每个 mounted target 都会得到一个绑定本地
 archive 的随机 destination marker；相同路径被新 target 替换、或另一 archive 误用同一目录时会

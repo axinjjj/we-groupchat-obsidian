@@ -212,11 +212,11 @@
     <tspan x="414" dy="14.075999999999999">&#x4E0D;&#x9A71;&#x52A8; UI / &#x767B;&#x5F55;</tspan>
   </text>
   <rect x="680" y="1280" width="230" height="125" rx="17" fill="#ECFEFF" stroke="#0891B2" stroke-width="2"/>
-  <text x="694" y="1310" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="13.2" font-weight="750" fill="#0F172A">&#x7A33;&#x5B9A; source envelope</text>
+  <text x="694" y="1310" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="13.2" font-weight="750" fill="#0F172A">Shard inventory + envelope</text>
   <text x="694" y="1338" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="10.2" font-weight="500" fill="#475569">
-    <tspan x="694" dy="0">schema introspection</tspan>
-    <tspan x="694" dy="14.075999999999999">&#x5148;&#x53D6;&#x8D44;&#x6E90; metadata</tspan>
-    <tspan x="694" dy="14.075999999999999">AI &#x53EA;&#x770B; cleaned text</tspan>
+    <tspan x="694" dy="0">expected logical shards</tspan>
+    <tspan x="694" dy="14.075999999999999">path-free digest + completeness</tspan>
+    <tspan x="694" dy="14.075999999999999">&#x7A33;&#x5B9A; generation envelope</tspan>
   </text>
   <rect x="960" y="1280" width="250" height="125" rx="17" fill="#FFF7ED" stroke="#EA580C" stroke-width="2"/>
   <text x="974" y="1310" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="13.2" font-weight="750" fill="#0F172A">Knowledge outbox / catalog</text>
@@ -241,7 +241,7 @@
     <tspan x="1780.0" dy="13.524">&#x4E91;&#x4E0A;&#x4F20;&#x72B6;&#x6001;&#xFF1A;&#x672A;&#x77E5;</tspan>
   </text>
   <text x="376.0" y="1320" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="8.2" font-weight="650" fill="#0F766E">normal open request</text>
-  <text x="656.0" y="1320" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="8.2" font-weight="650" fill="#2563EB">rows + metadata</text>
+  <text x="656.0" y="1320" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="8.2" font-weight="650" fill="#2563EB">inventory + rows</text>
   <text x="936.0" y="1320" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="8.2" font-weight="650" fill="#2563EB">same transaction</text>
   <text x="1236.0" y="1320" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="8.2" font-weight="650" fill="#EA580C">post-commit worker</text>
   <text x="1609.0" y="1320" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="8.2" font-weight="650" fill="#7C3AED">explicit snapshot</text>
@@ -285,7 +285,7 @@
   <text x="1304" y="1638" text-anchor="start" font-family="Noto Sans CJK SC, sans-serif" font-size="10.2" font-weight="500" fill="#475569">
     <tspan x="1304" dy="0">archive_id manifest + resources.jsonl</tspan>
     <tspan x="1304" dy="14.1">&#x7A77;&#x5C3D;&#x5F0F; outcome classifier</tspan>
-    <tspan x="1304" dy="14.1">COMPLETE = catalog &#x5B8C;&#x6574;</tspan>
+    <tspan x="1304" dy="14.1">catalog &#x5B8C;&#x6574; &#x2260; source &#x5B8C;&#x6574;</tspan>
   </text>
   <polyline points="360,1642 410,1642" fill="none" stroke="#4F46E5" stroke-width="2.4" marker-end="url(#arrowBlue)"/>
   <text x="395" y="1622" text-anchor="middle" font-family="Noto Sans CJK SC, sans-serif" font-size="8.2" font-weight="650" fill="#4F46E5">cursor + rows &#x539F;&#x5B50;&#x63D0;&#x4EA4;</text>

@@ -140,6 +140,57 @@ class FakeSource:
         return rows[:limit]
 
 
+class InventoryAwareSource:
+    def __init__(self, messages_by_shard, *, complete, digest, missing=0):
+        self.messages_by_shard = dict(messages_by_shard)
+        self.complete = bool(complete)
+        self.digest = str(digest)
+        self.missing = int(missing)
+        self.present = list(messages_by_shard)
+
+    def get_source_inventory(self, *, update=True, sensitive=False):
+        del update, sensitive
+        return {
+            "schema": "we-groupchat-obsidian.source-inventory.v1",
+            "source_namespace": "opaque-source",
+            "inventory_revision": 1,
+            "inventory_digest": self.digest,
+            "complete": self.complete,
+            "counts": {
+                "present": len(self.present),
+                "missing_file": self.missing,
+            },
+            "error_codes": [] if self.complete else ["source_missing_file"],
+            "present_generation_ids": list(self.present),
+            "shards": [],
+        }
+
+    def get_messages_for_shard(
+        self,
+        _username,
+        source_shard_id,
+        *,
+        since_ts=0,
+        limit=500,
+        page_forward=False,
+        since_inclusive=False,
+    ):
+        rows = [
+            dict(row)
+            for row in self.messages_by_shard.get(source_shard_id, [])
+            if int(row.get("timestamp") or 0) > int(since_ts)
+            or (
+                since_inclusive
+                and int(row.get("timestamp") or 0) == int(since_ts)
+            )
+        ]
+        rows.sort(key=lambda row: (
+            int(row.get("timestamp") or 0),
+            str(row.get("source_message_id") or ""),
+        ))
+        return rows[:limit] if page_forward else rows[-limit:]
+
+
 class ResourceBackupTests(unittest.TestCase):
     def setUp(self):
         self.settings_patcher = patch(
@@ -1095,6 +1146,55 @@ class ResourceBackupTests(unittest.TestCase):
             conn.close()
         self.assertEqual(cursors, {"shard-a": 100, "shard-b": 200})
 
+    def test_incomplete_inventory_processes_present_shard_then_recovers_missing_once(self):
+        source = InventoryAwareSource(
+            {
+                "generation-a": [{
+                    "timestamp": 100,
+                    "source_message_id": "message-a",
+                    "text": "https://example.com/a",
+                    "resources": [],
+                }],
+                "generation-b": [{
+                    "timestamp": 200,
+                    "source_message_id": "message-b",
+                    "text": "https://example.com/b",
+                    "resources": [],
+                }],
+            },
+            complete=False,
+            digest="inventory-missing-b",
+            missing=1,
+        )
+        source.present = ["generation-a"]
+        capture = SelectedResourceCapture(
+            self.config,
+            source=source,
+            now_func=lambda: 1_000,
+            archive_id_factory=lambda: "00000000-0000-0000-0000-000000000001",
+        )
+        capture.initialize_selected_chat_cursors(start_timestamp=0)
+
+        first = capture.scan()
+        source.complete = True
+        source.digest = "inventory-recovered"
+        source.missing = 0
+        source.present = ["generation-a", "generation-b"]
+        second = capture.scan()
+        third = capture.scan()
+
+        self.assertEqual(first["state"], "source_degraded")
+        self.assertFalse(first["source_complete"])
+        self.assertEqual(first["captured_links"], 1)
+        self.assertEqual(second["state"], "healthy")
+        self.assertTrue(second["source_complete"])
+        self.assertEqual(second["captured_links"], 1)
+        self.assertEqual(third["captured_links"], 0)
+        self.assertEqual(
+            [row["source_message_id"] for row in capture.occurrences()],
+            ["message-a", "message-b"],
+        )
+
     def test_reselect_starts_new_selection_epoch_without_gap_backfill(self):
         config = dict(self.config)
         config["resource_backup_selected_chats"] = [{
@@ -1439,7 +1539,7 @@ class ResourceBackupTests(unittest.TestCase):
         self.assertEqual(result["inserted_links"], 0)
         self.assertEqual(capture.occurrences(), [])
 
-    def test_backfill_apply_consumes_staged_rows_without_rescanning_new_source(self):
+    def test_backfill_apply_rechecks_inventory_without_rescanning_messages(self):
         source = FakeSource({
             self.selected: [{
                 "timestamp": 100,
@@ -1461,8 +1561,6 @@ class ResourceBackupTests(unittest.TestCase):
             "text": "https://example.com/later",
             "resources": [],
         })
-        capture.source = None
-
         applied = capture.backfill_links(
             0, apply=True, run_id=planned["run_id"]
         )
@@ -1483,6 +1581,40 @@ class ResourceBackupTests(unittest.TestCase):
         )
 
         self.assertEqual(applied["state"], "selection_changed")
+        self.assertFalse(applied["source_complete"])
+        self.assertEqual(capture.occurrences(selected_only=False), [])
+
+    def test_backfill_apply_fails_closed_when_inventory_digest_changes(self):
+        source = InventoryAwareSource(
+            {
+                "generation-a": [{
+                    "timestamp": 100,
+                    "source_message_id": "planned-link",
+                    "text": "https://example.com/planned",
+                    "resources": [],
+                }],
+            },
+            complete=True,
+            digest="inventory-before",
+        )
+        capture = SelectedResourceCapture(
+            self.config,
+            source=source,
+            now_func=lambda: 200,
+            archive_id_factory=lambda: "00000000-0000-0000-0000-000000000001",
+        )
+        planned = capture.backfill_links(0)
+        source.digest = "inventory-after"
+
+        applied = capture.backfill_links(
+            0,
+            apply=True,
+            run_id=planned["run_id"],
+        )
+
+        self.assertEqual(planned["inventory_digest"], "inventory-before")
+        self.assertEqual(applied["state"], "inventory_changed")
+        self.assertEqual(applied["error_code"], "inventory_digest_mismatch")
         self.assertFalse(applied["source_complete"])
         self.assertEqual(capture.occurrences(selected_only=False), [])
 
@@ -1711,7 +1843,7 @@ class ResourceBackupTests(unittest.TestCase):
         try:
             conn.execute("CREATE TABLE future_owner(value TEXT)")
             conn.execute("INSERT INTO future_owner VALUES ('preserve')")
-            conn.execute("PRAGMA user_version = 3")
+            conn.execute("PRAGMA user_version = 4")
             conn.commit()
         finally:
             conn.close()
@@ -1725,7 +1857,7 @@ class ResourceBackupTests(unittest.TestCase):
 
         conn = sqlite3.connect(self.capture_db)
         try:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 4)
             self.assertEqual(
                 conn.execute("SELECT value FROM future_owner").fetchone()[0],
                 "preserve",
@@ -1735,6 +1867,33 @@ class ResourceBackupTests(unittest.TestCase):
             ).fetchone())
         finally:
             conn.close()
+
+    def test_schema_v2_migrates_inventory_digest_without_replacing_ledger(self):
+        capture = self._capture()
+        archive_id = capture.archive_id
+        conn = sqlite3.connect(self.capture_db)
+        try:
+            conn.execute(
+                "ALTER TABLE resource_backfill_runs DROP COLUMN inventory_digest"
+            )
+            conn.execute("PRAGMA user_version = 2")
+            conn.commit()
+        finally:
+            conn.close()
+
+        reopened = self._capture()
+
+        self.assertEqual(reopened.archive_id, archive_id)
+        conn = sqlite3.connect(self.capture_db)
+        try:
+            columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(resource_backfill_runs)")
+            }
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
+        finally:
+            conn.close()
+        self.assertIn("inventory_digest", columns)
 
     def test_attachment_consent_revocation_stops_before_next_byte_operation(self):
         capture = self._capture()
@@ -1961,6 +2120,9 @@ class ResourceBackupTests(unittest.TestCase):
 
         self.assertEqual(result["state"], "source_unavailable")
         self.assertEqual(result["scan"]["state"], "source_unavailable")
+        evidence = capture.source_inventory_evidence()
+        self.assertFalse(evidence["complete"])
+        self.assertEqual(evidence["error_codes"], ["source_unavailable"])
 
     def test_capture_run_reports_worker_busy_and_never_resolves_after_failed_lock(self):
         capture = self._capture()
@@ -2200,6 +2362,93 @@ class ResourceBackupTests(unittest.TestCase):
         self.assertEqual(manifest["handoff_semantics"], "pending_resources")
         self.assertEqual(manifest["unresolved_file_count"], 2)
         self.assertTrue(os.path.isfile(os.path.join(snapshot_dir, "COMPLETE")))
+
+    def test_snapshot_separates_durable_catalog_from_incomplete_source_observation(self):
+        source = InventoryAwareSource(
+            {
+                "generation-a": [{
+                    "timestamp": 100,
+                    "source_message_id": "durable-link",
+                    "text": "https://example.com/durable",
+                    "resources": [],
+                }],
+            },
+            complete=False,
+            digest="inventory-incomplete",
+            missing=1,
+        )
+        capture = SelectedResourceCapture(
+            self.config,
+            source=source,
+            now_func=lambda: 200,
+            archive_id_factory=lambda: "00000000-0000-0000-0000-000000000001",
+        )
+        capture.initialize_selected_chat_cursors(start_timestamp=0)
+        scanned = capture.scan()
+        backup = self._backup(capture)
+
+        result = backup.run()
+        snapshot_dir = os.path.join(
+            backup.backup_root,
+            "snapshots",
+            result["snapshot"]["snapshot_id"],
+        )
+        with open(os.path.join(snapshot_dir, "manifest.json"), encoding="utf-8") as handle:
+            manifest = json.load(handle)
+
+        self.assertEqual(scanned["state"], "source_degraded")
+        self.assertEqual(manifest["snapshot_completeness"], "catalog_complete")
+        self.assertFalse(manifest["source_observation"]["complete"])
+        self.assertEqual(
+            manifest["source_observation"]["inventory_digest"],
+            "inventory-incomplete",
+        )
+        self.assertFalse(result["snapshot"]["source_complete"])
+
+    def test_source_observation_change_rebuilds_unchanged_catalog_snapshot(self):
+        source = InventoryAwareSource(
+            {
+                "generation-a": [{
+                    "timestamp": 100,
+                    "source_message_id": "stable-link",
+                    "text": "https://example.com/stable",
+                    "resources": [],
+                }],
+            },
+            complete=False,
+            digest="inventory-before",
+            missing=1,
+        )
+        capture = SelectedResourceCapture(
+            self.config,
+            source=source,
+            now_func=lambda: 200,
+            archive_id_factory=lambda: "00000000-0000-0000-0000-000000000001",
+        )
+        capture.initialize_selected_chat_cursors(start_timestamp=0)
+        capture.scan()
+        identifiers = iter(("first", "second"))
+        backup = MountedResourceBackup(
+            self.config,
+            capture=capture,
+            now_func=lambda: 1_787_600_000,
+            id_factory=lambda: next(identifiers),
+        )
+        first = backup.run()
+        source.complete = True
+        source.digest = "inventory-after"
+        source.missing = 0
+        capture.scan()
+
+        second = backup.run()
+
+        self.assertEqual(first["snapshot"]["state"], "written")
+        self.assertEqual(second["snapshot"]["state"], "written")
+        self.assertNotEqual(
+            first["snapshot"]["snapshot_id"],
+            second["snapshot"]["snapshot_id"],
+        )
+        self.assertTrue(second["snapshot"]["source_complete"])
 
     def test_unchanged_catalog_rebuilds_deleted_snapshot(self):
         capture = self._ready_capture()
@@ -3027,7 +3276,7 @@ class ResourceBackupCliTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "--apply requires"):
             resource_backup_cli.main(["backfill-links", "--all", "--apply"])
 
-    def test_cli_backfill_apply_consumes_staging_without_source(self):
+    def test_cli_backfill_apply_reopens_source_for_inventory_check(self):
         output = io.StringIO()
         capture = unittest.mock.Mock()
         capture.backfill_links.return_value = {
@@ -3045,7 +3294,7 @@ class ResourceBackupCliTests(unittest.TestCase):
             ])
 
         self.assertEqual(result, 0)
-        factory.assert_called_once_with(self.config, source=False)
+        factory.assert_called_once_with(self.config, source=True)
         capture.backfill_links.assert_called_once_with(
             0,
             apply=True,

@@ -16,6 +16,13 @@
   Catch-up apply must stop the managed LaunchAgent, acquire the same
   `AppInstanceLock` as the menu app, hold it through backup/drain/projection/
   validation/receipt, release it, and only then restore the LaunchAgent.
+- `core/source_inventory.py::SourceInventoryStore` owns the durable expected
+  message-shard set. Logical shard identity is source namespace plus normalized
+  relative path; database generation remains separate. Missing, keyless,
+  cache-only, unreadable, and changed-generation states must remain explicit.
+  Monitor/catch-up may read only a complete inventory. Resource and Direct
+  Drive scanners may consume present generations while reporting
+  `source_degraded`; they must never relabel that partial observation complete.
 - `setup.py` is the py2app packaging entrypoint. These are the only Python
   files that belong at repository root.
 - `core/` owns domain behavior, durable state, privacy boundaries, recovery,
@@ -36,7 +43,9 @@
   and CLI capture/backfill runs share the resource capture operation lock.
   Historical backfill is staged: plan writes bounded keyset pages and apply
   requires the exact unexpired `run_id`; never restore a confirm-then-rescan
-  path.
+  path. The plan binds `inventory_digest`; apply must reopen the source,
+  re-read the exact inventory digest, and fail closed before consuming staged
+  rows if the inventory is unavailable, incomplete, or changed.
 - `launchers/` owns the canonical Finder-friendly `.command` entrypoints. The
   root `启动.command` is a compatibility stub for deployed source-mode
   LaunchAgents and must not grow a second implementation.
@@ -70,6 +79,10 @@
   WeChat decrypted caches and source shard/message identities are namespaced by
   source root; plaintext SQLite snapshots use Online Backup so WAL state is not
   lost.
+- Source-inventory evidence is path-free and content-free. A mounted snapshot's
+  `catalog_complete` marker binds the durable exported catalog only; its
+  separate `source_observation.complete` field is the authority for whether the
+  current WeChat source set was completely observed.
 - Resource projection manifests own generated-path GC. Empty selections still
   render an explicit root; GC may remove only app-owned generated files and must
   hold canonical capture/selection authority, then the DB-scoped backup lock
