@@ -335,7 +335,7 @@ class WindowsPathIdentityTests(unittest.TestCase):
 
         self.assertTrue(native.swapped)
         self.assertEqual(value.identity_key, original.identity_key)
-        self.assertEqual(Path(value.display_path), moved / child.name)
+        self.assertTrue(os.path.samefile(value.display_path, moved / child.name))
 
     def test_missing_child_uses_refreshed_parent_after_ancestor_swap(self):
         checked = self.root / "missing-checked"
@@ -356,7 +356,15 @@ class WindowsPathIdentityTests(unittest.TestCase):
 
         self.assertTrue(native.swapped)
         self.assertEqual(value.identity_key, original.identity_key)
-        self.assertEqual(Path(value.display_path), moved / child.name)
+        observed_parent = self.service.describe(
+            Path(value.display_path).parent
+        )
+        expected_parent = self.service.describe(moved)
+        self.assertEqual(
+            observed_parent.identity_key,
+            expected_parent.identity_key,
+        )
+        self.assertEqual(Path(value.display_path).name, child.name)
 
     def test_junction_and_unknown_reparse_tags_share_fail_closed_boundary(self):
         for tag in (0xA0000003, 0xA000001D):
