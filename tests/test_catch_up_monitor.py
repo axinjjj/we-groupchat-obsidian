@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -158,16 +159,74 @@ class CatchUpMonitorTests(unittest.TestCase):
         self.assertNotIn("/private/vault.md", serialized)
         self.assertNotIn("provider timeout", serialized)
 
+    def test_complete_drain_is_provisional_while_agent_restore_is_pending(self):
+        receipt = build_reconciliation_receipt(
+            run_id="run-pending",
+            started_at="2026-08-30T10:00:00+08:00",
+            chats=[{"username": "chat", "name": "Chat"}],
+            audit=[{
+                "username": "chat",
+                "checkpoint": 10,
+                "count": 1,
+                "capped": False,
+            }],
+            checkpoints_after={"chat": 11},
+            result={
+                "complete": ["chat"],
+                "blocked": {},
+                "affected_dates": [],
+                "per_chat": {
+                    "chat": {
+                        "pages": 1,
+                        "statuses": {"no_match": 1},
+                        "event_ids": [],
+                        "affected_dates": [],
+                        "outcome": "complete",
+                        "blocked_reason": "",
+                    },
+                },
+            },
+            projections={"indexes": {}, "digests": []},
+            validation={"ok": True},
+            backup_path=Path("/private/backup"),
+            launch_agent={
+                "was_loaded": True,
+                "restore_attempted": False,
+                "restored": None,
+                "error": "",
+            },
+            transaction_error="",
+        )
+
+        self.assertEqual(receipt["state"], "partial")
+        self.assertEqual(receipt["outcome"], "drain_complete_restore_pending")
+        self.assertFalse(receipt["resume_supported"])
+
     def test_receipt_writer_is_private_and_round_trips(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = write_reconciliation_receipt(
-                {"schema_version": 1, "run_id": "run-1", "state": "complete"},
-                receipts_dir=tmp,
-            )
+            with (
+                patch(
+                    "scripts.catch_up_monitor.os.fsync", wraps=os.fsync
+                ) as fsync,
+                patch(
+                    "scripts.catch_up_monitor.os.replace", wraps=os.replace
+                ) as replace,
+            ):
+                path = write_reconciliation_receipt(
+                    {
+                        "schema_version": 1,
+                        "run_id": "run-1",
+                        "state": "complete",
+                    },
+                    receipts_dir=tmp,
+                )
 
             self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
             with open(path, encoding="utf-8") as handle:
-                self.assertEqual(__import__("json").load(handle)["state"], "complete")
+                self.assertEqual(json.load(handle)["state"], "complete")
+            self.assertGreaterEqual(fsync.call_count, 2)
+            replace.assert_called_once()
+            self.assertEqual(list(Path(tmp).glob(".run-1.*.tmp")), [])
 
     def test_rebuild_projections_uses_exact_affected_dates(self):
         store = MagicMock()
@@ -453,12 +512,22 @@ class CatchUpMonitorTests(unittest.TestCase):
             patch("scripts.catch_up_monitor.drain_monitors", side_effect=lambda *_args, **_kwargs: events.append("drain") or drain_result),
             patch("scripts.catch_up_monitor.rebuild_projections", side_effect=lambda *_args: events.append("projections") or {"indexes": {}, "digests": []}),
             patch("scripts.catch_up_monitor.validate_knowledge_db", side_effect=lambda *_args: events.append("validation") or {"ok": True}),
-            patch("scripts.catch_up_monitor.write_reconciliation_receipt", side_effect=lambda *_args: events.append("receipt") or Path("/tmp/receipt.json")),
+            patch(
+                "scripts.catch_up_monitor._checkpoint_for_chat",
+                return_value=11,
+            ) as checkpoint,
+            patch(
+                "scripts.catch_up_monitor.write_reconciliation_receipt",
+                side_effect=lambda receipt: events.append(
+                    f"receipt:{receipt['outcome']}"
+                ) or Path("/tmp/receipt.json"),
+            ),
             patch("scripts.catch_up_monitor._restore_launch_agent", side_effect=lambda _record: events.append("agent_restored")),
         ):
             result = apply_catch_up({}, chats, FakeDB([]), args)
 
         self.assertEqual(result, 0)
+        checkpoint.assert_called_once_with("chat")
         self.assertEqual(events, [
             "agent_stopped",
             "lock_acquired",
@@ -466,10 +535,103 @@ class CatchUpMonitorTests(unittest.TestCase):
             "drain",
             "projections",
             "validation",
-            "receipt",
+            "receipt:drain_complete_restore_pending",
             "lock_released",
             "agent_restored",
+            "receipt:drained",
         ])
+
+    def test_restore_failure_finalizes_durable_receipt_as_partial(self):
+        args = SimpleNamespace(audit_limit=100, max_pages_per_chat=5, max_minutes=5)
+        record = MagicMock(label="test.agent", plist_path=Path("/tmp/test.plist"))
+        status = MagicMock(loaded=True)
+        chats = [{"username": "chat", "name": "Chat"}]
+        audit = [{
+            "name": "Chat",
+            "username": "chat",
+            "checkpoint": 10,
+            "count": 1,
+            "capped": False,
+        }]
+        drain_result = {
+            "complete": ["chat"],
+            "blocked": {},
+            "pages": {"chat": 1},
+            "statuses": {"no_match": 1},
+            "affected_dates": [],
+            "per_chat": {
+                "chat": {
+                    "pages": 1,
+                    "statuses": {"no_match": 1},
+                    "event_ids": [],
+                    "affected_dates": [],
+                    "outcome": "complete",
+                    "blocked_reason": "",
+                },
+            },
+        }
+        validation = {"ok": True, "quick_check": "ok", "integrity_check": "ok"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            written = []
+
+            def durable_write(receipt):
+                written.append(json.loads(json.dumps(receipt)))
+                return write_reconciliation_receipt(receipt, receipts_dir=tmp)
+
+            with (
+                patch("scripts.catch_up_monitor.audit_pending", return_value=audit),
+                patch(
+                    "scripts.catch_up_monitor.launch_agent_report",
+                    return_value=(record, status),
+                ),
+                patch("scripts.catch_up_monitor._stop_launch_agent"),
+                patch(
+                    "scripts.catch_up_monitor._restore_launch_agent",
+                    side_effect=RuntimeError("bootstrap failed"),
+                ),
+                patch(
+                    "scripts.catch_up_monitor._checkpoint_for_chat",
+                    return_value=11,
+                ),
+                patch(
+                    "scripts.catch_up_monitor.backup_runtime_state",
+                    return_value=Path("/tmp/backup"),
+                ),
+                patch("scripts.catch_up_monitor.TopicMonitor"),
+                patch(
+                    "scripts.catch_up_monitor.drain_monitors",
+                    return_value=drain_result,
+                ),
+                patch(
+                    "scripts.catch_up_monitor.rebuild_projections",
+                    return_value={"indexes": {}, "digests": []},
+                ),
+                patch(
+                    "scripts.catch_up_monitor.validate_knowledge_db",
+                    return_value=validation,
+                ),
+                patch(
+                    "scripts.catch_up_monitor.write_reconciliation_receipt",
+                    side_effect=durable_write,
+                ),
+            ):
+                result = apply_catch_up({}, chats, FakeDB([]), args)
+
+            self.assertEqual(result, 1)
+            self.assertEqual(
+                [item["outcome"] for item in written],
+                ["drain_complete_restore_pending", "launch_agent_restore_failed"],
+            )
+            receipt_files = list(Path(tmp).glob("*.json"))
+            self.assertEqual(len(receipt_files), 1)
+            receipt = json.loads(receipt_files[0].read_text(encoding="utf-8"))
+            self.assertEqual(receipt["state"], "partial")
+            self.assertEqual(receipt["outcome"], "launch_agent_restore_failed")
+            self.assertTrue(receipt["launch_agent"]["restore_attempted"])
+            self.assertFalse(receipt["launch_agent"]["restored"])
+            self.assertEqual(receipt["launch_agent"]["error"], "RuntimeError")
+            self.assertEqual(receipt["canonical"]["affected_dates"], [])
 
 
 if __name__ == "__main__":

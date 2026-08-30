@@ -816,6 +816,35 @@ class KnowledgeStoreTests(unittest.TestCase):
         self.assertEqual(len(self.rows("topics")), 1)
         self.assertEqual(len(self.rows("events")), 1)
 
+    def test_reused_source_batch_repairs_missing_topic_projection(self):
+        failure = OSError(errno.EIO, "I/O error")
+
+        with patch.object(self.store, "_write_topic_markdown", side_effect=failure):
+            first = self.store.apply_event(
+                candidate(links=[]),
+                self.messages,
+                self.config,
+                {"relation": "new"},
+                source_batch_id="source-batch-retry",
+            )
+
+        self.assertEqual(first["knowledge_path"], "")
+        self.assertEqual(first["projection_warnings"][0]["surface"], "topic_markdown")
+
+        reused = self.store.apply_event(
+            candidate(links=[]),
+            self.messages,
+            self.config,
+            {"relation": "new"},
+            source_batch_id="source-batch-retry",
+        )
+
+        self.assertTrue(reused["reused"])
+        self.assertTrue(os.path.isfile(reused["knowledge_path"]))
+        self.assertEqual(reused["projection_warnings"], [])
+        self.assertEqual(len(self.rows("topics")), 1)
+        self.assertEqual(len(self.rows("events")), 1)
+
     def test_managed_legacy_date_archive_dir_is_removed(self):
         monitor_root = os.path.join(self.obsidian_root, "关注推送")
         archive_dir = os.path.join(monitor_root, "按日期")

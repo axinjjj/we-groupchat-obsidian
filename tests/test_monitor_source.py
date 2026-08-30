@@ -368,22 +368,44 @@ class MonitorSourceCursorTests(unittest.TestCase):
         self.assertEqual(Path(self.state_file).read_bytes(), original)
 
     def test_ai_failure_preserves_every_source_cursor(self):
-        save_state({"last_checked_ts": 10}, self.state_file)
-        original = Path(self.state_file).read_bytes()
         db = CursorDB({
             "logical-a": (
                 "generation-a",
                 [raw_message("generation-a", 1, 11, "可见消息")],
             ),
         })
+        inventory = db.get_source_inventory()
+        original_cursors = {
+            "logical-a": {
+                "generation_id": "generation-a",
+                "cursor_token": "[10,0]",
+            },
+        }
+        save_state({
+            "last_checked_ts": 10,
+            "source_cursors": original_cursors,
+            "source_inventory_digest": inventory["inventory_digest"],
+            "source_inventory_revision": inventory["inventory_revision"],
+        }, self.state_file)
 
-        with self.assertRaisesRegex(RuntimeError, "provider unavailable"):
+        with self.assertRaisesRegex(RuntimeError, "provider timeout"):
             self.monitor(
                 db,
-                lambda *_: (_ for _ in ()).throw(RuntimeError("provider unavailable")),
+                lambda *_: (_ for _ in ()).throw(RuntimeError("provider timeout")),
             ).check_once()
 
-        self.assertEqual(Path(self.state_file).read_bytes(), original)
+        state = load_state(self.state_file)
+        self.assertEqual(state["last_checked_ts"], 10)
+        self.assertEqual(state["source_cursors"], original_cursors)
+        self.assertEqual(
+            state["source_inventory_digest"], inventory["inventory_digest"]
+        )
+        self.assertEqual(
+            state["source_inventory_revision"], inventory["inventory_revision"]
+        )
+        self.assertEqual(state["ai_failure_count"], 1)
+        self.assertEqual(state["ai_last_error_code"], "ai_timeout")
+        self.assertEqual(state["ai_next_retry_after"], 1600)
 
     def test_state_conflict_preserves_tentative_source_cursor(self):
         save_state({"last_checked_ts": 10}, self.state_file)

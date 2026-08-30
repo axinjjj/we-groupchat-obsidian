@@ -117,8 +117,28 @@ Reader 为每个 present shard 保留 bounded page，再按 `create_time` 与稳
 
 Visible row 可以搭配另行读取的 read-only overlap context；context 永远不改变 tentative cursor。
 AI/provider 失败不提交 cursor；AI/Knowledge 工作结束后、state CAS 之前还会复核 generation。
+Retryable provider failure 只能针对读取到的 state revision CAS 写入 content-free failure
+count/code/timestamps 与 bounded backoff deadline，并精确保留 source cursors、inventory binding 和
+checkpoint。Deadline 之前的 run 返回 `ai_backoff`，不会调用 provider；成功 retry 会同时清理当前与
+legacy failure metadata。
+
 Knowledge write 使用由 source IDs 派生的 `source_batch_id`：若 event 已 commit、state revision CAS
-却失败，retry 会 adopt 同一条 event，不再插入第二条 canonical event。
+却失败，retry 会 adopt 同一条 event，不再插入第二条 canonical event。通常 reuse 不写 projection；
+但 managed topic Markdown 确实缺失时，会从 canonical SQLite 重建该 note 与 date indexes，不改变
+event/topic identity，I/O 失败仍以明确的 `projection_warnings` 返回。
+
+### Catch-up receipt finalization
+
+Write-mode catch-up 会停止 managed LaunchAgent、取得 menu app 的 singleton lock，并持锁完成 backup、
+bounded drain、projection rebuild、canonical validation、一次 post-drain checkpoint capture 与 durable
+provisional receipt。Receipt publication 通过 atomic replace，并对 file 和 parent directory 执行
+`fsync`。随后释放 lock，再恢复原本 loaded 的 LaunchAgent；最终以观测到的 restore result atomic
+覆盖同一个 `run_id` receipt，app 恢复运行后不会再次采样 checkpoint。
+
+Provisional receipt 只能是 `partial / drain_complete_restore_pending`，绝不是 success。Canonical work
+通过且 LaunchAgent 恢复成功（或原本无需恢复）后，final receipt 才是 `complete / drained`；恢复失败会
+durably 写成 `partial / launch_agent_restore_failed`、关闭 `resume_supported` 并返回 nonzero。Receipt
+只保存 content-free error code，不保存 provider 或 chat content。
 
 Encrypted WAL reconstruction 会验证 SQLite WAL header 与 cumulative frame checksum，只回放到最后一个
 valid commit marker，按 committed database-page count 截断，并丢弃 uncommitted tail。发布 decrypted

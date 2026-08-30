@@ -1218,7 +1218,7 @@ class KnowledgeStore:
             if source_batch_id:
                 existing = self._source_batch_result(conn, source_batch_id)
                 if existing:
-                    return existing
+                    return self._repair_reused_source_batch_projection(conn, existing)
             projection_warnings = []
             linked_topic_id = None
             if relation == "new" or not target_topic_id:
@@ -1253,7 +1253,7 @@ class KnowledgeStore:
                     else None
                 )
                 if existing:
-                    return existing
+                    return self._repair_reused_source_batch_projection(conn, existing)
                 raise
             self._register_attachment_mentions(
                 conn,
@@ -1348,6 +1348,35 @@ class KnowledgeStore:
             "projection_warnings": [],
             "reused": True,
         }
+
+    def _repair_reused_source_batch_projection(self, conn, result):
+        repaired = dict(result)
+        knowledge_path = str(repaired.get("knowledge_path") or "")
+        if knowledge_path and os.path.isfile(knowledge_path):
+            return repaired
+
+        projection_warnings = []
+        try:
+            self._write_topic_markdown(conn, int(repaired["topic_id"]))
+        except OSError as exc:
+            projection_warnings.append({
+                "surface": "topic_markdown",
+                "error_type": type(exc).__name__,
+                "errno": exc.errno,
+            })
+            repaired["knowledge_path"] = ""
+        else:
+            try:
+                self.write_date_indexes()
+            except OSError as exc:
+                projection_warnings.append({
+                    "surface": "date_indexes",
+                    "error_type": type(exc).__name__,
+                    "errno": exc.errno,
+                })
+
+        repaired["projection_warnings"] = projection_warnings
+        return repaired
 
     @staticmethod
     def _register_attachment_mentions(conn, event_id, topic_id, messages, config, now):
