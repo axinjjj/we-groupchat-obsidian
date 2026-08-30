@@ -1,7 +1,7 @@
 """Behavioral contracts for platform-owned services.
 
-W0.1 defines the ownership seam only.  Concrete macOS and Windows adapters are
-introduced in their scheduled PRs and are not registered by this module.
+W0.2A supplies concrete macOS and Windows file-lock adapters. Later platform
+capabilities remain fail-closed until their owning phases.
 """
 from __future__ import annotations
 
@@ -51,6 +51,8 @@ class PlatformCapabilityUnavailable(RuntimeError):
 
 class LockHandle(Protocol):
     """A retained operating-system lock handle."""
+
+    def fileno(self) -> int: ...
 
     def close(self) -> None: ...
 

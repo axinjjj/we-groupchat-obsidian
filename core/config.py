@@ -1,5 +1,4 @@
 """Configuration management - app config and WeChat data path detection."""
-import fcntl
 import json
 import os
 import re
@@ -9,6 +8,7 @@ import tempfile
 import uuid
 
 from .project_identity import DATA_DIR_NAME, LEGACY_DATA_DIR_NAME
+from .platform import LockMode, create_file_lock
 from .taxonomy_assignment import FREE_FORM_PROFILE
 
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -487,31 +487,32 @@ class ConfigStore:
     """Locked, revisioned, atomic JSON configuration store.
 
     Patch updates reload the canonical document while holding an exclusive
-    ``flock``. Whole-document replacement remains available for first-run and
-    migration code, but rejects stale revisions instead of losing an unrelated
-    concurrent update.
+    platform file lock. Whole-document replacement remains available for
+    first-run and migration code, but rejects stale revisions instead of losing
+    an unrelated concurrent update.
     """
 
-    def __init__(self, path=None):
+    def __init__(self, path=None, *, file_lock=None):
         self.path = os.path.abspath(os.path.expanduser(path or CONFIG_FILE))
         self.lock_path = self.path + ".lock"
+        self._file_lock = file_lock
+
+    def _lock_service(self):
+        if self._file_lock is None:
+            self._file_lock = create_file_lock()
+        return self._file_lock
 
     def _lock(self, exclusive):
         ensure_private_dir(os.path.dirname(self.path))
-        fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-        try:
-            os.fchmod(fd, 0o600)
-        except OSError:
-            pass
-        fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
-        return fd
+        return self._lock_service().acquire(
+            self.lock_path,
+            mode=LockMode.EXCLUSIVE if exclusive else LockMode.SHARED,
+            blocking=True,
+        )
 
     @staticmethod
-    def _unlock(fd):
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+    def _unlock(lock_handle):
+        lock_handle.close()
 
     def _read_locked(self):
         if not os.path.lexists(self.path):

@@ -640,8 +640,8 @@ cache-only、key-missing 与 unreadable。只有 expected logical-shard inventor
 objects。Mounted `sync_delegated` 始终保留 `provider_side_sync=unknown` 与
 `remote_verified=False`。独立 Direct Drive 行只统计通过 Drive API verification 的 ledger objects；
 这份 remote evidence 与 source completeness 互不替代。Health 还直接写明三个固定产品边界：remote
-link preview 是 `link_preview_disabled` 且零请求；MCP 是 legacy read-only、send retired；Windows
-W0.1 只是一条 import/dependency boundary。
+  link preview 是 `link_preview_disabled` 且零请求；MCP 是 legacy read-only、send retired；Windows
+  W0.2A 只提供可移植文件锁源码，不代表产品支持。
 
 ```bash
 .venv/bin/python scripts/health_check.py
@@ -661,8 +661,9 @@ W0.1 只是一条 import/dependency boundary。
 - 旧 `monitor_fetch_links=true` 加载后仍为 disabled；旧 mounted `link_export_mode=full` 加载为
   `redacted`，两者都不能恢复已经退休的 network/export 行为。
 - Legacy MCP send keys 仍可解析但完全 inert；所有旧 send tool 固定返回 `mcp_send_retired`。
-- Windows W0.1 不激活 source、monitor、backup、tray、autostart、packaging 或 sending；后续 Windows
-  phase 是独立 migration。
+- Windows W0.2A 为 config、app singleton、monitor state 与 source inventory 增加可移植文件锁，
+  但不激活 source、monitor、backup、tray、autostart、packaging 或 sending；后续 Windows phase
+  仍是独立 migration。
 
 第一次安全启用 mounted backup 建议按下面顺序：
 

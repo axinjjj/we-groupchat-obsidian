@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import fcntl
 import json
 import os
 import stat
@@ -10,6 +9,7 @@ import tempfile
 from typing import Callable
 
 from .config import ensure_private_dir, ensure_private_file
+from .platform import LockMode, create_file_lock
 
 
 MONITOR_STATE_SCHEMA = "we-groupchat-obsidian.monitor-state.v1"
@@ -40,34 +40,31 @@ class MonitorStateSnapshot:
 class MonitorStateStore:
     """Own locked reads and compare-and-swap writes for one state file."""
 
-    def __init__(self, path: str | os.PathLike[str]):
+    def __init__(self, path: str | os.PathLike[str], *, file_lock=None):
         self.path = os.path.abspath(os.path.expanduser(os.fspath(path)))
         self.lock_path = self.path + ".lock"
+        self._file_lock = file_lock
 
-    def _lock(self, *, exclusive: bool) -> int:
+    def _lock_service(self):
+        if self._file_lock is None:
+            self._file_lock = create_file_lock()
+        return self._file_lock
+
+    def _lock(self, *, exclusive: bool):
         directory = os.path.dirname(self.path)
         try:
             ensure_private_dir(directory)
-            fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            return self._lock_service().acquire(
+                self.lock_path,
+                mode=LockMode.EXCLUSIVE if exclusive else LockMode.SHARED,
+                blocking=True,
+            )
         except OSError as exc:
             raise MonitorStateError("monitor_state_lock_unavailable") from exc
-        try:
-            try:
-                os.fchmod(fd, 0o600)
-            except OSError:
-                pass
-            fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
-            return fd
-        except Exception:
-            os.close(fd)
-            raise
 
     @staticmethod
-    def _unlock(fd: int) -> None:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+    def _unlock(lock_handle) -> None:
+        lock_handle.close()
 
     def _read_locked(self) -> MonitorStateSnapshot:
         try:

@@ -795,7 +795,8 @@ Drive line reports the number of ledger objects that passed Drive API
 verification; that remote evidence is independent from source completeness.
 It also states the fixed product boundaries: remote link preview is
 `link_preview_disabled` with zero requests, MCP is legacy read-only with send
-retired, and Windows W0.1 is an import/dependency boundary only.
+  retired, and Windows W0.2A provides portable file-lock source only, not
+  product support.
 
 ```bash
 .venv/bin/python scripts/health_check.py
@@ -821,8 +822,10 @@ details.
   retired network/export behavior.
 - Legacy MCP send keys remain parseable but inert; every old send tool returns
   `mcp_send_retired`.
-- Windows W0.1 adds no source, monitor, backup, tray, autostart, packaging, or
-  sending activation. Later Windows phases remain separate migrations.
+- Windows W0.2A adds portable file locking for config, the app singleton,
+  monitor state, and source inventory, but activates no source, monitor,
+  backup, tray, autostart, packaging, or sending behavior. Later Windows phases
+  remain separate migrations.
 
 A safe first mounted-backup rollout is:
 
