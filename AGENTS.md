@@ -40,6 +40,15 @@
   patch the latest locked revision; do not reintroduce whole-snapshot UI/CLI
   saves or non-atomic config writes. `core/app_runtime.py` owns the menu-app
   process singleton.
+- `core/url_safety.py` is the sole URL display/export/prompt redaction
+  authority. Exact observed URLs and their stable hashes remain unchanged only
+  in private durable ledgers. Human-readable projections, snapshots/exports,
+  Review Queue, Daily Digest, AI prompts and surfaced errors must use the
+  canonical redacted form. The in-process remote link preview path is retired
+  and inert: legacy `monitor_fetch_links: true` must still produce
+  `link_preview_disabled` with zero network requests. Legacy mounted
+  `link_export_mode=full` migrates to `redacted`; only `redacted|off` may be
+  selected. Do not add a crawler or another local redaction implementation.
 - `ai/` owns provider adapters; `ui/` owns reusable UI components.
 - `scripts/` contains thin operator entrypoints and compatibility cleanup
   commands. Put

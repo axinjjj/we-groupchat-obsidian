@@ -385,6 +385,34 @@ class KnowledgeStoreTests(unittest.TestCase):
         self.assertNotIn("## 来源记录", md)
         self.assertNotIn("```text", md)
 
+    def test_exact_signed_url_stays_canonical_but_markdown_is_redacted(self):
+        exact = (
+            "https://example.com/object?X-Goog-Credential=knowledge-secret"
+            "&X-Goog-Signature=signature-secret&view=1"
+            "#access_token=fragment-secret"
+        )
+        result = self.store.apply_event(
+            candidate(
+                title=f"资源 {exact}",
+                summary=f"请阅读 {exact}",
+                key_facts=[f"原始链接是 {exact}"],
+                links=[exact],
+            ),
+            self.messages,
+            self.config,
+            {"relation": "new"},
+        )
+
+        topics = self.rows("topics")
+        self.assertEqual(json.loads(topics[0]["links_json"]), [exact])
+        with open(result["knowledge_path"], encoding="utf-8") as handle:
+            markdown = handle.read()
+        for secret in ("knowledge-secret", "signature-secret", "fragment-secret"):
+            self.assertNotIn(secret, markdown)
+        self.assertIn("X-Goog-Credential=REDACTED", markdown)
+        self.assertIn("view=1", markdown)
+        self.assertIn("access_token=REDACTED", markdown)
+
     def test_atomic_topic_renders_stable_source_contract(self):
         result = self.store.apply_event(
             candidate(links=[]), self.messages, self.config, {"relation": "new"}

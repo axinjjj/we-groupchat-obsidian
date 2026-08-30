@@ -14,7 +14,7 @@ Windows 迁移当前处于 **W0.1 模块清单与 import 边界阶段**；完整
 
 一个本地优先的 macOS 微信群聊总结工具。它读取你电脑上的微信本地数据库，生成群聊摘要、关键词搜索结果，并把值得关注的新消息整理成 Obsidian-friendly Markdown 笔记。
 
-它不是微信/Tencent 官方软件，不是微信机器人，不是员工监控工具；当你启用云端 AI 或远程链接预览时，它也不是完全离线工具。它不接入微信官方/非官方接口，也不会替你把聊天记录上传到项目作者的服务器。所有运行状态、数据库 key、知识库和导出文件默认都保存在你自己的 Mac 上；可选 MCP read tools 会另外把你选择读取的本机 chat-derived data 暴露给你配置的 MCP client。
+它不是微信/Tencent 官方软件，不是微信机器人，不是员工监控工具；启用云端 AI 时，它也不是完全离线工具。它不接入微信官方/非官方接口，也不会替你把聊天记录上传到项目作者的服务器。所有运行状态、数据库 key、知识库和导出文件默认都保存在你自己的 Mac 上；内置远程链接预览已停用并保持零网络请求；可选 MCP read tools 会另外把你选择读取的本机 chat-derived data 暴露给你配置的 MCP client。
 
 项目来源说明：本项目是基于 [Qizhan7/mac-wechat-summary](https://github.com/Qizhan7/mac-wechat-summary) 的 standalone derivative。原项目打下了 macOS 菜单栏总结、本地微信数据库读取和 MCP 访问的基础；这个仓库没有挂在 GitHub fork network 里，也不作为 upstream PR 分支维护，而是继续发展成一个独立的 local-first Obsidian workflow 项目。见 [NOTICE.md](NOTICE.md)。
 
@@ -122,8 +122,9 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
   durable queue 和 archive-owned provider-neutral CAS catalog；每个 digest 只上传一次，>5 MiB upload 按
   server-confirmed offset resumable，再按群聊/月份创建可读 shortcut。Remote identity 由 Drive file ID
   持有，不由可见名称或路径持有。
-- 远程 AI 调用和显式开启的公开网页预览会跨出 Mac 本地边界；Ollama 可以让 AI 解释留在本机，
-  而公开网页上下文默认关闭，并始终按 untrusted input 处理。
+- 远程 AI 调用会跨出 Mac 本地边界；Ollama 可以让 AI 解释留在本机。内置远程 URL preview
+  已停用；链接进入 AI prompt 或人类可读 projection 前会脱敏 credential，exact URL identity
+  只留在 private local ledger。
 - 保存知识、立刻发通知、进入 Review Queue 供以后行动，是三个独立判断。MCP 只保留可选的
   legacy read-only compatibility surface；原微信 UI 发送路径已经退休。
 
@@ -146,7 +147,7 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
 - Provider-neutral filesystem snapshot：支持 attachment archive 的 plan、run、verify 和只读 restore plan。
 - 默认 no-OAuth selected-resource mounted backup：把 exact links 与共享 CAS files 交给现有 Google Drive for Desktop 等挂载目录，同时生成轻量 Obsidian index、catalog snapshot 和诚实的 `sync_delegated` receipt。
 - 可选 advanced Google Drive API lane：拥有独立 selection/control plane、durable queue、群聊/月 shortcut 与 retry/reconcile，不自动删除。
-- 链接和转发展开：可选择补充公开网页标题/摘要；远程链接预览默认关闭。本地微信 XML 里可见的转发聊天记录会尽量解析。
+- 链接和转发展开：保留 exact URL extraction，并对 display/export 做 credential-safe redaction；内置远程链接预览已停用且零网络请求。本地微信 XML 里可见的转发聊天记录会尽量解析。
 - MCP Server：面向 Claude Desktop、Claude Code、Cursor、OpenClaw 等 client 的可选 legacy read-only compatibility surface；可查询、搜索、总结、查看图片与已有 metadata，但不能发送消息或修改本地状态。
 - 运维命令：即使菜单栏图标被隐藏，也可以用 `.command` 文件配置关注推送、健康检查、刷新数据源、历史回填和安装自启动。
 
@@ -173,7 +174,7 @@ DeepSeek 按实际 token 用量计费，输入缓存命中、输入缓存未命�
   `0600` private runtime storage，绝不能提交。被选群聊的 configured stable alias、文件名与文件 bytes 会
   上传到用户自己的 Drive；raw `@chatroom` username、消息 body/XML、`source_message_id`、`wxid` 与
   WeChat cache path 不进入 Drive metadata。程序不删除 Drive 文件、微信 cache 或本地 CAS object。
-- 远程链接预览默认关闭。只有显式设置 `monitor_fetch_links: true` 后，程序才会请求关注消息里的公开 URL；远端网站可能收到你的请求元数据。链接预览有保守的 SSRF 防护，但它仍然只是 best-effort public URL preview，不是 hardened crawler。
+- 内置远程链接预览已经从 normal runtime 退休并保持零网络请求。旧配置中的 `monitor_fetch_links: true` 只为兼容读取，加载后也会强制关闭；菜单与 CLI 都没有重新开启入口。Exact observed URL 仍留在 private local ledger，用于 deterministic identity。所有人类可读 projection、snapshot/export、Review Queue、Daily Digest、AI prompt 与 error text 都使用同一套 canonical display redaction，对 query 与 fragment 里的 credential fields 脱敏，包括常见 AWS、GCS 与 Azure signed-URL 参数。本仓库不声称提供 hardened crawler。
 - MCP read tools 会把本地 chat-derived data 暴露给已配置的 MCP client；AI summary 还会把相应内容交给用户配置的 AI provider。MCP 不推进 bookmark，也不修改群聊分组 metadata。
 - MCP 发送微信消息已经退休，不是“默认关闭”。旧 `prepare_send_message`、`confirm_send_message` 与 `send_message` tool name 只返回稳定、content-free 的 `mcp_send_retired`，绝不触碰微信 UI；旧 send config keys 仍可读取，但完全 inert。
 
@@ -775,7 +776,7 @@ macOS 菜单栏图标太多、刘海区域或菜单栏管理工具都可能把�
 - 更完整的本地运维入口：`setup-only`、健康检查、关注推送配置、刷新数据源、历史回填、整理 Obsidian 输出、安装/卸载自启动，都有 CLI 或 `.command` 入口。
 - 微信更新恢复路径更明确：通过 `./launchers/健康检查.command` 判断 re-sign、missing keys、monitor、Obsidian、LaunchAgent 状态，再用 `./launchers/刷新数据源.command` 修复，不依赖菜单栏图标一定可见。
 - LaunchAgent 做了 public-safe 兼容：新安装使用 neutral label，旧的项目 plist 会按 `ProgramArguments` / `WorkingDirectory` 自动识别并默认保留，只有显式 `--migrate-label` 才迁移。
-- 关注推送从“有命中就吵人”调成了更 value-first 的工作流：支持多群、provider/model 配置、显式开启的链接预览、转发聊天记录解析、睡眠唤醒补跑、`P1/P2/P3` 通知分层，以及更稳定的摘要 prompt。
+- 关注推送从“有命中就吵人”调成了更 value-first 的工作流：支持多群、provider/model 配置、credential-redacted URL references、转发聊天记录解析、睡眠唤醒补跑、`P1/P2/P3` 通知分层，以及更稳定的摘要 prompt；内置远程链接预览保持停用。
 - 资源线索不会因为暂时没有文件/链接而丢掉：`resource_lead` 会把“可以私发 / 晚点发 / repo 还没公开 / 求一份”这类机会作为 `follow_up_resource` 留进 Review Queue。
 - Obsidian 输出被当作本地知识库来维护：按群聊/分类组织笔记，文件名和 frontmatter 更稳定，资源区更安全，生成 root-level link-only 日期 overview，也支持不重新调用 AI 的重导出整理。
 - 新增 Daily Digest 和派生 Review Queue：只有 `follow_up_resource`、`import_resource`、`evaluate_reference`、`review_risk` 这类有明确动作的条目才进入 Review Queue；队列文件保存派生标题、摘要、资源线索、链接和笔记路径，不复制 raw chat bodies；高信号但无下一步动作的内容会保存在知识库和 Daily Digest，但不进入 Review Queue，单条通知仍按 `P1/P2/P3` gating 判断。

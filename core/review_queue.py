@@ -15,6 +15,7 @@ from typing import Iterable
 
 from .config import DATA_DIR, ensure_private_dir, ensure_private_file
 from .link_preview import is_wechat_record_url
+from .url_safety import redact_url_for_display, redact_urls_in_text
 
 QUEUE_DIR = os.path.join(DATA_DIR, "review_queue")
 PENDING_FILE = "pending.jsonl"
@@ -201,7 +202,8 @@ def _normalize_links(value, limit=20) -> list[str]:
             continue
         if is_wechat_record_url(text):
             continue
-        key = text.lower()
+        text = redact_url_for_display(text)
+        key = text.casefold()
         if key in seen:
             continue
         seen.add(key)
@@ -421,17 +423,25 @@ class ReviewQueue:
             "signal_level": _clean_text(data.get("signal_level"), 16),
             "actionability": _clean_text(data.get("actionability"), 40),
             "queue_worthy": bool(data.get("queue_worthy")) if "queue_worthy" in data else False,
-            "source_chat": _clean_text(data.get("source_chat"), 120),
+            "source_chat": redact_urls_in_text(
+                _clean_text(data.get("source_chat"), 120)
+            ),
             "window_start": _clean_text(data.get("window_start"), 40),
             "window_end": _clean_text(data.get("window_end"), 40),
-            "title": _clean_text(data.get("title") or "待审阅内容", 160),
-            "summary": _clean_text(data.get("summary"), 1000),
+            "title": redact_urls_in_text(
+                _clean_text(data.get("title") or "待审阅内容", 160)
+            ),
+            "summary": redact_urls_in_text(
+                _clean_text(data.get("summary"), 1000)
+            ),
             "knowledge_topic_id": data.get("knowledge_topic_id"),
             "knowledge_event_id": data.get("knowledge_event_id"),
             "obsidian_path": _clean_text(data.get("obsidian_path"), 500),
             "resource_lead": resource_lead,
             "resource_status": resource_status,
-            "lead_key": _clean_text(data.get("lead_key"), 160),
+            "lead_key": redact_urls_in_text(
+                _clean_text(data.get("lead_key"), 160)
+            ),
             "resources": {
                 "files": files,
                 "links": links,

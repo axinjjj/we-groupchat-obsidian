@@ -238,10 +238,10 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(DEFAULT_CONFIG["monitor_notify_writes"])
         self.assertFalse(DEFAULT_CONFIG["monitor_notify_checkins"])
 
-    def test_link_preview_fetching_defaults_to_explicit_opt_in(self):
+    def test_legacy_link_preview_enablement_is_forced_off(self):
         self.assertFalse(DEFAULT_CONFIG["monitor_fetch_links"])
         cfg = _sanitize_config({"monitor_fetch_links": True})
-        self.assertTrue(cfg["monitor_fetch_links"])
+        self.assertFalse(cfg["monitor_fetch_links"])
 
     def test_mcp_send_mode_defaults_and_sanitized_config(self):
         self.assertEqual(DEFAULT_CONFIG["mcp_send_mode"], "disabled")

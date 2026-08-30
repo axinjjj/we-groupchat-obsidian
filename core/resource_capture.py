@@ -30,7 +30,7 @@ from .config import (
     selected_resource_backup_chats,
     update_config,
 )
-from .link_preview import URL_RE
+from .url_safety import URL_RE
 from .wechat_db import WeChatSourceDegraded
 
 

@@ -23,11 +23,12 @@ import uuid
 from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import quote
 
 from .attachment_archive import ArchiveError
 from .config import DATA_DIR
 from .resource_capture import ResourceCaptureError, SelectedResourceCapture
+from .url_safety import redact_url_for_display, redact_urls_in_text
 
 
 BACKUP_SCHEMA = "we-groupchat-obsidian.resource-backup.v3"
@@ -88,23 +89,9 @@ DESTINATION_MARKER_SCHEMA = "we-groupchat-obsidian.destination.v1"
 SETTINGS_FILE = os.path.join(DATA_DIR, "resource_backup.json")
 SETTINGS_LOCK_SUFFIX = ".lock"
 OCCURRENCE_ID_DOMAIN = b"we-groupchat-resource-occurrence-v1\0"
-SENSITIVE_QUERY_KEYS = {
-    "access_token",
-    "api_key",
-    "auth",
-    "authorization",
-    "code",
-    "credential",
-    "credentials",
-    "jwt",
-    "key",
-    "password",
-    "secret",
-    "session",
-    "signature",
-    "sig",
-    "token",
-}
+
+# Compatibility import surface; the implementation authority is url_safety.
+_redact_url = redact_url_for_display
 
 
 class ResourceBackupError(RuntimeError):
@@ -495,59 +482,6 @@ def _file_url(path):
     return "file://" + quote(str(path or ""))
 
 
-def _sensitive_query_key(key):
-    lowered = str(key or "").strip().lower()
-    if not lowered:
-        return False
-    if lowered in SENSITIVE_QUERY_KEYS:
-        return True
-    tokens = [token for token in re.split(r"[^a-z0-9]+", lowered) if token]
-    compact = "".join(tokens)
-    if any(
-        token in {
-            "token", "secret", "password", "signature", "sig", "auth",
-            "authorization", "credential", "credentials", "jwt", "session",
-        }
-        for token in tokens
-    ):
-        return True
-    if tokens and tokens[-1] in {"key", "code"}:
-        return True
-    return any(
-        marker in compact
-        for marker in (
-            "accesstoken",
-            "authorization",
-            "authtoken",
-            "apikey",
-            "credential",
-            "credentials",
-            "jwt",
-            "sessionid",
-            "sessiontoken",
-            "signature",
-            "password",
-            "secret",
-        )
-    )
-
-
-def _redact_url(url):
-    try:
-        parsed = urlsplit(str(url or ""))
-    except ValueError:
-        return "REDACTED_INVALID_URL"
-    if not parsed.query:
-        return str(url or "")
-    query = []
-    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
-        if _sensitive_query_key(key):
-            query.append((key, "REDACTED"))
-        else:
-            query.append((key, value))
-    return urlunsplit(parsed._replace(query=urlencode(query, doseq=True)))
-
-
 def _markdown_url(url):
     return (
         _single_line(url, "", 8192)
@@ -590,6 +524,11 @@ def _canonical_jsonl_bytes(rows):
     return b"".join(_canonical_json_bytes(row) for row in rows)
 
 
+def _normalized_link_export_mode(value) -> str:
+    """Migrate legacy ``full`` and unknown values to safe redacted export."""
+    return "off" if str(value or "").strip().casefold() == "off" else "redacted"
+
+
 def _read_resource_backup_settings_unlocked(path):
     try:
         with open(path, encoding="utf-8") as handle:
@@ -598,9 +537,7 @@ def _read_resource_backup_settings_unlocked(path):
         value = {}
     value = value if isinstance(value, dict) else {}
     target = str(value.get("target") or "").strip()
-    mode = str(value.get("link_export_mode") or "redacted").strip().lower()
-    if mode not in {"full", "redacted", "off"}:
-        mode = "redacted"
+    mode = _normalized_link_export_mode(value.get("link_export_mode"))
     return {
         "target": os.path.abspath(os.path.expanduser(target)) if target else "",
         "link_export_mode": mode,
@@ -634,9 +571,7 @@ def save_resource_backup_settings(settings, path=SETTINGS_FILE):
         current = _read_resource_backup_settings_unlocked(path)
         current.update(settings if isinstance(settings, dict) else {})
         target = str(current.get("target") or "").strip()
-        mode = str(current.get("link_export_mode") or "redacted").strip().lower()
-        if mode not in {"full", "redacted", "off"}:
-            raise ValueError("link_export_mode must be full, redacted, or off")
+        mode = _normalized_link_export_mode(current.get("link_export_mode"))
         payload = {
             "target": os.path.abspath(os.path.expanduser(target)) if target else "",
             "link_export_mode": mode,
@@ -694,13 +629,11 @@ class MountedResourceBackup:
                 self.config.get("attachment_archive_min_free_bytes", 1024 * 1024 * 1024),
             )
         ))
-        mode = str(
+        mode = _normalized_link_export_mode(
             link_export_mode
             if link_export_mode is not None
             else settings.get("link_export_mode") or "redacted"
-        ).strip().lower()
-        if mode not in {"full", "redacted", "off"}:
-            raise ValueError("link_export_mode must be full, redacted, or off")
+        )
         self.link_export_mode = mode
         self._destination_uuid = ""
         self._schema_ready = False
@@ -1680,9 +1613,7 @@ class MountedResourceBackup:
     def _export_url(self, url):
         if self.link_export_mode == "off":
             return ""
-        if self.link_export_mode == "redacted":
-            return _redact_url(url)
-        return str(url or "")
+        return redact_url_for_display(url)
 
     def _catalog_records(self, occurrences, delivery_map):
         records = []
@@ -1701,7 +1632,9 @@ class MountedResourceBackup:
                 "source_time": str(row.get("source_time") or ""),
                 "source_sender": str(row.get("source_sender") or ""),
                 "source_month": str(row.get("source_month") or ""),
-                "original_name": str(row.get("original_name") or ""),
+                "original_name": redact_urls_in_text(
+                    row.get("original_name") or ""
+                ),
                 "observed_url": self._export_url(row.get("observed_url") or "") if kind == "link" else "",
                 "url_sha256": str(row.get("url_sha256") or ""),
                 "object_sha256": digest,
@@ -1889,9 +1822,13 @@ class MountedResourceBackup:
             if item.get("kind") == "link":
                 url = (
                     self._export_url(item.get("observed_url") or "")
-                    if target_view else str(item.get("observed_url") or "")
+                    if target_view else redact_url_for_display(
+                        item.get("observed_url") or ""
+                    )
                 )
-                title = str(item.get("original_name") or "").strip()
+                title = redact_urls_in_text(
+                    item.get("original_name") or ""
+                ).strip()
                 if url:
                     label_source = title or url
                     label = _markdown_label(

@@ -15,6 +15,7 @@ from urllib.parse import quote
 from .config import DATA_DIR
 from .link_preview import is_wechat_record_url
 from .project_identity import PROJECT_SLUG
+from .url_safety import redact_url_for_display, redact_urls_in_text
 from .source_contract import (
     atomic_source_lines,
     aware_iso_from_timestamp,
@@ -444,7 +445,7 @@ def _resource_prefix(links=None, files=None):
 
 
 def _display_title(title, links=None, files=None):
-    title = str(title or "关注内容").strip() or "关注内容"
+    title = redact_urls_in_text(title or "关注内容").strip() or "关注内容"
     prefix = _resource_prefix(links, files)
     return f"{prefix} {title}" if prefix else title
 
@@ -595,7 +596,7 @@ def _obsidian_link(obsidian_path, title):
 
 
 def _render_relation_markdown_line(relation, obsidian_path, title):
-    return f"- {relation}:: {_obsidian_link(obsidian_path, title)}"
+    return f"- {relation}:: {_obsidian_link(obsidian_path, redact_urls_in_text(title))}"
 
 
 def _is_default_obsidian_root(path):
@@ -1741,12 +1742,18 @@ class KnowledgeStore:
         self, topic, events, relations, *, include_source_contract=True,
         attachment_mentions=(),
     ):
-        title = topic["title"]
-        entities = topic["entities"]
+        title = redact_urls_in_text(topic["title"])
+        entities = [redact_urls_in_text(value) for value in topic["entities"]]
         links = topic["links"]
+        display_links = [redact_url_for_display(link) for link in links]
         files = topic.get("files") or []
-        key_facts = topic["key_facts"]
-        semantic_tags = topic.get("semantic_tags") or []
+        key_facts = [
+            redact_urls_in_text(value) for value in topic["key_facts"]
+        ]
+        semantic_tags = [
+            redact_urls_in_text(value)
+            for value in (topic.get("semantic_tags") or [])
+        ]
         tags = ["wechat-monitor", safe_path_part(topic["category"], "uncategorized").replace(" ", "-")]
         display_title = _display_title(title, links, files)
         resource_types = _resource_types(links, files)
@@ -1800,7 +1807,7 @@ class KnowledgeStore:
             f"# {display_title}",
             "",
             "## 摘要",
-            topic["summary"] or "（暂无摘要）",
+            redact_urls_in_text(topic["summary"]) or "（暂无摘要）",
             "",
         ]
 
@@ -1814,12 +1821,16 @@ class KnowledgeStore:
             lines.extend(["", "## 资源"])
             if links:
                 lines.extend(["", "### 链接"])
-                lines.extend(f"- {link}" for link in links)
+                lines.extend(f"- {link}" for link in display_links)
             if files:
                 lines.extend(["", "### 文件"])
                 for item in files:
-                    details = " · ".join(x for x in (item.get("time"), item.get("sender")) if x)
-                    line = f"- {item['name']}"
+                    details = " · ".join(
+                        redact_urls_in_text(value)
+                        for value in (item.get("time"), item.get("sender"))
+                        if value
+                    )
+                    line = f"- {redact_urls_in_text(item['name'])}"
                     if details:
                         line += f"（{details}）"
                     lines.append(line)
@@ -1850,7 +1861,9 @@ class KnowledgeStore:
                 for mention in remaining_mentions:
                     kind = str(_row_get(mention, "kind", "attachment") or "attachment")
                     name = str(_row_get(mention, "original_name", "") or "").strip()
-                    label = name or ("图片附件" if kind == "image" else "附件")
+                    label = redact_urls_in_text(
+                        name or ("图片附件" if kind == "image" else "附件")
+                    )
                     details = " · ".join(
                         value
                         for value in (

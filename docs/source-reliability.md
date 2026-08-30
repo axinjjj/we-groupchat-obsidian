@@ -328,6 +328,18 @@ The target and link-export policy live in the separate private
 `resource_backup.json` settings file. The chosen directory must already exist;
 the worker never recreates a missing mount path.
 
+The exact observed URL and its digest-bound identity stay in the private local
+ledger. Every human-readable Markdown projection, snapshot/export value,
+Review Queue entry, Daily Digest entry, AI prompt, and surfaced error uses
+`core/url_safety.py` as the canonical display-redaction authority. It redacts
+credential-bearing values in both query strings and fragments, including
+common AWS, GCS, and Azure signed-URL fields. The supported export choices are
+`redacted` (default) and `off`; a legacy stored `full` value is migrated to
+`redacted` and can no longer export exact credential-bearing URLs. Built-in
+remote link preview is inert and makes zero network requests even if an old
+main config contains `monitor_fetch_links: true`. This is not a hardened
+crawler claim.
+
 ```bash
 .venv/bin/python scripts/resource_backup.py set-target "<existing-mounted-directory>"
 .venv/bin/python scripts/resource_backup.py set-link-export-mode redacted
