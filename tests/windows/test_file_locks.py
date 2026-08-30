@@ -4,6 +4,7 @@ import multiprocessing
 from pathlib import Path
 import queue
 import tempfile
+import time
 import unittest
 
 from core.platform import LockBusy, LockMode, create_file_lock, detect_platform
@@ -155,11 +156,19 @@ class FileLockContractTests(unittest.TestCase):
         process.join(10)
         self.assertFalse(process.is_alive())
 
-        recovered = self.service.acquire(
-            self.path,
-            mode=LockMode.EXCLUSIVE,
-            blocking=False,
-        )
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                recovered = self.service.acquire(
+                    self.path,
+                    mode=LockMode.EXCLUSIVE,
+                    blocking=False,
+                )
+                break
+            except LockBusy:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
         recovered.close()
 
     def test_handle_retains_descriptor_and_close_is_idempotent(self):

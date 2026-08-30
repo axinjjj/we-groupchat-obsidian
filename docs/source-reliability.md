@@ -795,8 +795,8 @@ Drive line reports the number of ledger objects that passed Drive API
 verification; that remote evidence is independent from source completeness.
 It also states the fixed product boundaries: remote link preview is
 `link_preview_disabled` with zero requests, MCP is legacy read-only with send
-  retired, and Windows W0.2A provides portable file-lock source only, not
-  product support.
+retired, and Windows W0.2A provides portable file-lock source only, not product
+support.
 
 ```bash
 .venv/bin/python scripts/health_check.py

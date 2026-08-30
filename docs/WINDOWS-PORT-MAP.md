@@ -1,9 +1,10 @@
 # Windows portability map (W0.2A)
 
-The full Windows programme contract, `WGO-WIN-SPEC-2`, is owner-authorized
-external material and is not distributed with this repository. This document
-is the sole in-repository executable authority for the current portability
-classification and `PR-W0.2A` file-lock migration boundary.
+The full Windows programme contract, `WGO-WIN-SPEC-2`, remains external
+owner-review candidate material and is not distributed with this repository.
+`PR-W0.2A` is authorized as a bounded source migration; this document is its
+sole in-repository executable authority and the living portability
+classification.
 
 ```text
 repository: IndelibleVivi/we-groupchat-obsidian
@@ -84,7 +85,7 @@ root, `ai/`, `core/`, `ui/`, and `scripts/` Python module and imports every
 | `core/monitor_source.py` | `windows-import-safe` | Pure bounded source-cursor merge helper; platform storage remains owned by callers. |
 | `core/monitor_state.py` | `windows-import-safe` | W0.2A shared/exclusive locking and revision CAS are portable; Windows monitor activation remains W3. |
 | `core/notification_identity.py` | `macos-only` | Foundation/app-bundle notification identity diagnostics. |
-| `core/notification_target.py` | `macos-only` | Emits the macOS `open` command; target-opening adapter is W0.3. |
+| `core/notification_target.py` | `macos-only` | Emits the macOS `open` command; target-opening adapter is W6. |
 | `core/platform/__init__.py` | `windows-import-safe` | Exposes contracts, factory, and the active-platform file-lock selector. |
 | `core/platform/contracts.py` | `windows-import-safe` | Shared lock/path/storage/secret/process/notification/open/autostart protocols. |
 | `core/platform/factory.py` | `windows-import-safe` | Fail-closed service registry with lazy macOS and Windows file-lock providers; all later capabilities remain absent. |

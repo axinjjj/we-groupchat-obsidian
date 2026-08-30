@@ -91,10 +91,10 @@
 
 ## Windows port staging
 
-- The full Windows programme contract, `WGO-WIN-SPEC-2`, is owner-authorized
-  external material. For `PR-W0.2A`, `docs/WINDOWS-PORT-MAP.md` is the sole
-  in-repository executable authority for the bounded lock migration and living
-  module/import classification.
+- The full Windows programme contract, `WGO-WIN-SPEC-2`, remains external
+  owner-review candidate material. `PR-W0.2A` is authorized as a bounded source
+  migration; `docs/WINDOWS-PORT-MAP.md` is its sole in-repository executable
+  authority and the living module/import classification.
 - `app.py` remains the macOS shell. W0.2A must not add Windows source reads, key
   acquisition, monitor activation, attachment/backup behavior, tray UI,
   autostart, packaging or message sending.

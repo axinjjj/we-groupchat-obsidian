@@ -640,8 +640,8 @@ cache-only、key-missing 与 unreadable。只有 expected logical-shard inventor
 objects。Mounted `sync_delegated` 始终保留 `provider_side_sync=unknown` 与
 `remote_verified=False`。独立 Direct Drive 行只统计通过 Drive API verification 的 ledger objects；
 这份 remote evidence 与 source completeness 互不替代。Health 还直接写明三个固定产品边界：remote
-  link preview 是 `link_preview_disabled` 且零请求；MCP 是 legacy read-only、send retired；Windows
-  W0.2A 只提供可移植文件锁源码，不代表产品支持。
+link preview 是 `link_preview_disabled` 且零请求；MCP 是 legacy read-only、send retired；Windows
+W0.2A 只提供可移植文件锁源码，不代表产品支持。
 
 ```bash
 .venv/bin/python scripts/health_check.py
